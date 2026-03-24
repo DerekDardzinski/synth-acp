@@ -1,0 +1,12 @@
+{
+  "session": "test",
+  "agents": [
+    {
+      "id": "kiro",
+      "binary": "kiro-cli",
+      "args": ["acp"],
+      "cwd": ".",
+      "autostart": true
+    }
+  ]
+}

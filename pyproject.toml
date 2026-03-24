@@ -59,6 +59,7 @@ ignore = [
 "__init__.py" = ["F401"]
 "tests/*" = ["S101", "ARG001", "ARG002", "RUF059"]
 "src/*" = ["T201"]
+"src/synth_acp/acp/session.py" = ["ARG002"]  # ACP Client protocol requires unused params
 
 [tool.ruff.lint.isort]
 known-first-party = ["synth_acp"]
