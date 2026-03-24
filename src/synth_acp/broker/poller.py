@@ -11,7 +11,7 @@ import aiosqlite
 
 log = logging.getLogger(__name__)
 
-DeliverFn = Callable[[str, str], Awaitable[bool]]
+DeliverFn = Callable[[str, str, list[str]], Awaitable[bool]]
 
 
 class MessagePoller:
@@ -91,7 +91,8 @@ class MessagePoller:
             by_agent.setdefault(row[2], []).append(row)  # type: ignore[arg-type]
         for agent_id, messages in by_agent.items():
             combined = "\n\n".join(f"[Message from {m[1]}]: {m[3]}" for m in messages)
-            success = await self._deliver(agent_id, combined)
+            senders = list({m[1] for m in messages})
+            success = await self._deliver(agent_id, combined, senders)
             if success:
                 ids = [m[0] for m in messages]
                 placeholders = ",".join("?" * len(ids))

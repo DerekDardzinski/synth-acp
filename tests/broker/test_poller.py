@@ -47,7 +47,7 @@ class TestPollerDelivery:
 
         delivered: list[tuple[str, str]] = []
 
-        async def deliver(agent_id: str, text: str) -> bool:
+        async def deliver(agent_id: str, text: str, from_agents: list[str]) -> bool:
             delivered.append((agent_id, text))
             return True
 
@@ -79,7 +79,7 @@ class TestPollerDelivery:
         db_path = tmp_path / "test.db"
         _init_db(db_path)
 
-        async def deliver(agent_id: str, text: str) -> bool:
+        async def deliver(agent_id: str, text: str, from_agents: list[str]) -> bool:
             return False  # Simulate busy agent
 
         poller = MessagePoller(db_path, deliver, "sess-1")
@@ -105,7 +105,7 @@ class TestPollerStop:
 
         deliver_count = 0
 
-        async def deliver(agent_id: str, text: str) -> bool:
+        async def deliver(agent_id: str, text: str, from_agents: list[str]) -> bool:
             nonlocal deliver_count
             deliver_count += 1
             return True

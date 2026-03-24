@@ -232,12 +232,13 @@ class ACPBroker:
         conn.commit()
         conn.close()
 
-    async def _deliver_message(self, agent_id: str, text: str) -> bool:
+    async def _deliver_message(self, agent_id: str, text: str, from_agents: list[str]) -> bool:
         """Deliver combined message text to an idle agent.
 
         Args:
             agent_id: Target agent ID.
             text: Combined message text.
+            from_agents: List of unique sender agent IDs.
 
         Returns:
             True if delivery succeeded, False otherwise.
@@ -247,13 +248,14 @@ class ACPBroker:
             return False
         try:
             await session.prompt(text)
-            await self._event_queue.put(
-                McpMessageDelivered(
-                    agent_id=agent_id,
-                    from_agent="mcp",
-                    to_agent=agent_id,
+            for sender in from_agents:
+                await self._event_queue.put(
+                    McpMessageDelivered(
+                        agent_id=agent_id,
+                        from_agent=sender,
+                        to_agent=agent_id,
+                    )
                 )
-            )
             return True
         except Exception:
             return False
