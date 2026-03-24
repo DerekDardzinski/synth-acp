@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Literal
 
+from acp.schema import PermissionOption
 from pydantic import BaseModel, Field
 
 from synth_acp.models.agent import AgentState
+from synth_acp.models.permissions import PermissionDecision
 
 
 def _now() -> datetime:
@@ -48,3 +50,32 @@ class BrokerError(BrokerEvent):
 
     message: str
     severity: Literal["warning", "error"] = "error"
+
+
+class PermissionRequested(BrokerEvent):
+    """Agent is blocked waiting for a permission decision."""
+
+    request_id: str
+    title: str
+    kind: str
+    options: list[PermissionOption]
+
+
+class PermissionAutoResolved(BrokerEvent):
+    """A permission was auto-resolved by a persisted rule."""
+
+    request_id: str
+    decision: PermissionDecision
+
+
+class TurnComplete(BrokerEvent):
+    """Agent finished processing a prompt."""
+
+    stop_reason: str
+
+
+class McpMessageDelivered(BrokerEvent):
+    """An inter-agent message was delivered via the poller."""
+
+    from_agent: str
+    to_agent: str

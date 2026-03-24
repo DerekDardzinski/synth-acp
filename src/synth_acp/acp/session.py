@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from acp.schema import (
+    AllowedOutcome,
     ClientCapabilities,
     DeniedOutcome,
     FileSystemCapability,
@@ -25,7 +26,9 @@ from synth_acp.models.events import (
     BrokerError,
     BrokerEvent,
     MessageChunkReceived,
+    PermissionRequested,
     ToolCallUpdated,
+    TurnComplete,
 )
 
 log = logging.getLogger(__name__)
@@ -105,7 +108,15 @@ class ACPSession:
             return
         await self._set_state(AgentState.BUSY)
         try:
-            await self._conn.prompt(session_id=self._session_id, prompt=[text_block(text)])
+            response = await self._conn.prompt(
+                session_id=self._session_id, prompt=[text_block(text)]
+            )
+            await self._event_sink(
+                TurnComplete(
+                    agent_id=self.agent_id,
+                    stop_reason=response.stop_reason if response else "unknown",
+                )
+            )
         finally:
             if self.state == AgentState.BUSY:
                 await self._set_state(AgentState.IDLE)
@@ -153,6 +164,14 @@ class ACPSession:
                 )
             )
 
+    def resolve_permission(self, option_id: str) -> None:
+        """Resolve the pending permission Future with the selected option_id.
+
+        No-op if no Future is pending or Future is already done.
+        """
+        if self._permission_future and not self._permission_future.done():
+            self._permission_future.set_result(option_id)
+
     async def request_permission(
         self,
         options: list[PermissionOption],
@@ -160,8 +179,33 @@ class ACPSession:
         tool_call: ToolCallUpdate,
         **kwargs: Any,
     ) -> RequestPermissionResponse:
-        """Called by ACP SDK when agent requests permission. Auto-cancels for now."""
-        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        """Called by ACP SDK when agent requests permission.
+
+        Creates a Future, transitions to AWAITING_PERMISSION, emits
+        PermissionRequested, and awaits resolution.
+        """
+        await self._set_state(AgentState.AWAITING_PERMISSION)
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._permission_future = future
+        await self._event_sink(
+            PermissionRequested(
+                agent_id=self.agent_id,
+                request_id=tool_call.tool_call_id,
+                title=tool_call.title or "",
+                kind=tool_call.kind or "other",
+                options=list(options),
+            )
+        )
+        try:
+            option_id = await future
+        except asyncio.CancelledError:
+            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        finally:
+            self._permission_future = None
+        await self._set_state(AgentState.BUSY)
+        return RequestPermissionResponse(
+            outcome=AllowedOutcome(option_id=option_id, outcome="selected")
+        )
 
     def on_connect(self, conn: Any) -> None:
         """Called when the ACP connection is established."""

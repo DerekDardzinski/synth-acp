@@ -7,6 +7,13 @@
       "args": ["acp"],
       "cwd": ".",
       "autostart": true
+    },
+    {
+      "id": "kiro-2",
+      "binary": "kiro-cli",
+      "args": ["acp"],
+      "cwd": ".",
+      "autostart": true
     }
   ]
 }
