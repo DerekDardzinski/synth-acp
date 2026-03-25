@@ -1,0 +1,903 @@
+# SYNTH Design Document
+
+**SYNTH** — **SY**nchronized **N**etwork of **T**eamed **H**arnesses over ACP
+
+Version: 0.3
+Date: 2026-03-25
+
+---
+
+## 1. Overview
+
+SYNTH is a multi-agent orchestration dashboard that manages teams of AI coding agents through the Agent Client Protocol (ACP). It provides a Textual-based TUI for real-time session management, streaming markdown output, permission handling, and inter-agent messaging.
+
+### Project Identity
+
+| Attribute | Value |
+|---|---|
+| PyPI package | `synth_acp` |
+| CLI command | `synth` |
+| MCP server entrypoint | `synth-mcp` |
+| Config file | `.synth.toml` (`.synth.json` for backward compat) |
+| Data directory | `~/.synth/` |
+| Repo name | `synth-acp` |
+
+### Design Principles
+
+- **Feel like the underlying tool, not a wrapper.** Running `synth` should feel as natural as running `kiro-cli` or `claude` directly. Multi-agent capability is additive.
+- **Config file is an output, not a prerequisite.** First-run interactive setup guides the user; the resulting `.synth.toml` is a project artifact worth committing.
+- **The orchestrator is primary.** The default workflow is one orchestrator that the user talks to directly, which dynamically spawns workers as needed. Static team configs are supported but secondary.
+
+### Goals
+
+- Manage teams of ACP-compatible agents (Kiro CLI, Claude Code, Gemini CLI, etc.) from a single process
+- Surface permission requests to the operator in real time with persistent auto-resolve rules
+- Stream agent responses with rendered markdown, thought blocks, and token usage visibility
+- Support flexible agent topologies: human-dispatch, orchestrator, peer-to-peer
+- Enable agent-to-agent communication via a bundled MCP server
+- Support session resumption across restarts
+
+### Non-Goals
+
+- Building a new AI agent (SYNTH manages existing agents)
+- Supporting non-ACP agents (no tmux fallback)
+- Multi-user authentication (single operator, single session)
+
+---
+
+## 2. Architecture
+
+### 2.1 System Diagram
+
+```
+synth (single process: broker + TUI)
+┌──────────────────────────────────────────────────┐
+│                                                  │
+│  CLI (argparse)                                  │
+│    ├── first-run picker (no config)              │
+│    ├── --harness/--agent (transient config)      │
+│    └── .synth.toml / .synth.json (project config)│
+│                                                  │
+│  ACPBroker ─────────────────────────────────┐    │
+│    ├── ACPSession (agent-1)                 │    │
+│    ├── ACPSession (agent-2)                 │    │
+│    ├── ACPSession (agent-N)                 │    │
+│    ├── PermissionEngine (persisted rules)   │    │
+│    └── MessagePoller (SQLite watcher)       │    │
+│              │                              │    │
+│              │ AsyncIterator[BrokerEvent]    │    │
+│              ▼                              │    │
+│  SynthApp (Textual) ◄─────────────────────┘    │
+│    ├── AgentList (sidebar)                       │
+│    ├── ConversationFeed (per agent, lazy)        │
+│    │     ├── PromptBubble                        │
+│    │     ├── AgentMessage (MarkdownStream)       │
+│    │     ├── ThoughtBlock (Collapsible)          │
+│    │     ├── ToolCallBlock                       │
+│    │     └── PermissionRequest                   │
+│    ├── MessageQueue                              │
+│    └── InputBar                                  │
+│                                                  │
+└──────────────────────────────────────────────────┘
+     │ spawns N agent subprocesses via ACP stdio
+     ▼
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│ kiro-cli │  │ kiro-cli │  │ claude   │
+│   acp    │  │   acp    │  │   mcp    │
+│ MCP:     │  │ MCP:     │  │ MCP:     │
+│ synth-mcp│  │ synth-mcp│  │ synth-mcp│
+└──────────┘  └──────────┘  └──────────┘
+      │              │              │
+      └──────────────┴──────────────┘
+                     │
+              SQLite (messages table)
+```
+
+### 2.2 Three-Layer Design
+
+| Layer | Package | Responsibility | Imports from |
+|---|---|---|---|
+| 3 — Frontend | `synth_acp.ui` | Textual TUI rendering | `models`, `broker` |
+| 2 — Broker | `synth_acp.broker` | Session lifecycle, routing, permissions | `models`, `acp` |
+| 1 — ACP | `synth_acp.acp` | ACP SDK wrapper, subprocess management | `models` |
+| Shared | `synth_acp.models` | Pydantic models for events, commands, config | (none) |
+
+Layers 1 and 2 have zero Textual imports. The frontend communicates with the broker exclusively through typed events and commands defined in `models/`.
+
+### 2.3 Why a Single Process
+
+The broker, UI, and event loop all run in one Python process:
+
+- The broker owns all agent stdio channels. If it dies, all agents die. No failure mode where UI survives but broker doesn't.
+- Textual's event loop is asyncio. Running broker and UI in the same loop avoids cross-process IPC for the hot path.
+- A future web UI replaces `SynthApp` with a FastAPI/websocket server in the same process, consuming the same `broker.events()` / `broker.handle()` interface.
+
+---
+
+## 3. Component Design
+
+### 3.1 ACPSession (Layer 1)
+
+Wraps the `agent-client-protocol` SDK's `spawn_agent_process` for a single agent subprocess. Implements the SDK's `Client` protocol via duck typing.
+
+Responsibilities:
+- Spawn agent subprocess and perform ACP handshake (`initialize` → `session/new`)
+- Capture `InitializeResponse` agent capabilities (load_session, mcp_capabilities)
+- Track session state via a finite state machine
+- Forward `session_update` notifications as typed broker events
+- Handle `request_permission` via Future-based blocking
+- Emit `TurnComplete` on prompt completion
+
+```python
+class ACPSession:
+    agent_id: str
+    state: AgentState
+    _conn: Any                 # from spawn_agent_process
+    _event_sink: EventSink
+    _permission_future: asyncio.Future[str] | None = None
+    _capabilities: AgentCapabilities | None = None
+```
+
+#### State Machine
+
+```
+UNSTARTED → INITIALIZING → IDLE → BUSY → IDLE → ... → TERMINATED
+                                    ↑
+                              AWAITING_PERMISSION
+```
+
+Transitions are enforced at runtime. State change notifications are `await`ed (not fire-and-forget) to prevent race conditions where the broker's view of agent state is stale when the first streaming chunk arrives.
+
+#### Session Update Handling
+
+Currently handles `agent_message_chunk`, `tool_call`, and `tool_call_update`. The following are identified for future implementation (see Section 16, Gap Analysis):
+
+| Update Type | Status | Priority |
+|---|---|---|
+| `agent_message_chunk` | ✅ Implemented | — |
+| `tool_call` / `tool_call_update` | ✅ Implemented | — |
+| `agent_thought_chunk` | ❌ Not handled | 🟠 High |
+| `usage_update` | ❌ Not handled | 🟠 High |
+| `plan` | ❌ Not handled | 🟡 Medium |
+| `current_mode_update` | ❌ Not handled | 🟢 Low |
+| `available_commands_update` | ❌ Not handled | 🟢 Low |
+
+#### ACP Client Capabilities
+
+SYNTH declares filesystem and terminal capabilities as `False`:
+
+```python
+ClientCapabilities(
+    fs=FileSystemCapability(read_text_file=False, write_text_file=False),
+    terminal=False,
+)
+```
+
+Target harnesses (Kiro CLI, Claude Code, Gemini CLI) use their own file editing and shell execution tools. They report results via `session/update` notifications with `ToolCallContentDiff` and `ToolCallContentTerminal`. SYNTH receives full diff data and terminal output without touching the filesystem.
+
+#### Subprocess Crash Handling
+
+The `run()` method wraps `spawn_agent_process` in try/finally. On any exit:
+1. Cancel pending permission Future
+2. Transition to TERMINATED
+3. Emit `BrokerError` with details
+
+#### Permission Handling
+
+When the SDK calls `request_permission()`:
+1. Create `asyncio.Future[str]` and store as `_permission_future`
+2. Transition to `AWAITING_PERMISSION`
+3. Emit `PermissionRequested` event (Future stays on session, not on event)
+4. Await the Future
+5. On resolution: return `AllowedOutcome` with the selected `option_id`
+6. On cancellation: return `DeniedOutcome(outcome="cancelled")`
+7. Transition back to `BUSY`
+
+The broker resolves the Future via `session.resolve_permission(option_id)`.
+
+### 3.2 ACPBroker (Layer 2)
+
+Central orchestration service. Owns all `ACPSession` instances.
+
+```python
+class ACPBroker:
+    _sessions: dict[str, ACPSession]
+    _event_queue: asyncio.Queue[BrokerEvent]
+    _config: SessionConfig
+    _permission_engine: PermissionEngine
+    _poller: MessagePoller | None
+    _session_id: str  # "{config.project}-{uuid4.hex[:8]}"
+```
+
+Key behaviors:
+- `handle(command)` — match/case dispatch for all `BrokerCommand` subclasses
+- `events()` — async iterator over the event queue, terminates on shutdown
+- `_sink(event)` — intercepts `PermissionRequested` for auto-resolve before forwarding to queue
+- `get_agent_states()` — returns `{agent_id: state}` for all launched sessions
+- `get_agent_configs()` — returns all `AgentConfig` from the session config
+- Prompt dispatch is fire-and-forget (`create_task`) so `handle(SendPrompt)` doesn't block
+- Pre-registers all config agents in SQLite at startup so `list_agents` works immediately
+- MCP server config injected into each agent's `session/new` using `McpServerStdio` + `EnvVariable`
+
+### 3.3 PermissionEngine
+
+Reads/writes `~/.synth/rules.json`. Keyed on `(agent_id, tool_kind)`.
+
+```python
+class PermissionEngine:
+    def check(self, agent_id: str, tool_kind: str) -> PermissionDecision | None: ...
+    def persist(self, rule: PermissionRule) -> None: ...
+```
+
+Handles missing file (empty ruleset) and corrupt JSON (warning + empty ruleset) gracefully. Writes atomically via `.tmp` + `rename`.
+
+**Known bug (ACP-7):** `PermissionDecision` currently only has `allow` and `reject`. The ACP schema defines four kinds: `allow_once`, `allow_always`, `reject_once`, `reject_always`. The `_find_option_id` method maps `allow` → `allow_once`, so `allow_always` rules can never be stored. Additionally, `persist()` is never called — the "always" options don't actually persist. See Section 16 for the fix design.
+
+### 3.4 MessagePoller
+
+Polls SQLite via `PRAGMA data_version` at 100ms intervals using a persistent `aiosqlite` connection.
+
+Key behaviors:
+- Accepts a `DeliverFn` callback (not a broker reference) to avoid circular dependency
+- Combined delivery: multiple pending messages for one agent become a single `session/prompt`
+- Two-phase status: messages marked `delivered` only after `session/prompt` succeeds
+- Only delivers to IDLE agents; leaves messages pending for BUSY agents
+- Initial sweep on startup to catch messages from before the poller started
+- Session-scoped queries (ignores messages from other sessions)
+- `stop()` awaits current poll cycle completion (guarantees no in-flight deliveries)
+
+### 3.5 MCP Server (`synth-mcp`)
+
+FastMCP server using `mcp.server.fastmcp.FastMCP` (from the `mcp` package, not a separate `fastmcp` package). Each agent spawns its own instance. All instances share the same SQLite database.
+
+Tools provided:
+
+| Tool | Description |
+|---|---|
+| `send_message` | Send a message to a teammate (`to_agent="*"` broadcasts, expanded at send time) |
+| `check_delivery` | Check delivery status of a sent message |
+| `list_agents` | List all agents in the current session with status |
+| `deregister_agent` | Mark this agent as inactive (does not delete the row) |
+
+`pull_messages` was removed — the broker's poller handles all delivery. Agents receive messages between turns automatically via `session/prompt`.
+
+Auto-registers the agent on first tool call via `INSERT OR IGNORE`. WAL mode enabled.
+
+---
+
+## 4. Data Strategy
+
+### 4.1 Design Rationale
+
+The broker is a mandatory parent process that owns every agent's stdio channel. If the broker dies, all agents die. In-flight state cannot outlive the broker. SYNTH uses in-memory state for everything the broker owns, and persists only what must survive restarts.
+
+### 4.2 What Lives Where
+
+| Concern | Storage | Rationale |
+|---|---|---|
+| Agent state | Broker memory | Dies with broker (and so do agents) |
+| Conversation history | Broker memory + TUI event buffers | Streaming through broker; TUI buffers per-agent for panel replay |
+| Inter-agent messages | SQLite (write by MCP server, read by broker) | MCP servers are separate processes with no direct IPC to broker |
+| Permission rules | JSON file (`~/.synth/rules.json`) | Small, rarely written, must survive restarts |
+| Session resume IDs | JSON file (`~/.synth/sessions.json`) | Written on graceful shutdown |
+| Token usage | Broker memory (per-agent cumulative) | Ephemeral; displayed in TUI topbar |
+
+### 4.3 SQLite Schema
+
+```sql
+CREATE TABLE agents (
+    agent_id    TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active',
+    registered  INTEGER NOT NULL
+);
+
+CREATE TABLE messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    from_agent  TEXT NOT NULL,
+    to_agent    TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  INTEGER NOT NULL,
+    claimed_at  INTEGER
+);
+```
+
+WAL mode enabled. Broadcast `"*"` is expanded to individual rows at send time.
+
+---
+
+## 5. Inter-Agent Messaging
+
+### 5.1 Why MCP (Not ACP) for Agent-to-Agent
+
+ACP is client↔agent. Tool discovery flows from agent to MCP server, not from agent to client. The broker cannot expose tools as ACP-native capabilities. Agents need an actual MCP server for `send_message`, `check_delivery`, etc.
+
+### 5.2 Message Flow
+
+```
+agent-1 calls send_message(to="agent-2", body="...")
+  → synth-mcp writes to SQLite messages table
+  → Broker's MessagePoller detects PRAGMA data_version change (~100ms)
+  → Broker reads pending messages, groups by recipient
+  → If agent-2 is IDLE: combined delivery via session/prompt
+  → If agent-2 is BUSY: stays queued, delivered when IDLE
+```
+
+### 5.3 MCP Server Config Injection
+
+```python
+from acp.schema import McpServerStdio, EnvVariable
+
+mcp_servers = [McpServerStdio(
+    name="synth-mcp",
+    command="synth-mcp",
+    args=[],
+    env=[
+        EnvVariable(name="SYNTH_SESSION_ID", value=self._session_id),
+        EnvVariable(name="SYNTH_DB_PATH", value=str(self._db_path)),
+        EnvVariable(name="SYNTH_AGENT_ID", value=agent_id),
+    ],
+)]
+```
+
+### 5.4 Topology Support
+
+SYNTH does not enforce a topology. Topology emerges from how agents are prompted:
+- **Human-dispatch**: Human prompts individual agents. Agents don't message each other.
+- **Orchestrator**: One coordinator uses `send_message` to delegate to workers.
+- **Peer-to-peer**: Any agent messages any other. Broker delivers to idle agents.
+
+---
+
+## 6. Layer Boundary Contracts
+
+### 6.1 Events (Broker → Frontend)
+
+```python
+class BrokerEvent(BaseModel, frozen=True):
+    timestamp: datetime
+    agent_id: str
+
+class AgentStateChanged(BrokerEvent):
+    old_state: AgentState
+    new_state: AgentState
+
+class MessageChunkReceived(BrokerEvent):
+    chunk: str
+
+class ToolCallUpdated(BrokerEvent):
+    tool_call_id: str
+    title: str
+    kind: str
+    status: str
+
+class PermissionRequested(BrokerEvent):
+    request_id: str
+    title: str
+    kind: str
+    options: list[PermissionOption]  # SDK type from acp.schema
+
+class PermissionAutoResolved(BrokerEvent):
+    request_id: str
+    decision: PermissionDecision
+
+class TurnComplete(BrokerEvent):
+    stop_reason: str
+
+class McpMessageDelivered(BrokerEvent):
+    from_agent: str
+    to_agent: str
+    preview: str = ""
+
+class BrokerError(BrokerEvent):
+    message: str
+    severity: Literal["warning", "error"] = "error"
+```
+
+Note: The design doc v0.2 showed `_future: asyncio.Future` on `PermissionRequested` and `message_id` on `MessageChunkReceived`. The implementation correctly diverged: the Future lives on `ACPSession._permission_future` (not on the event), and `MessageChunkReceived` has no `message_id` field. The `McpMessagePending` event from v0.2 was replaced by `McpMessageDelivered` with a `preview` field.
+
+### 6.2 Commands (Frontend → Broker)
+
+```python
+class BrokerCommand(BaseModel, frozen=True): ...
+class LaunchAgent(BrokerCommand):    agent_id: str
+class TerminateAgent(BrokerCommand): agent_id: str
+class SendPrompt(BrokerCommand):     agent_id: str; text: str
+class RespondPermission(BrokerCommand): agent_id: str; option_id: str
+class CancelTurn(BrokerCommand):     agent_id: str
+```
+
+Note: `RespondPermission` has no `request_id` field. Since ACP enforces one pending permission per agent at a time, `agent_id` is sufficient to find the right Future.
+
+### 6.3 Broker Public API
+
+```python
+class ACPBroker:
+    async def handle(self, command: BrokerCommand) -> None: ...
+    async def events(self) -> AsyncIterator[BrokerEvent]: ...
+    def get_agent_states(self) -> dict[str, AgentState]: ...
+    def get_agent_configs(self) -> list[AgentConfig]: ...
+    async def shutdown(self) -> None: ...
+```
+
+`events()` is an infinite async iterator backed by an unbounded `asyncio.Queue`. It terminates (`StopAsyncIteration`) when `shutdown()` is called. Single-consumer design — one frontend at a time.
+
+### 6.4 Textual Bridge
+
+The TUI wraps broker events in a single `BrokerEventMessage` Textual message class. Widgets inspect `event` type via `isinstance`. This avoids a parallel message hierarchy that must stay in sync with `models/events.py`.
+
+```python
+class BrokerEventMessage(Message):
+    def __init__(self, event: BrokerEvent) -> None:
+        self.event = event
+        super().__init__()
+```
+
+The app runs a named worker (`"broker-consumer"`) that consumes `broker.events()` and posts `BrokerEventMessage` to the Textual message tree. Worker errors are caught and surfaced via `on_worker_state_changed` with auto-restart.
+
+---
+
+## 7. Permission Handling
+
+### 7.1 Flow
+
+```
+Agent sends request_permission
+  → ACPSession creates Future, stores as _permission_future
+  → ACPSession transitions BUSY → AWAITING_PERMISSION
+  → ACPSession emits PermissionRequested event to broker
+  → Broker's _sink() intercepts:
+      → Checks PermissionEngine for persisted rule
+      → If rule exists: calls session.resolve_permission(option_id), emits PermissionAutoResolved
+      → If no rule: forwards event to UI via event queue
+  → UI renders PermissionRequest widget with 4 buttons
+  → User clicks button → UI sends RespondPermission command
+  → Broker calls session.resolve_permission(option_id)
+  → If option is allow_always/reject_always: broker persists rule
+  → ACPSession.request_permission() awaits Future, gets option_id
+  → ACPSession transitions AWAITING_PERMISSION → BUSY
+  → Agent resumes
+```
+
+### 7.2 Decision Options
+
+| Kind | Label | Behavior |
+|---|---|---|
+| `allow_once` | Allow once | Respond with approval, no persistence |
+| `allow_always` | Always allow | Respond with approval, persist rule |
+| `reject_once` | Reject | Respond with rejection, no persistence |
+| `reject_always` | Always reject | Respond with rejection, persist rule |
+
+### 7.3 Graceful Shutdown
+
+Enforced ordering:
+
+1. Stop accepting new commands (`_shutting_down = True`)
+2. Cancel all active prompts
+3. Stop the message poller (await current cycle)
+4. Persist session IDs to `~/.synth/sessions.json`
+5. Terminate all sessions (kills subprocesses)
+6. Cancel all asyncio tasks
+
+---
+
+## 8. Launch Model & Configuration
+
+### 8.1 Config Resolution Order
+
+1. `--harness` present → build transient config from flags, skip file discovery
+2. `--config PATH` present → load that specific file
+3. Auto-discover `.synth.toml` then `.synth.json` in CWD
+4. First-run interactive picker (TUI mode only; headless prints error and exits)
+
+### 8.2 Config Format — `.synth.toml`
+
+```toml
+project = "my-api"
+
+[[agents]]
+id      = "orchestrator"
+cmd     = ["kiro-cli", "acp", "--agent", "orchestrator"]
+label   = "Orchestrator"
+profile = "orchestrator"
+cwd     = "."
+
+[[agents]]
+id      = "reviewer"
+cmd     = ["claude", "mcp", "--agent", "reviewer"]
+label   = "Code Reviewer"
+profile = "reviewer"
+env     = { ANTHROPIC_MODEL = "claude-opus-4-6" }
+```
+
+### 8.3 AgentConfig Model
+
+```python
+class AgentConfig(BaseModel, frozen=True):
+    id: str                          # CSS-safe: [a-zA-Z0-9][a-zA-Z0-9_-]*
+    cmd: list[str]                   # full argv
+    label: str | None = None         # display name; defaults to id
+    profile: str | None = None       # harness agent name
+    cwd: str = "."
+    env: dict[str, str] = {}
+
+    @property
+    def display_name(self) -> str: return self.label or self.id
+    @property
+    def binary(self) -> str: return self.cmd[0]       # backward compat
+    @property
+    def args(self) -> list[str]: return self.cmd[1:]   # backward compat
+```
+
+Legacy coercion: a `model_validator(mode="before")` converts old `{"binary": "kiro-cli", "args": ["acp"]}` to `cmd=["kiro-cli", "acp"]`.
+
+### 8.4 SessionConfig Model
+
+```python
+class SessionConfig(BaseModel, frozen=True):
+    project: str                     # was: session
+    agents: list[AgentConfig]
+    ui: UIConfig = UIConfig()
+```
+
+Legacy coercion: `session` accepted as synonym for `project`. `autostart` removed — all configured agents launch on startup.
+
+### 8.5 Known Harnesses Registry
+
+Data-driven registry in `src/synth_acp/data/harnesses/*.toml`. Powers PATH probing, `--harness` flag resolution, and install hints. Adding a new harness is a TOML file addition with no Python changes.
+
+### 8.6 CLI Flags
+
+| Flag | Description |
+|---|---|
+| `--harness NAME` | Harness to launch (kiro, claude, opencode, gemini). Bypasses config file. |
+| `--agent NAME` | Agent within the harness. Only with `--harness`. |
+| `--config PATH` / `-c` | Explicit config file path. |
+| `--headless` | Run without TUI (stdin/stdout mode). |
+| `--verbose` / `-v` | Enable debug logging. |
+
+### 8.7 Data Directory (`~/.synth/`)
+
+```
+~/.synth/
+├── rules.json          # Persisted permission rules
+├── sessions.json       # Session resume IDs
+└── synth.db            # SQLite database (inter-agent messages)
+```
+
+---
+
+## 9. Textual UI
+
+### 9.1 Theme and Styling
+
+Theme: `catppuccin-mocha`. All styles in external `ui/css/app.tcss`. Only Textual design tokens (`$primary`, `$surface`, `$text-muted`, etc.) — no hardcoded colors in CSS. Agent colors assigned from a rotating palette of 8-10 visually distinct colors by config index.
+
+### 9.2 Layout
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  SYNTH             [session: dev-project]  32k tok  $0.14   │
+├──────────────────┬──────────────────────────────────────────┤
+│  AGENTS          │  ▸ Thinking…                             │
+│  ────────────    │  ──────────────────────────────────────  │
+│  ● coordinator   │  [10:42] You → agent-1                   │
+│  ● kiro-auth     │  Refactor the auth module to use JWT.    │
+│  ○ kiro-api      │                                          │
+│                  │  [10:42] agent-1                         │
+│  [+ Launch]      │  ▶ read  reading src/auth.py     ✓       │
+│                  │  ▶ edit  modifying src/auth.py   ●       │
+│                  │  I'll start by extracting the session... │
+│                  │  ▌                                       │
+│                  ├──────────────────────────────────────────┤
+│  MCP MESSAGES    │  ⚠ PERMISSION REQUEST                    │
+│  ────────────    │  agent-1 wants to execute:               │
+│  3 pending       │  $ pip install pyjwt                     │
+│                  │                                          │
+│                  │  [ Allow once ]  [ Always allow ]        │
+│                  │  [ Reject ]      [ Always reject ]       │
+│                  ├──────────────────────────────────────────┤
+│                  │  > Send message to agent-1...            │
+└──────────────────┴──────────────────────────────────────────┘
+```
+
+### 9.3 Widget Hierarchy
+
+- `AgentList` — sidebar (32 chars). `AgentTile` per agent, `LaunchButton`, `MCPButton`.
+- `ConversationFeed` — scrollable container, one per agent (lazy-created, stays alive):
+  - `PromptBubble` — right-aligned, `$primary` border
+  - `ThoughtBlock` — `Collapsible` wrapping `MarkdownStream`, collapsed when finalized
+  - `AgentMessage` — extends `Markdown`, uses `MarkdownStream` for incremental rendering
+  - `ToolCallBlock` — kind icon + color, title, status badge
+  - `PermissionRequest` — yellow border, 4 `Button` widgets
+- `MessageQueue` — thread list + detail, grouped by sorted agent pairs
+- `InputBar` — `Input` widget, disabled when BUSY/AWAITING_PERMISSION, `@agent-id` routing
+
+### 9.4 Streaming Markdown
+
+Agent responses use Textual's native `Markdown` + `MarkdownStream`:
+
+```python
+class AgentMessage(Markdown):
+    @property
+    def stream(self) -> MarkdownStream:
+        if self._stream is None:
+            self._stream = self.get_stream(self)
+        return self._stream
+
+    async def append_chunk(self, chunk: str) -> None:
+        await self.stream.write(chunk)
+```
+
+### 9.5 Panel Lifecycle
+
+Panels are created lazily on first selection with event buffering:
+
+- The app maintains `dict[str, list[BrokerEvent]]` per agent from broker start
+- On first selection: panel is created, drains buffer, renders backlog
+- Once created: panel stays in DOM, switching is CSS `display` toggle via `ContentSwitcher`
+- After creation: events flow directly to the mounted panel
+
+This gives fast startup, no lost events, and instant switching after first view.
+
+### 9.6 Key Bindings
+
+| Key | Action |
+|---|---|
+| `Tab` | Cycle agent focus |
+| `Enter` | Submit prompt |
+| `m` | MCP messages panel |
+| `l` | Launch agent (modal) |
+| `F1` | Help (modal) |
+| `Ctrl+P` | Command palette |
+| `q` | Quit |
+
+### 9.7 MCP Messages Panel
+
+TUI-side `dict[tuple[str, str], list[McpMessageDelivered]]` keyed by sorted agent pairs, populated from live events. No SQLite access from Layer 3. Thread list on left, metadata detail on right. Message body display deferred to Phase 3 when broker exposes message content API.
+
+---
+
+## 10. Technology Stack
+
+| Layer | Choice | Rationale |
+|---|---|---|
+| Language | Python 3.12+ | asyncio native |
+| TUI | Textual | Terminal + browser via `textual serve` |
+| ACP transport | JSON-RPC 2.0 over stdio | Standard ACP |
+| ACP library | `agent-client-protocol` (PyPI) | Official SDK; Pydantic models, `spawn_agent_process`, contrib helpers |
+| Models | Pydantic v2 | Already a dependency via ACP SDK; fast Rust core |
+| MCP server | `mcp>=1.0.0` (`mcp.server.fastmcp.FastMCP`) | Agent-to-agent messaging |
+| IPC | SQLite (WAL mode) | Zero-config cross-process coordination |
+| Config | TOML (stdlib `tomllib`) + JSON backward compat | Human-readable, comments, standard |
+| Package manager | uv | Fast, modern Python packaging |
+| Linting | ruff | Formatting + linting |
+| Type checking | ty | Replaces mypy |
+| Testing | pytest + pytest-asyncio | `asyncio_mode = "auto"` |
+
+---
+
+## 11. Design Decisions and Rejected Alternatives
+
+### 11.1 Pydantic v2 over dataclasses
+ACP SDK depends on Pydantic. Consistency + free JSON serialization outweighs marginal overhead.
+
+### 11.2 In-memory broker state over SQLite for everything
+Broker owns all lifecycles. Persisting ephemeral state provides durability against a failure mode that doesn't exist.
+
+### 11.3 JSON file over SQLite for permission rules
+Small dataset, rare writes, single writer, human-readable.
+
+### 11.4 SQLite message bus over direct IPC
+MCP servers are separate processes with no direct channel to broker. SQLite is zero-config IPC.
+
+### 11.5 Composition over inheritance for ACPSession
+SDK classes aren't designed for inheritance. Composition is stable across version bumps.
+
+### 11.6 Separate widgets over monolithic conversation renderer
+Reusable, independently testable, follows Textual's message-driven architecture.
+
+### 11.7 Single-consumer event stream over broadcast
+One frontend at a time. Fan-out added when needed.
+
+### 11.8 Permission Future on session, not on event
+Keeps Pydantic events serializable. Broker resolves via `_sessions[agent_id]` lookup.
+
+### 11.9 Broadcast expanded at MCP server send time
+Poller stays simple (deliver to named agent). Individual rows independently trackable.
+
+### 11.10 MessagePoller accepts DeliverFn callback
+Avoids circular reference. Poller holds callable, broker passes bound method.
+
+### 11.11 `pull_messages` removed from MCP server
+Broker poller handles all delivery. Agents receive messages between turns automatically.
+
+### 11.12 `cmd` replaces `binary`/`args` in AgentConfig
+Cleaner model. Backward-compat properties (`binary`, `args`) preserve existing callsites.
+
+### 11.13 `project` replaces `session` in SessionConfig
+Better name. Legacy coercion accepts `session` key.
+
+### 11.14 `autostart` removed
+Orchestrator-first model: all configured agents launch on startup.
+
+### 11.15 TOML over JSON for config
+Comments, human-readable, stdlib `tomllib`. JSON supported for backward compat.
+
+### 11.16 Lazy panel creation with event buffering over SessionAccumulator
+Simpler, no Phase 1 changes needed. Panels created on first view, stay alive, events buffered until then.
+
+### 11.17 `mcp` package, not `fastmcp`
+`FastMCP` lives at `mcp.server.fastmcp.FastMCP` inside the official `mcp` package. No separate dependency.
+
+---
+
+## 12. Implementation Phases
+
+### Phase 1 — ACP Core + Headless Broker ✅
+
+Completed. Includes: ACPSession, ACPBroker, PermissionEngine, MessagePoller, synth-mcp, interactive CLI, 29 tests.
+
+### Phase 2 — Textual TUI ✅
+
+Completed. Includes: SynthApp, AgentList, ConversationFeed, PromptBubble, AgentMessage (MarkdownStream), ToolCallBlock, PermissionRequest, MessageQueue, InputBar, external CSS, `--headless` flag.
+
+### Phase 3 — UX Overhaul + Critical Fixes
+
+- **ACP-7:** Fix permission persistence bug (extend `PermissionDecision`, wire `persist()`)
+- **Textual-10:** Worker error handling with auto-restart
+- **Config migration:** `.synth.toml` support, `cmd` field, `project` field, harness registry, first-run picker, `--harness`/`--agent` flags
+- **ACP-3:** Capture `InitializeResponse` capabilities
+- **ACP-1a:** Handle `agent_thought_chunk`, render `ThoughtBlock` (Collapsible + MarkdownStream)
+- **ACP-1b:** Handle `usage_update`, display token count + cost in topbar
+- **Textual-1:** Modal screens (LaunchAgentScreen, HelpScreen)
+- **Textual-5:** LoadingIndicator during INITIALIZING
+- **Textual-2 + 3:** ContentSwitcher + reactive watchers
+
+### Phase 4 — Session Management + Control Surface
+
+- **ACP-4:** Session resume via `list_sessions` / `load_session`
+- **ACP-5:** `set_session_mode` / `set_session_model` via command palette
+- **ACP-2:** Adopt `SessionAccumulator` (refactor session.py, unblocks plan/mode/commands)
+- **ACP-1c:** Plan panel
+- **Textual-4:** Command palette (`SynthCommandProvider`)
+- **Textual-8:** AgentTile keyboard focus
+
+### Phase 5 — Advanced Features
+
+- Dynamic agent management (`launch_agent`/`terminate_agent` in synth-mcp)
+- Topology visualization
+- `@file:path` prompt attachments
+- Filesystem/terminal client capabilities (configurable)
+- Web mode (`textual serve`)
+- JSONL audit log
+
+---
+
+## 13. Entrypoints
+
+```toml
+[project.scripts]
+synth = "synth_acp.cli:main"
+synth-mcp = "synth_acp.mcp.server:main"
+```
+
+---
+
+## 14. Dependencies
+
+```toml
+[project]
+requires-python = ">=3.12"
+dependencies = [
+    "agent-client-protocol",
+    "textual",
+    "mcp>=1.0.0",
+    "aiosqlite>=0.19.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.11",
+    "ty>=0.0.1a7",
+]
+```
+
+---
+
+## 15. Package Layout
+
+```
+synth-acp/
+├── pyproject.toml
+├── src/synth_acp/
+│   ├── __init__.py / __main__.py / cli.py
+│   ├── models/
+│   │   ├── agent.py          # AgentConfig, AgentState, transitions
+│   │   ├── config.py         # SessionConfig, load_config
+│   │   ├── events.py         # BrokerEvent subclasses
+│   │   ├── commands.py       # BrokerCommand subclasses
+│   │   └── permissions.py    # PermissionDecision, PermissionRule
+│   ├── acp/
+│   │   └── session.py        # ACPSession
+│   ├── broker/
+│   │   ├── broker.py         # ACPBroker
+│   │   ├── permissions.py    # PermissionEngine
+│   │   └── poller.py         # MessagePoller
+│   ├── mcp/
+│   │   └── server.py         # synth-mcp (FastMCP)
+│   ├── data/
+│   │   └── harnesses/        # Known harness TOML files
+│   └── ui/
+│       ├── app.py            # SynthApp
+│       ├── messages.py       # BrokerEventMessage
+│       ├── screens/          # ModalScreens (launch, help, resume)
+│       ├── widgets/          # AgentList, ConversationFeed, etc.
+│       └── css/app.tcss
+├── docs/
+│   ├── DESIGN.md
+│   └── references/
+├── tests/                    # Mirrors src/ structure
+└── examples/
+    └── echo_agent.py
+```
+
+---
+
+## 16. Gap Analysis Summary
+
+Detailed analysis in `docs/references/design_gaps.md`. Key items by priority:
+
+### 🔴 Critical
+
+| ID | Summary |
+|---|---|
+| ACP-7 | `allow_always`/`reject_always` never persisted — permission rules don't work |
+
+### 🟠 High
+
+| ID | Summary |
+|---|---|
+| ACP-1a | `agent_thought_chunk` dropped — no agent reasoning visible |
+| ACP-1b | `usage_update` dropped — no token count or cost visibility |
+| ACP-3 | `InitializeResponse` discarded — agent capabilities unknown |
+| ACP-4 | No `load_session`/`list_sessions` — session context lost on restart |
+| Textual-1 | No `ModalScreen` — launch/help are notification stubs |
+| Textual-10 | Worker error swallowed silently — broker consumer failures invisible |
+
+### 🟡 Medium
+
+| ID | Summary |
+|---|---|
+| ACP-2 | `SessionAccumulator` unused — manual event dispatch growing fragile |
+| ACP-1c | `AgentPlanUpdate` dropped — no plan visibility |
+| ACP-5 | No `set_session_mode`/`set_session_model` — can't control agents at runtime |
+| Textual-2 | Manual display toggling instead of `ContentSwitcher` |
+| Textual-3 | `reactive` declared but never watched |
+| Textual-4 | No command palette |
+| Textual-5 | No `LoadingIndicator` during INITIALIZING |
+
+### 🟢 Low
+
+ACP-6, ACP-8, ACP-9, ACP-10, ACP-1d, ACP-1e, Textual-7, Textual-8, Textual-9, Textual-11
+
+---
+
+## Changelog
+
+### v0.3 (2026-03-25)
+- Incorporated UX & CLI design: TOML config, `cmd` field, `project` field, harness registry, first-run picker, `--harness`/`--agent` flags
+- Incorporated gap analysis: documented all unhandled ACP session_update types, permission persistence bug, missing SDK capabilities
+- Updated to reflect actual implementation: `mcp` not `fastmcp`, `pull_messages` removed, Future on session not event, `RespondPermission` without `request_id`, `McpMessageDelivered` with `preview`, fire-and-forget prompt dispatch
+- Added TUI design details: MarkdownStream, lazy panel lifecycle, event buffering, ContentSwitcher, ThoughtBlock, command palette, worker error handling
+- Reorganized phases to reflect completed work (Phase 1-2 done) and prioritized roadmap (Phase 3-5)
+
+### v0.2 (2026-03-24)
+- Added permission Future-based flow, awaited state notifications, combined message delivery, two-phase status, graceful shutdown ordering, config validation, BrokerError event, rendering strategy, async iterator contract
+
+### v0.1 (2026-03-24)
+- Initial design document
