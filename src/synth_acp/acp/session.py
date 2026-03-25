@@ -23,12 +23,14 @@ from acp import spawn_agent_process, text_block
 from synth_acp.models.agent import TRANSITIONS, AgentState, InvalidTransitionError
 from synth_acp.models.events import (
     AgentStateChanged,
+    AgentThoughtReceived,
     BrokerError,
     BrokerEvent,
     MessageChunkReceived,
     PermissionRequested,
     ToolCallUpdated,
     TurnComplete,
+    UsageUpdated,
 )
 
 log = logging.getLogger(__name__)
@@ -62,6 +64,7 @@ class ACPSession:
         self._conn: Any = None
         self._session_id: str | None = None
         self._permission_future: asyncio.Future[str] | None = None
+        self._capabilities: Any = None
 
     async def _set_state(self, new_state: AgentState) -> None:
         """Transition state and notify broker. Awaited to prevent races."""
@@ -82,7 +85,7 @@ class ACPSession:
                 proc,
             ):
                 self._conn = conn
-                await conn.initialize(
+                init_response = await conn.initialize(
                     protocol_version=1,
                     client_capabilities=ClientCapabilities(
                         fs=FileSystemCapability(read_text_file=False, write_text_file=False),
@@ -90,6 +93,7 @@ class ACPSession:
                     ),
                     client_info=Implementation(name="synth", version="0.1.0"),
                 )
+                self._capabilities = getattr(init_response, "agent_capabilities", None)
                 session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers)
                 self._session_id = session.session_id
                 await self._set_state(AgentState.IDLE)
@@ -137,6 +141,7 @@ class ACPSession:
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         """Called by ACP SDK when agent streams a response."""
         su = getattr(update, "session_update", None) or getattr(update, "sessionUpdate", None)
+        log.debug("session_update type=%s agent=%s", su, self.agent_id)
         if su in ("agent_message_chunk",):
             content = getattr(update, "content", None)
             if content:
@@ -161,6 +166,23 @@ class ACPSession:
                     title=getattr(update, "title", "") or "",
                     kind=getattr(update, "kind", "other") or "other",
                     status=getattr(update, "status", "in_progress") or "in_progress",
+                )
+            )
+        elif su == "agent_thought_chunk":
+            content = getattr(update, "content", None)
+            if content:
+                text = getattr(content, "text", None)
+                if text:
+                    await self._event_sink(AgentThoughtReceived(agent_id=self.agent_id, chunk=text))
+        elif su == "usage_update":
+            cost = getattr(update, "cost", None)
+            await self._event_sink(
+                UsageUpdated(
+                    agent_id=self.agent_id,
+                    size=getattr(update, "size", 0),
+                    used=getattr(update, "used", 0),
+                    cost_amount=getattr(cost, "amount", None) if cost else None,
+                    cost_currency=getattr(cost, "currency", None) if cost else None,
                 )
             )
 

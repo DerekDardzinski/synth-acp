@@ -1,0 +1,6 @@
+identity = "kiro"
+name = "Kiro CLI"
+short_name = "kiro"
+binary_names = ["kiro-cli"]
+run_cmd = "kiro-cli acp"
+run_cmd_with_agent = "kiro-cli acp --agent {agent}"

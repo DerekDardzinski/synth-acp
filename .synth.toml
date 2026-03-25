@@ -1,0 +1,11 @@
+project = "test"
+
+[[agents]]
+id = "kiro"
+cmd = ["kiro-cli", "acp"]
+cwd = "."
+
+[[agents]]
+id = "kiro-2"
+cmd = ["kiro-cli", "acp"]
+cwd = "."

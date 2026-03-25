@@ -19,8 +19,8 @@ from synth_acp.ui.messages import BrokerEventMessage
 def _make_config(*agent_ids: str) -> SessionConfig:
     """Create a minimal SessionConfig."""
     return SessionConfig(
-        session="test",
-        agents=[{"id": aid, "binary": "echo"} for aid in agent_ids],
+        project="test",
+        agents=[{"id": aid, "cmd": ["echo"]} for aid in agent_ids],
     )
 
 

@@ -1,9 +1,11 @@
-"""Session configuration parsed from .synth.json."""
+"""Session configuration parsed from .synth.toml or .synth.json."""
 
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, model_validator
 
@@ -18,14 +20,28 @@ class UIConfig(BaseModel, frozen=True):
 
 
 class SessionConfig(BaseModel, frozen=True):
-    """Top-level configuration from .synth.json."""
+    """Top-level session configuration.
 
-    session: str
+    Supports both ``project`` (new) and ``session`` (legacy) keys.
+    """
+
+    project: str
     agents: list[AgentConfig]
     ui: UIConfig = UIConfig()
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_session_to_project(cls, data: Any) -> Any:
+        """Rename legacy ``session`` key to ``project``."""
+        if isinstance(data, dict):
+            data = dict(data)
+            if "session" in data and "project" not in data:
+                data["project"] = data.pop("session")
+        return data
+
     @model_validator(mode="after")
     def validate_unique_ids(self) -> SessionConfig:
+        """Ensure no duplicate agent IDs."""
         ids = [a.id for a in self.agents]
         dupes = [x for x in ids if ids.count(x) > 1]
         if dupes:
@@ -33,12 +49,42 @@ class SessionConfig(BaseModel, frozen=True):
         return self
 
 
+def find_config(cwd: Path) -> Path | None:
+    """Find a config file in the given directory.
+
+    Checks ``.synth.toml`` first, then ``.synth.json``.
+
+    Args:
+        cwd: Directory to search in.
+
+    Returns:
+        Path to the config file, or None if not found.
+    """
+    toml_path = cwd / ".synth.toml"
+    if toml_path.exists():
+        return toml_path
+    json_path = cwd / ".synth.json"
+    if json_path.exists():
+        return json_path
+    return None
+
+
 def load_config(path: Path) -> SessionConfig:
-    """Load and validate a .synth.json file.
+    """Load and validate a config file (.toml or .json).
 
     Relative agent CWD paths are resolved against the config file's parent directory.
+
+    Args:
+        path: Path to the config file.
+
+    Returns:
+        Validated SessionConfig.
     """
-    raw = json.loads(path.read_text())
+    if path.suffix == ".toml":
+        raw = tomllib.loads(path.read_text())
+    else:
+        raw = json.loads(path.read_text())
+
     config = SessionConfig.model_validate(raw)
 
     config_dir = path.parent.resolve()
@@ -48,3 +94,25 @@ def load_config(path: Path) -> SessionConfig:
         resolved_agents.append(agent.model_copy(update={"cwd": str(cwd)}))
 
     return config.model_copy(update={"agents": resolved_agents})
+
+
+def write_toml_config(path: Path, config: SessionConfig) -> None:
+    """Write a SessionConfig as TOML.
+
+    Args:
+        path: Destination file path.
+        config: The configuration to write.
+    """
+    lines = [f'project = "{config.project}"', ""]
+    for agent in config.agents:
+        lines.append("[[agents]]")
+        lines.append(f'id = "{agent.id}"')
+        lines.append(f"cmd = {agent.cmd!r}")
+        if agent.label:
+            lines.append(f'label = "{agent.label}"')
+        if agent.profile:
+            lines.append(f'profile = "{agent.profile}"')
+        if agent.cwd != ".":
+            lines.append(f'cwd = "{agent.cwd}"')
+        lines.append("")
+    path.write_text("\n".join(lines))

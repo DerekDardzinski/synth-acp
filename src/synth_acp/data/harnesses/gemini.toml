@@ -1,0 +1,6 @@
+identity = "gemini"
+name = "Gemini CLI"
+short_name = "gemini"
+binary_names = ["gemini"]
+run_cmd = "gemini --experimental-acp"
+run_cmd_with_agent = "gemini --experimental-acp -e {agent}"

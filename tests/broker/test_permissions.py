@@ -1,63 +1,80 @@
-"""Tests for PermissionEngine rule loading, lookup, and persistence."""
+"""Tests for PermissionEngine rule lookup and persistence."""
 
 from __future__ import annotations
 
-import json
-import logging
+import sqlite3
 from pathlib import Path
-
-import pytest
 
 from synth_acp.broker.permissions import PermissionEngine
 from synth_acp.models.permissions import PermissionDecision, PermissionRule
 
 
 class TestPermissionEngine:
-    def test_check_when_rule_exists_returns_decision(self, tmp_path: Path) -> None:
-        rules_file = tmp_path / "rules.json"
-        rules_file.write_text(
-            json.dumps([{"agent_id": "agent-1", "tool_kind": "execute", "decision": "allow"}])
-        )
-        engine = PermissionEngine(rules_file)
-
-        assert engine.check("agent-1", "execute") == PermissionDecision.allow
-
     def test_check_when_no_rule_returns_none(self, tmp_path: Path) -> None:
-        rules_file = tmp_path / "rules.json"
-        rules_file.write_text(json.dumps([]))
-        engine = PermissionEngine(rules_file)
+        db = tmp_path / "synth.db"
+        engine = PermissionEngine(db, session_id="sess-1")
 
-        assert engine.check("agent-1", "execute") is None
+        assert engine.check("agent-1", "execute", "sess-1") is None
 
-    def test_persist_when_called_writes_to_disk_and_updates_cache(self, tmp_path: Path) -> None:
-        rules_file = tmp_path / "rules.json"
-        engine = PermissionEngine(rules_file)
-
-        rule = PermissionRule(
-            agent_id="agent-1", tool_kind="edit", decision=PermissionDecision.reject
+    def test_check_when_allow_always_stored_returns_allow_always(self, tmp_path: Path) -> None:
+        db = tmp_path / "synth.db"
+        engine = PermissionEngine(db, session_id="sess-1")
+        engine.persist(
+            PermissionRule(
+                agent_id="agent-1",
+                tool_kind="execute",
+                session_id="sess-1",
+                decision=PermissionDecision.allow_always,
+            )
         )
-        engine.persist(rule)
 
-        # In-memory cache updated
-        assert engine.check("agent-1", "edit") == PermissionDecision.reject
-        # Disk written — reload from scratch to verify
-        engine2 = PermissionEngine(rules_file)
-        assert engine2.check("agent-1", "edit") == PermissionDecision.reject
+        assert engine.check("agent-1", "execute", "sess-1") == PermissionDecision.allow_always
 
-    def test_init_when_file_missing_starts_empty(self, tmp_path: Path) -> None:
-        rules_file = tmp_path / "nonexistent" / "rules.json"
-        engine = PermissionEngine(rules_file)
+    def test_persist_when_called_writes_to_sqlite(self, tmp_path: Path) -> None:
+        db = tmp_path / "synth.db"
+        engine = PermissionEngine(db, session_id="sess-1")
+        engine.persist(
+            PermissionRule(
+                agent_id="agent-1",
+                tool_kind="execute",
+                session_id="sess-1",
+                decision=PermissionDecision.allow_always,
+            )
+        )
 
-        assert engine.check("agent-1", "execute") is None
+        conn = sqlite3.connect(str(db))
+        row = conn.execute("SELECT agent_id, tool_kind, session_id, decision FROM rules").fetchone()
+        conn.close()
 
-    def test_init_when_file_corrupt_starts_empty(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        rules_file = tmp_path / "rules.json"
-        rules_file.write_text("{invalid json")
+        assert row == ("agent-1", "execute", "sess-1", "allow_always")
 
-        with caplog.at_level(logging.WARNING):
-            engine = PermissionEngine(rules_file)
+    def test_check_when_different_session_returns_none(self, tmp_path: Path) -> None:
+        db = tmp_path / "synth.db"
+        engine = PermissionEngine(db, session_id="sess-1")
+        engine.persist(
+            PermissionRule(
+                agent_id="agent-1",
+                tool_kind="execute",
+                session_id="sess-1",
+                decision=PermissionDecision.allow_always,
+            )
+        )
 
-        assert engine.check("agent-1", "execute") is None
-        assert "Corrupt rules file" in caplog.text
+        assert engine.check("agent-1", "execute", "sess-2") is None
+
+    def test_init_when_called_starts_with_empty_cache(self, tmp_path: Path) -> None:
+        db = tmp_path / "synth.db"
+        # Persist a rule via one engine instance
+        engine1 = PermissionEngine(db, session_id="sess-1")
+        engine1.persist(
+            PermissionRule(
+                agent_id="agent-1",
+                tool_kind="execute",
+                session_id="sess-1",
+                decision=PermissionDecision.allow_always,
+            )
+        )
+
+        # New engine instance should NOT pre-load from SQLite
+        engine2 = PermissionEngine(db, session_id="sess-1")
+        assert engine2.check("agent-1", "execute", "sess-1") is None

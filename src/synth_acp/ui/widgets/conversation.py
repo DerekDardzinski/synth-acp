@@ -12,6 +12,7 @@ from synth_acp.ui.widgets.agent_message import AgentMessage
 from synth_acp.ui.widgets.input_bar import InputBar
 from synth_acp.ui.widgets.permission import PermissionRequest
 from synth_acp.ui.widgets.prompt_bubble import PromptBubble
+from synth_acp.ui.widgets.thought_block import ThoughtBlock
 from synth_acp.ui.widgets.tool_call import ToolCallBlock
 
 
@@ -28,6 +29,7 @@ class ConversationFeed(Vertical):
         self._agent_id = agent_id
         self._color = color
         self._current_message: AgentMessage | None = None
+        self._current_thought: ThoughtBlock | None = None
         self._scroll: ScrollableContainer | None = None
         self.input_bar: InputBar | None = None
 
@@ -64,6 +66,20 @@ class ConversationFeed(Vertical):
             assert self._scroll is not None
             self._scroll.mount(self._current_message)
         await self._current_message.append_chunk(chunk)
+        assert self._scroll is not None
+        self._scroll.scroll_end(animate=False)
+
+    async def add_thought_chunk(self, chunk: str) -> None:
+        """Append a streaming thought chunk, creating a ThoughtBlock if needed.
+
+        Args:
+            chunk: Markdown fragment from agent reasoning.
+        """
+        if self._current_thought is None:
+            self._current_thought = ThoughtBlock()
+            assert self._scroll is not None
+            self._scroll.mount(self._current_thought)
+        await self._current_thought.append_chunk(chunk)
         assert self._scroll is not None
         self._scroll.scroll_end(animate=False)
 
@@ -119,7 +135,10 @@ class ConversationFeed(Vertical):
             pass
 
     async def finalize_current_message(self) -> None:
-        """Finalize the active streaming message."""
+        """Finalize the active streaming message and thought block."""
+        if self._current_thought is not None:
+            await self._current_thought.finalize()
+            self._current_thought = None
         if self._current_message is not None:
             await self._current_message.finalize()
             self._current_message = None

@@ -1,0 +1,6 @@
+identity = "opencode"
+name = "OpenCode"
+short_name = "opencode"
+binary_names = ["opencode"]
+run_cmd = "opencode acp"
+run_cmd_with_agent = "opencode acp"

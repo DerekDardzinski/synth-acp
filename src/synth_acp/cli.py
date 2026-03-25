@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
+import importlib.resources
 import logging
+import shutil
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
+import typer
+from pydantic import BaseModel
+
 from synth_acp.broker.broker import ACPBroker
 from synth_acp.models.commands import LaunchAgent, RespondPermission, SendPrompt
-from synth_acp.models.config import load_config
+from synth_acp.models.config import SessionConfig, find_config, load_config, write_toml_config
 from synth_acp.models.events import (
     AgentStateChanged,
     BrokerError,
@@ -25,6 +30,53 @@ from synth_acp.models.events import (
 )
 
 log = logging.getLogger(__name__)
+
+app = typer.Typer(invoke_without_command=True)
+
+
+# ------------------------------------------------------------------
+# HarnessEntry model
+# ------------------------------------------------------------------
+
+
+class HarnessEntry(BaseModel, frozen=True):
+    """A known ACP-capable harness from the registry.
+
+    Attributes:
+        identity: Unique key for the harness.
+        name: Human-readable display name.
+        short_name: Used with ``--harness`` flag.
+        binary_names: Executables searched in PATH.
+        run_cmd: Command template without agent.
+        run_cmd_with_agent: Command template with ``{agent}`` placeholder.
+    """
+
+    identity: str
+    name: str
+    short_name: str
+    binary_names: list[str]
+    run_cmd: str
+    run_cmd_with_agent: str
+
+
+def load_harness_registry() -> list[HarnessEntry]:
+    """Load all harness definitions from package data.
+
+    Returns:
+        List of HarnessEntry objects.
+    """
+    entries: list[HarnessEntry] = []
+    harness_dir = importlib.resources.files("synth_acp.data.harnesses")
+    for item in harness_dir.iterdir():
+        if hasattr(item, "name") and item.name.endswith(".toml"):
+            data = tomllib.loads(item.read_text())
+            entries.append(HarnessEntry.model_validate(data))
+    return entries
+
+
+# ------------------------------------------------------------------
+# Input parsing (preserved from original)
+# ------------------------------------------------------------------
 
 
 def parse_input(text: str, default_agent: str | None) -> tuple[str, str] | None:
@@ -72,6 +124,11 @@ def parse_permission_response(text: str, options: list) -> str | None:
     return None
 
 
+# ------------------------------------------------------------------
+# Event printing (headless mode)
+# ------------------------------------------------------------------
+
+
 def _print_event(
     event: BrokerEvent,
     pending_permissions: list[dict[str, Any]],
@@ -111,12 +168,13 @@ def _print_event(
             print(f"[message] {src} → {dst}")
 
 
-async def _read_input() -> str:
-    """Read a line from stdin via event loop reader.
+# ------------------------------------------------------------------
+# Async stdin reader
+# ------------------------------------------------------------------
 
-    Uses add_reader instead of run_in_executor so no background thread
-    blocks shutdown when Ctrl+C fires.
-    """
+
+async def _read_input() -> str:
+    """Read a line from stdin via event loop reader."""
     loop = asyncio.get_running_loop()
     future: asyncio.Future[str] = loop.create_future()
 
@@ -136,28 +194,193 @@ async def _read_input() -> str:
         raise
 
 
-async def _run(config_path: Path) -> None:
-    """Load config, launch autostart agents, run interactive loop.
+# ------------------------------------------------------------------
+# Config resolution
+# ------------------------------------------------------------------
+
+
+def _build_transient_config(harness_name: str, agent_name: str | None) -> SessionConfig:
+    """Build a transient SessionConfig from a harness name.
 
     Args:
-        config_path: Path to .synth.json config file.
+        harness_name: The ``--harness`` value (short_name).
+        agent_name: Optional ``--agent`` value.
+
+    Returns:
+        A SessionConfig with a single agent.
+
+    Raises:
+        typer.Exit: If the harness is not found.
     """
-    config = load_config(config_path)
+    registry = load_harness_registry()
+    harness = next((h for h in registry if h.short_name == harness_name), None)
+    if not harness:
+        known = ", ".join(sorted(h.short_name for h in registry))
+        print(f"Unknown harness '{harness_name}'. Known: {known}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    agent_id = agent_name or harness.short_name
+    if agent_name:
+        cmd = harness.run_cmd_with_agent.format(agent=agent_id).split()
+    else:
+        cmd = harness.run_cmd.split()
+
+    return SessionConfig(
+        project=Path.cwd().name,
+        agents=[{"id": agent_id, "cmd": cmd}],
+    )
+
+
+def _resolve_config(
+    harness: str | None,
+    agent: str | None,
+    config_path: Path | None,
+    headless: bool,
+) -> SessionConfig:
+    """Resolve configuration using the priority order.
+
+    Args:
+        harness: ``--harness`` flag value.
+        agent: ``--agent`` flag value.
+        config_path: ``--config`` flag value.
+        headless: Whether running in headless mode.
+
+    Returns:
+        Resolved SessionConfig.
+
+    Raises:
+        typer.Exit: If no config can be resolved.
+    """
+    # 1. --harness → transient config
+    if harness:
+        return _build_transient_config(harness, agent)
+
+    # 2. --config → load file
+    if config_path:
+        if not config_path.exists():
+            print(f"Config not found: {config_path}", file=sys.stderr)
+            raise typer.Exit(1)
+        return load_config(config_path)
+
+    # 3. Auto-discover
+    found = find_config(Path.cwd())
+    if found:
+        return load_config(found)
+
+    # 4. First-run picker (TUI only)
+    if headless:
+        print("No config found. Run without --headless for interactive setup.", file=sys.stderr)
+        raise typer.Exit(1)
+
+    return _first_run_picker()
+
+
+# ------------------------------------------------------------------
+# First-run picker
+# ------------------------------------------------------------------
+
+
+def _first_run_picker() -> SessionConfig:
+    """Interactive first-run setup that probes PATH for harnesses.
+
+    Detects installed harnesses, shows a numbered list, prompts for
+    agent name and project name, writes ``.synth.toml``, and returns
+    the config.
+
+    Returns:
+        The newly created SessionConfig.
+
+    Raises:
+        typer.Exit: If no harnesses are found.
+    """
+    registry = load_harness_registry()
+
+    # Probe PATH for installed harnesses
+    installed: list[tuple[HarnessEntry, str]] = []
+    for harness in registry:
+        for binary in harness.binary_names:
+            path = shutil.which(binary)
+            if path:
+                installed.append((harness, path))
+                break
+
+    if not installed:
+        print("\nNo supported harnesses found in PATH.\n", file=sys.stderr)
+        print("Install one of:", file=sys.stderr)
+        for h in registry:
+            print(f"  - {h.name} ({', '.join(h.binary_names)})", file=sys.stderr)
+        raise typer.Exit(1)
+
+    print("\nNo .synth.toml found. Let's set one up.\n")
+    print("Which harness?")
+    for i, (harness, path) in enumerate(installed, 1):
+        print(f"  {i}) {harness.short_name}    ({path})")
+
+    # Get harness selection
+    while True:
+        choice = input("\n  > ").strip()
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(installed):
+                selected_harness, _ = installed[idx]
+                break
+        except ValueError:
+            pass
+        print(f"  Enter a number 1-{len(installed)}")
+
+    # Get agent name
+    default_agent = selected_harness.short_name
+    agent_input = input(f"\nAgent name [{default_agent}]: ").strip()
+    agent_name = agent_input or default_agent
+
+    # Get project name
+    default_project = Path.cwd().name
+    project_input = input(f"Project name [{default_project}]: ").strip()
+    project_name = project_input or default_project
+
+    # Build cmd
+    if agent_name != default_agent:
+        cmd = selected_harness.run_cmd_with_agent.format(agent=agent_name).split()
+    else:
+        cmd = selected_harness.run_cmd.split()
+
+    config = SessionConfig(
+        project=project_name,
+        agents=[{"id": agent_name, "cmd": cmd}],
+    )
+
+    config_path = Path.cwd() / ".synth.toml"
+    write_toml_config(config_path, config)
+    print(f"\nWrote {config_path}\n")
+
+    return load_config(config_path)
+
+
+# ------------------------------------------------------------------
+# Headless run
+# ------------------------------------------------------------------
+
+
+async def _run(config: SessionConfig) -> None:
+    """Run in headless mode with the given config.
+
+    Args:
+        config: Resolved session configuration.
+    """
     broker = ACPBroker(config)
 
-    autostart = [a for a in config.agents if a.autostart]
-    if not autostart:
-        print(f"No autostart agents in {config_path}", file=sys.stderr)
+    if not config.agents:
+        print("No agents configured", file=sys.stderr)
         return
 
-    # Launch all autostart agents
-    for agent in autostart:
+    # Launch all agents
+    for agent in config.agents:
         print(f"[synth] Launching {agent.id}...")
         await broker.handle(LaunchAgent(agent_id=agent.id))
 
-    # Wait for all autostart agents to reach IDLE
+    # Wait for all agents to reach IDLE
     idle_agents: set[str] = set()
-    expected = {a.id for a in autostart}
+    expected = {a.id for a in config.agents}
     async for event in broker.events():
         _print_event(event, {})
         if isinstance(event, AgentStateChanged) and event.new_state == "idle":
@@ -169,7 +392,7 @@ async def _run(config_path: Path) -> None:
             return
 
     # Auto-select default agent if only one
-    default_agent: str | None = autostart[0].id if len(config.agents) == 1 else None
+    default_agent: str | None = config.agents[0].id if len(config.agents) == 1 else None
     pending_permissions: list[dict[str, Any]] = []
 
     # Start event consumer task
@@ -244,45 +467,47 @@ async def _run(config_path: Path) -> None:
             pass
 
 
-def _run_tui(config_path: Path) -> None:
+# ------------------------------------------------------------------
+# TUI run
+# ------------------------------------------------------------------
+
+
+def _run_tui(config: SessionConfig) -> None:
     """Launch the Textual TUI.
 
     Args:
-        config_path: Path to .synth.json config file.
+        config: Resolved session configuration.
     """
     from synth_acp.ui.app import SynthApp
 
-    config = load_config(config_path)
     broker = ACPBroker(config)
     SynthApp(broker, config).run()
 
 
-def main() -> None:
-    """Entry point for `synth` CLI."""
-    parser = argparse.ArgumentParser(description="SYNTH — multi-agent ACP orchestrator")
-    parser.add_argument(
-        "-c",
-        "--config",
-        type=Path,
-        default=Path(".synth.json"),
-        help="Path to .synth.json (default: .synth.json in CWD)",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run without TUI (stdin/stdout mode)",
-    )
-    args = parser.parse_args()
+# ------------------------------------------------------------------
+# Typer command
+# ------------------------------------------------------------------
 
-    if args.verbose:
+
+@app.command()
+def cli(
+    harness: str | None = typer.Option(None, help="Harness to launch (e.g. kiro, claude)"),
+    agent: str | None = typer.Option(None, help="Agent within the harness"),
+    config: Path | None = typer.Option(None, "-c", "--config", help="Path to config file"),
+    headless: bool = typer.Option(False, help="Run without TUI (stdin/stdout mode)"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Enable debug logging"),
+) -> None:
+    """SYNTH — multi-agent ACP orchestrator."""
+    if verbose:
         logging.basicConfig(level=logging.DEBUG)
+        logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 
-    if not args.config.exists():
-        print(f"Config not found: {args.config}", file=sys.stderr)
-        sys.exit(1)
+    resolved = _resolve_config(harness, agent, config, headless)
 
-    if args.headless:
-        asyncio.run(_run(args.config))
+    if headless:
+        asyncio.run(_run(resolved))
     else:
-        _run_tui(args.config)
+        _run_tui(resolved)
+
+
+main = app

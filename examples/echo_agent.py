@@ -65,9 +65,7 @@ class EchoAgent(Agent):
         **kwargs: Any,
     ) -> PromptResponse:
         for block in prompt:
-            text = (
-                block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")
-            )
+            text = block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")
             chunk = update_agent_message(text_block(text))
             await self._conn.session_update(session_id=session_id, update=chunk)
         return PromptResponse(stop_reason="end_turn")

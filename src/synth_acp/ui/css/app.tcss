@@ -134,6 +134,13 @@ AgentMessage {
     color: $text-muted;
 }
 
+ThoughtBlock {
+    height: auto;
+    margin-right: 8;
+    border: round $surface;
+    color: $text-muted;
+}
+
 ToolCallBlock {
     height: auto;
     background: $background;

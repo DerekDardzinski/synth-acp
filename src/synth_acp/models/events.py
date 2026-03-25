@@ -74,6 +74,26 @@ class TurnComplete(BrokerEvent):
     stop_reason: str
 
 
+class AgentThoughtReceived(BrokerEvent):
+    """A streaming thought/reasoning chunk from an agent."""
+
+    chunk: str
+
+
+class UsageUpdated(BrokerEvent):
+    """Context window and cost snapshot from an agent turn.
+
+    ``cost_amount`` and ``cost_currency`` reflect per-turn values as
+    reported by the ACP SDK.  The broker may accumulate these into
+    cumulative totals before surfacing to the UI.
+    """
+
+    size: int
+    used: int
+    cost_amount: float | None = None
+    cost_currency: str | None = None
+
+
 class McpMessageDelivered(BrokerEvent):
     """An inter-agent message was delivered via the poller."""
 

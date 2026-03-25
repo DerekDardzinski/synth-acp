@@ -9,6 +9,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Footer, Static
+from textual.worker import WorkerState
 
 from synth_acp.broker.broker import ACPBroker
 from synth_acp.models.agent import AgentState
@@ -16,6 +17,7 @@ from synth_acp.models.commands import LaunchAgent
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
     AgentStateChanged,
+    AgentThoughtReceived,
     BrokerError,
     BrokerEvent,
     McpMessageDelivered,
@@ -24,6 +26,7 @@ from synth_acp.models.events import (
     PermissionRequested,
     ToolCallUpdated,
     TurnComplete,
+    UsageUpdated,
 )
 from synth_acp.ui.messages import BrokerEventMessage
 from synth_acp.ui.widgets.agent_list import AgentList, AgentTile, MCPButton
@@ -83,7 +86,7 @@ class SynthApp(App):
         with Horizontal(id="topbar"):
             yield Static("SYNTH", id="tb-title")
             yield Static("│", id="tb-sep")
-            yield Static(f"session: {self.config.session}", id="tb-session")
+            yield Static(f"project: {self.config.project}", id="tb-session")
             yield Static("", id="tb-right")
         with Horizontal(id="main"):
             agents = [(a.id, self._agent_colors[a.id]) for a in self.config.agents]
@@ -93,13 +96,12 @@ class SynthApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
-        """Launch autostart agents and start the broker event consumer."""
+        """Launch all agents and start the broker event consumer."""
         for agent in self.config.agents:
             self._event_buffers[agent.id] = []
         for agent in self.config.agents:
-            if agent.autostart:
-                await self.broker.handle(LaunchAgent(agent_id=agent.id))
-        self.run_worker(self._consume_broker_events(), exit_on_error=False)
+            await self.broker.handle(LaunchAgent(agent_id=agent.id))
+        self.run_worker(self._consume_broker_events(), exit_on_error=False, name="broker-consumer")
 
     async def _consume_broker_events(self) -> None:
         """Consume broker events and post them as Textual messages."""
@@ -167,6 +169,8 @@ class SynthApp(App):
         """
         if isinstance(event, MessageChunkReceived):
             await feed.add_chunk(event.chunk)
+        elif isinstance(event, AgentThoughtReceived):
+            await feed.add_thought_chunk(event.chunk)
         elif isinstance(event, ToolCallUpdated):
             feed.add_tool_call(event.tool_call_id, event.title, event.kind, event.status)
         elif isinstance(event, PermissionRequested):
@@ -177,6 +181,8 @@ class SynthApp(App):
             feed.remove_permission(event.request_id)
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
+        elif isinstance(event, UsageUpdated):
+            self._update_usage_display(event)
         elif isinstance(event, BrokerError):
             self.notify(event.message, severity=event.severity)
 
@@ -192,6 +198,8 @@ class SynthApp(App):
         """
         if isinstance(event, MessageChunkReceived):
             await feed.add_chunk(event.chunk)
+        elif isinstance(event, AgentThoughtReceived):
+            await feed.add_thought_chunk(event.chunk)
         elif isinstance(event, ToolCallUpdated):
             feed.add_tool_call(event.tool_call_id, event.title, event.kind, event.status)
         elif isinstance(event, PermissionRequested):
@@ -221,6 +229,42 @@ class SynthApp(App):
             bar.set_disabled(disabled=True, hint=hint)
         else:
             bar.set_disabled(disabled=False, hint=f"Message {agent_id}…")
+
+    def _update_usage_display(self, event: UsageUpdated) -> None:
+        """Update the topbar usage display for the selected agent.
+
+        Args:
+            event: Usage snapshot from the broker.
+        """
+        if event.agent_id != self.selected_agent:
+            return
+        parts: list[str] = []
+        used = event.used
+        parts.append(f"{used // 1000}k ctx" if used >= 1000 else f"{used} ctx")
+        if event.cost_amount is not None:
+            parts.append(f"${event.cost_amount:.2f}")
+        try:
+            self.query_one("#tb-right", Static).update(
+                f"[dim]{'  '.join(parts)}[/dim]" if parts else ""
+            )
+        except Exception:
+            pass
+
+    def on_worker_state_changed(self, event: SynthApp.WorkerStateChanged) -> None:
+        """Handle worker state changes — notify and restart on error.
+
+        Args:
+            event: Textual worker state change event.
+        """
+        if event.worker.name != "broker-consumer" or event.state != WorkerState.ERROR:
+            return
+        error = event.worker.error
+        self.notify(
+            f"Broker consumer crashed: {error}",
+            severity="error",
+            timeout=0,
+        )
+        self.run_worker(self._consume_broker_events(), exit_on_error=False, name="broker-consumer")
 
     async def select_agent(self, agent_id: str) -> None:
         """Switch the right panel to the given agent.

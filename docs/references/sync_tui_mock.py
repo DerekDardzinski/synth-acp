@@ -311,11 +311,7 @@ class AgentTile(Static):
     def __init__(self, agent: dict, **kwargs) -> None:
         self.agent_data = agent
         color = _color(agent["id"])
-        warn = (
-            "  [bold yellow]⚠[/bold yellow]"
-            if agent["status"] == "AWAITING_PERMISSION"
-            else ""
-        )
+        warn = "  [bold yellow]⚠[/bold yellow]" if agent["status"] == "AWAITING_PERMISSION" else ""
         dot = _dot(agent["status"])
         conv = CONVERSATIONS.get(agent["id"], [])
         last = next((m for m in reversed(conv) if m[0] in ("agent", "tool")), None)
@@ -330,14 +326,10 @@ class AgentTile(Static):
             preview = "[bold yellow italic]awaiting permission…[/bold yellow italic]"
         elif last and last[0] == "tool":
             t = last[1]
-            preview = (
-                f"[dim]{t[:max_preview]}{'…' if len(t) > max_preview else ''}[/dim]"
-            )
+            preview = f"[dim]{t[:max_preview]}{'…' if len(t) > max_preview else ''}[/dim]"
         elif last:
             t = last[1].replace("\n", " ")
-            preview = (
-                f"[dim]{t[:max_preview]}{'…' if len(t) > max_preview else ''}[/dim]"
-            )
+            preview = f"[dim]{t[:max_preview]}{'…' if len(t) > max_preview else ''}[/dim]"
         else:
             preview = "[dim italic]idle[/dim italic]"
 
@@ -373,9 +365,7 @@ class LaunchButton(Static):
         super().__init__("[dim]+ launch agent[/dim]", id="launch-btn", **kwargs)
 
     def on_click(self) -> None:
-        self.app.notify(
-            "Launch agent dialog — not implemented in mock", title="Mock UI"
-        )
+        self.app.notify("Launch agent dialog — not implemented in mock", title="Mock UI")
 
 
 class MCPButton(Static):
@@ -477,9 +467,7 @@ class ThreadItem(Static):
             f"[bold {ca}]{a}[/bold {ca}] [dim]→[/dim] [bold {cb}]{b}[/bold {cb}]{badge}\n"
             f"  [dim {lc}]{last[0].split('-')[0]}:[/dim {lc}] [dim]{preview}[/dim]"
         )
-        super().__init__(
-            content, id=f"titem-{thread['id']}", classes="thread-item", **kwargs
-        )
+        super().__init__(content, id=f"titem-{thread['id']}", classes="thread-item", **kwargs)
         if pending:
             self.add_class("thread-pending")
 
@@ -551,9 +539,7 @@ class ThreadDetail(Vertical):
                 )
             prev_from = frm
             status_m = (
-                "[dim]✓[/dim]"
-                if status == "delivered"
-                else "[bold #f97316]pending[/bold #f97316]"
+                "[dim]✓[/dim]" if status == "delivered" else "[bold #f97316]pending[/bold #f97316]"
             )
             scroll.mount(Static(f"{text}  {status_m}", classes="tmsg-body"))
 
@@ -792,9 +778,7 @@ class TeamACPApp(App):
     def _load_thread(self, thread_id: str) -> None:
         try:
             for t in MCP_THREADS:
-                self.query_one(f"#titem-{t['id']}", ThreadItem).remove_class(
-                    "thread-active"
-                )
+                self.query_one(f"#titem-{t['id']}", ThreadItem).remove_class("thread-active")
             self.query_one(f"#titem-{thread_id}", ThreadItem).add_class("thread-active")
             self.query_one(ThreadDetail).show_thread(thread_id)
         except Exception:

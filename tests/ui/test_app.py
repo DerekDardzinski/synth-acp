@@ -16,8 +16,8 @@ from synth_acp.ui.messages import BrokerEventMessage
 def _make_config(*agent_ids: str) -> SessionConfig:
     """Create a minimal SessionConfig."""
     return SessionConfig(
-        session="test",
-        agents=[{"id": aid, "binary": "echo"} for aid in agent_ids],
+        project="test",
+        agents=[{"id": aid, "cmd": ["echo"]} for aid in agent_ids],
     )
 
 
@@ -55,29 +55,39 @@ class TestConsumeEvents:
 class TestCLIModeSelection:
     @pytest.mark.filterwarnings("ignore::RuntimeWarning")
     def test_main_when_headless_flag_calls_async_run(self, tmp_path: Path) -> None:
-        config_file = tmp_path / ".synth.json"
-        config_file.write_text('{"session":"s","agents":[{"id":"a","binary":"echo"}]}')
+        config_file = tmp_path / ".synth.toml"
+        config_file.write_text('project = "s"\n\n[[agents]]\nid = "a"\ncmd = ["echo"]\n')
 
         with (
             patch("synth_acp.cli.asyncio.run") as mock_run,
-            patch("synth_acp.cli.sys.argv", ["synth", "-c", str(config_file), "--headless"]),
+            patch(
+                "synth_acp.cli.sys.argv",
+                ["synth", "-c", str(config_file), "--headless"],
+            ),
+            pytest.raises(SystemExit, match="0"),
         ):
             from synth_acp.cli import main
 
             main()
-            mock_run.assert_called_once()
-            # Close the unawaited coroutine to suppress RuntimeWarning
-            mock_run.call_args[0][0].close()
+
+        mock_run.assert_called_once()
+        # Close the unawaited coroutine to suppress RuntimeWarning
+        mock_run.call_args[0][0].close()
 
     def test_main_when_default_calls_tui(self, tmp_path: Path) -> None:
-        config_file = tmp_path / ".synth.json"
-        config_file.write_text('{"session":"s","agents":[{"id":"a","binary":"echo"}]}')
+        config_file = tmp_path / ".synth.toml"
+        config_file.write_text('project = "s"\n\n[[agents]]\nid = "a"\ncmd = ["echo"]\n')
 
         with (
             patch("synth_acp.cli._run_tui") as mock_tui,
-            patch("synth_acp.cli.sys.argv", ["synth", "-c", str(config_file)]),
+            patch(
+                "synth_acp.cli.sys.argv",
+                ["synth", "-c", str(config_file)],
+            ),
+            pytest.raises(SystemExit, match="0"),
         ):
             from synth_acp.cli import main
 
             main()
-            mock_tui.assert_called_once_with(config_file)
+
+        mock_tui.assert_called_once()

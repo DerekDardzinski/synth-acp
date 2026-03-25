@@ -150,14 +150,14 @@ Transitions are enforced at runtime. State change notifications are `await`ed (n
 
 #### Session Update Handling
 
-Currently handles `agent_message_chunk`, `tool_call`, and `tool_call_update`. The following are identified for future implementation (see Section 16, Gap Analysis):
+Currently handles `agent_message_chunk`, `tool_call`, `tool_call_update`, `agent_thought_chunk`, and `usage_update`:
 
 | Update Type | Status | Priority |
 |---|---|---|
 | `agent_message_chunk` | ✅ Implemented | — |
 | `tool_call` / `tool_call_update` | ✅ Implemented | — |
-| `agent_thought_chunk` | ❌ Not handled | 🟠 High |
-| `usage_update` | ❌ Not handled | 🟠 High |
+| `agent_thought_chunk` | ✅ Implemented | — |
+| `usage_update` | ✅ Implemented | — |
 | `plan` | ❌ Not handled | 🟡 Medium |
 | `current_mode_update` | ❌ Not handled | 🟢 Low |
 | `available_commands_update` | ❌ Not handled | 🟢 Low |
@@ -221,17 +221,16 @@ Key behaviors:
 
 ### 3.3 PermissionEngine
 
-Reads/writes `~/.synth/rules.json`. Keyed on `(agent_id, tool_kind)`.
+Session-scoped permission engine backed by SQLite (`~/.synth/synth.db`). Keyed on `(agent_id, tool_kind, session_id)`.
 
 ```python
 class PermissionEngine:
-    def check(self, agent_id: str, tool_kind: str) -> PermissionDecision | None: ...
+    def __init__(self, db_path: Path, session_id: str) -> None: ...
+    def check(self, agent_id: str, tool_kind: str, session_id: str) -> PermissionDecision | None: ...
     def persist(self, rule: PermissionRule) -> None: ...
 ```
 
-Handles missing file (empty ruleset) and corrupt JSON (warning + empty ruleset) gracefully. Writes atomically via `.tmp` + `rename`.
-
-**Known bug (ACP-7):** `PermissionDecision` currently only has `allow` and `reject`. The ACP schema defines four kinds: `allow_once`, `allow_always`, `reject_once`, `reject_always`. The `_find_option_id` method maps `allow` → `allow_once`, so `allow_always` rules can never be stored. Additionally, `persist()` is never called — the "always" options don't actually persist. See Section 16 for the fix design.
+`PermissionDecision` has four values: `allow_once`, `allow_always`, `reject_once`, `reject_always`. Cache starts empty on each new session — no pre-loading from SQLite. `persist()` writes to both in-memory cache and SQLite `rules` table. `check()` returns the stored decision as-is (no translation). The SQLite write stores the per-run `session_id` for future session resume support.
 
 ### 3.4 MessagePoller
 
@@ -278,7 +277,7 @@ The broker is a mandatory parent process that owns every agent's stdio channel. 
 | Agent state | Broker memory | Dies with broker (and so do agents) |
 | Conversation history | Broker memory + TUI event buffers | Streaming through broker; TUI buffers per-agent for panel replay |
 | Inter-agent messages | SQLite (write by MCP server, read by broker) | MCP servers are separate processes with no direct IPC to broker |
-| Permission rules | JSON file (`~/.synth/rules.json`) | Small, rarely written, must survive restarts |
+| Permission rules | SQLite (`~/.synth/synth.db`, `rules` table) | Session-scoped, keyed on `(agent_id, tool_kind, session_id)` |
 | Session resume IDs | JSON file (`~/.synth/sessions.json`) | Written on graceful shutdown |
 | Token usage | Broker memory (per-agent cumulative) | Ephemeral; displayed in TUI topbar |
 
@@ -394,6 +393,15 @@ class McpMessageDelivered(BrokerEvent):
 class BrokerError(BrokerEvent):
     message: str
     severity: Literal["warning", "error"] = "error"
+
+class AgentThoughtReceived(BrokerEvent):
+    chunk: str
+
+class UsageUpdated(BrokerEvent):
+    size: int           # context window size in tokens
+    used: int           # tokens currently in context
+    cost_amount: float | None = None
+    cost_currency: str | None = None
 ```
 
 Note: The design doc v0.2 showed `_future: asyncio.Future` on `PermissionRequested` and `message_id` on `MessageChunkReceived`. The implementation correctly diverged: the Future lives on `ACPSession._permission_future` (not on the event), and `MessageChunkReceived` has no `message_id` field. The `McpMessagePending` event from v0.2 was replaced by `McpMessageDelivered` with a `preview` field.
@@ -687,8 +695,8 @@ ACP SDK depends on Pydantic. Consistency + free JSON serialization outweighs mar
 ### 11.2 In-memory broker state over SQLite for everything
 Broker owns all lifecycles. Persisting ephemeral state provides durability against a failure mode that doesn't exist.
 
-### 11.3 JSON file over SQLite for permission rules
-Small dataset, rare writes, single writer, human-readable.
+### 11.3 SQLite for permission rules (was JSON)
+Session-scoped rules keyed on `(agent_id, tool_kind, session_id)`. SQLite is consistent with the existing `messages`/`agents` tables and supports future session resume without subfolder proliferation.
 
 ### 11.4 SQLite message bus over direct IPC
 MCP servers are separate processes with no direct channel to broker. SQLite is zero-config IPC.
@@ -744,17 +752,16 @@ Completed. Includes: ACPSession, ACPBroker, PermissionEngine, MessagePoller, syn
 
 Completed. Includes: SynthApp, AgentList, ConversationFeed, PromptBubble, AgentMessage (MarkdownStream), ToolCallBlock, PermissionRequest, MessageQueue, InputBar, external CSS, `--headless` flag.
 
-### Phase 3 — UX Overhaul + Critical Fixes
+### Phase 3 — UX Overhaul + Critical Fixes ✅
 
-- **ACP-7:** Fix permission persistence bug (extend `PermissionDecision`, wire `persist()`)
-- **Textual-10:** Worker error handling with auto-restart
-- **Config migration:** `.synth.toml` support, `cmd` field, `project` field, harness registry, first-run picker, `--harness`/`--agent` flags
-- **ACP-3:** Capture `InitializeResponse` capabilities
-- **ACP-1a:** Handle `agent_thought_chunk`, render `ThoughtBlock` (Collapsible + MarkdownStream)
-- **ACP-1b:** Handle `usage_update`, display token count + cost in topbar
-- **Textual-1:** Modal screens (LaunchAgentScreen, HelpScreen)
-- **Textual-5:** LoadingIndicator during INITIALIZING
-- **Textual-2 + 3:** ContentSwitcher + reactive watchers
+Completed across spec phases 1-4. Includes:
+- **ACP-7:** Permission persistence fix — 4-value `PermissionDecision`, SQLite-backed `PermissionEngine`, session-scoped rules, `persist()` wired
+- **Textual-10:** Worker error handling — named `"broker-consumer"` worker, `on_worker_state_changed` with notify + auto-restart
+- **Config migration:** `.synth.toml` support, `cmd` field, `project` field, harness registry, first-run picker, typer CLI with `--harness`/`--agent`/`--config` flags
+- **ACP-3:** `InitializeResponse` capabilities captured on `ACPSession`
+- **ACP-1a:** `agent_thought_chunk` → `AgentThoughtReceived` event, `ThoughtBlock` widget (Collapsible + MarkdownStream)
+- **ACP-1b:** `usage_update` → `UsageUpdated` event, topbar context/cost display
+- Remaining: Textual-1 (modal screens), Textual-5 (LoadingIndicator), Textual-2+3 (ContentSwitcher + reactive watchers)
 
 ### Phase 4 — Session Management + Control Surface
 
@@ -796,6 +803,7 @@ dependencies = [
     "textual",
     "mcp>=1.0.0",
     "aiosqlite>=0.19.0",
+    "typer>=0.9",
 ]
 
 [dependency-groups]
@@ -856,18 +864,18 @@ Detailed analysis in `docs/references/design_gaps.md`. Key items by priority:
 
 | ID | Summary |
 |---|---|
-| ACP-7 | `allow_always`/`reject_always` never persisted — permission rules don't work |
+| ~~ACP-7~~ | ~~`allow_always`/`reject_always` never persisted~~ — **Resolved** (Phase 1): 4-value `PermissionDecision`, SQLite-backed `PermissionEngine`, session-scoped rules |
 
 ### 🟠 High
 
 | ID | Summary |
 |---|---|
-| ACP-1a | `agent_thought_chunk` dropped — no agent reasoning visible |
-| ACP-1b | `usage_update` dropped — no token count or cost visibility |
-| ACP-3 | `InitializeResponse` discarded — agent capabilities unknown |
+| ~~ACP-1a~~ | ~~`agent_thought_chunk` dropped~~ — **Resolved** (Phase 3/4): `AgentThoughtReceived` event, `ThoughtBlock` widget with streaming markdown |
+| ~~ACP-1b~~ | ~~`usage_update` dropped~~ — **Resolved** (Phase 3/4): `UsageUpdated` event, topbar display with context/cost |
+| ~~ACP-3~~ | ~~`InitializeResponse` discarded~~ — **Resolved** (Phase 3): `_capabilities` captured on `ACPSession` |
 | ACP-4 | No `load_session`/`list_sessions` — session context lost on restart |
 | Textual-1 | No `ModalScreen` — launch/help are notification stubs |
-| Textual-10 | Worker error swallowed silently — broker consumer failures invisible |
+| ~~Textual-10~~ | ~~Worker error swallowed silently~~ — **Resolved** (Phase 4): named `"broker-consumer"` worker, `on_worker_state_changed` with notify + auto-restart |
 
 ### 🟡 Medium
 
@@ -890,11 +898,12 @@ ACP-6, ACP-8, ACP-9, ACP-10, ACP-1d, ACP-1e, Textual-7, Textual-8, Textual-9, Te
 ## Changelog
 
 ### v0.3 (2026-03-25)
-- Incorporated UX & CLI design: TOML config, `cmd` field, `project` field, harness registry, first-run picker, `--harness`/`--agent` flags
-- Incorporated gap analysis: documented all unhandled ACP session_update types, permission persistence bug, missing SDK capabilities
-- Updated to reflect actual implementation: `mcp` not `fastmcp`, `pull_messages` removed, Future on session not event, `RespondPermission` without `request_id`, `McpMessageDelivered` with `preview`, fire-and-forget prompt dispatch
-- Added TUI design details: MarkdownStream, lazy panel lifecycle, event buffering, ContentSwitcher, ThoughtBlock, command palette, worker error handling
-- Reorganized phases to reflect completed work (Phase 1-2 done) and prioritized roadmap (Phase 3-5)
+- **Permission fix (ACP-7):** `PermissionDecision` extended to four values (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `PermissionEngine` migrated from JSON to SQLite with session-scoped rules. `persist()` now called on always-options. Auto-resolve works within same session.
+- **Config overhaul:** `AgentConfig` uses `cmd` field (legacy `binary`/`args` coerced). `SessionConfig` renamed `session` → `project`. TOML config support. Harness registry as package data. First-run interactive picker. CLI migrated to typer with `--harness`/`--agent`/`--config` flags.
+- **ACP session improvements:** `InitializeResponse` capabilities captured. `agent_thought_chunk` and `usage_update` handled — emit `AgentThoughtReceived` and `UsageUpdated` events. Broker accumulates usage per agent.
+- **UI — ThoughtBlock:** `ThoughtBlock(Collapsible)` widget with streaming `MarkdownStream`. Title "Thinking…" while streaming, "Thought" when finalized. Collapsed by default after finalization.
+- **UI — Usage display:** Topbar `#tb-right` shows context usage and cost for selected agent (e.g. `32k ctx  $0.14`).
+- **UI — Worker error handling:** Broker consumer worker named `"broker-consumer"`. `on_worker_state_changed` surfaces errors via persistent notification and auto-restarts the consumer.
 
 ### v0.2 (2026-03-24)
 - Added permission Future-based flow, awaited state notifications, combined message delivery, two-phase status, graceful shutdown ordering, config validation, BrokerError event, rendering strategy, async iterator contract

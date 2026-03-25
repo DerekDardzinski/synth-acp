@@ -98,9 +98,25 @@ uv run pytest -k "test_foo"        # Run matching tests
 - **File structure**: Test files mirror the source tree. `src/synth_acp/acp/session.py` → `tests/acp/test_session.py`.
 - **Async**: Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. All async tests are plain `async def` functions.
 - **Fixtures**: Shared fixtures in `tests/conftest.py`.
-- **Max 5 tests per source function** unless explicitly justified.
-- **Durable tests**: Test behavioral contracts and invariants, not implementation details. Tests should survive refactors — if the function signature and semantics don't change, the tests shouldn't break.
-- **Priority**: error handling > boundary conditions > invalid inputs > happy path.
+- **No Textual app launch**: Tests must never call `app.run_test()` or start a TUI. Test UI logic via direct method calls with mocks.
+
+### What to Test
+
+Every test must answer: **"What real bug does this catch that would otherwise fail silently?"**
+
+- A test earns its place if removing the code it covers would cause a **silent** failure — wrong data, dropped events, missing side effects — with no crash or error message.
+- A test does NOT earn its place if it merely confirms a framework/library works (Pydantic stores fields, Textual's `Collapsible.collapsed` toggles), or if the failure mode is a loud crash that any integration would catch.
+
+**Max 5 tests per source function.** If you can't articulate a distinct silent-failure bug for each test, you have too many.
+
+**Priority**: error handling > boundary conditions > invalid inputs > happy path.
+
+**Kill criteria — cut the test if any of these are true:**
+- It tests that a framework feature works (Pydantic validation, Textual widget properties)
+- The bug it catches would produce a loud crash, not a silent wrong result
+- Another test in the same file already exercises the same code path with different input values
+- It's a smoke test that just confirms construction/initialization succeeds
+- It would break on a refactor that doesn't change the function's contract
 
 ### Running Tests
 
