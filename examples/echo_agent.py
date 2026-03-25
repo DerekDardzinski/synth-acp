@@ -4,15 +4,6 @@ import asyncio
 from typing import Any
 from uuid import uuid4
 
-from acp import (
-    Agent,
-    InitializeResponse,
-    NewSessionResponse,
-    PromptResponse,
-    run_agent,
-    text_block,
-    update_agent_message,
-)
 from acp.interfaces import Client
 from acp.schema import (
     AudioContentBlock,
@@ -25,6 +16,16 @@ from acp.schema import (
     ResourceContentBlock,
     SseMcpServer,
     TextContentBlock,
+)
+
+from acp import (
+    Agent,
+    InitializeResponse,
+    NewSessionResponse,
+    PromptResponse,
+    run_agent,
+    text_block,
+    update_agent_message,
 )
 
 

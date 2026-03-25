@@ -79,3 +79,4 @@ class McpMessageDelivered(BrokerEvent):
 
     from_agent: str
     to_agent: str
+    preview: str = ""

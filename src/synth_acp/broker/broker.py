@@ -16,7 +16,7 @@ from acp.schema import EnvVariable, McpServerStdio
 from synth_acp.acp.session import ACPSession
 from synth_acp.broker.permissions import PermissionEngine
 from synth_acp.broker.poller import MessagePoller
-from synth_acp.models.agent import AgentState
+from synth_acp.models.agent import AgentConfig, AgentState
 from synth_acp.models.commands import (
     BrokerCommand,
     CancelTurn,
@@ -81,6 +81,18 @@ class ACPBroker:
                 self._resolve_permission(aid, oid)
             case CancelTurn(agent_id=aid):
                 await self._cancel(aid)
+
+    # ------------------------------------------------------------------
+    # State queries
+    # ------------------------------------------------------------------
+
+    def get_agent_states(self) -> dict[str, AgentState]:
+        """Return current state of all launched agents."""
+        return {aid: s.state for aid, s in self._sessions.items()}
+
+    def get_agent_configs(self) -> list[AgentConfig]:
+        """Return all agent configs from the session config."""
+        return list(self._config.agents)
 
     # ------------------------------------------------------------------
     # Event sink with permission interception
@@ -254,6 +266,7 @@ class ACPBroker:
                         agent_id=agent_id,
                         from_agent=sender,
                         to_agent=agent_id,
+                        preview=text,
                     )
                 )
             return True
@@ -284,10 +297,12 @@ class ACPBroker:
         """Graceful shutdown: cancel prompts, stop poller, persist, terminate."""
         self._shutting_down = True
 
-        # 1. Cancel active prompts
+        # 1. Cancel active prompts and pending permissions
         for session in self._sessions.values():
             if session.state == AgentState.BUSY:
                 await session.cancel()
+            elif session.state == AgentState.AWAITING_PERMISSION:
+                await session.terminate()
 
         # 2. Stop poller (await current cycle)
         if self._poller:
@@ -311,8 +326,8 @@ class ACPBroker:
         for task in self._tasks.values():
             task.cancel()
             try:
-                await task
-            except (asyncio.CancelledError, ConnectionError, OSError):
+                await asyncio.wait_for(task, timeout=2.0)
+            except (asyncio.CancelledError, ConnectionError, OSError, TimeoutError):
                 pass
 
         self._shutdown_event.set()

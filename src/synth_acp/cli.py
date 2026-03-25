@@ -244,6 +244,19 @@ async def _run(config_path: Path) -> None:
             pass
 
 
+def _run_tui(config_path: Path) -> None:
+    """Launch the Textual TUI.
+
+    Args:
+        config_path: Path to .synth.json config file.
+    """
+    from synth_acp.ui.app import SynthApp
+
+    config = load_config(config_path)
+    broker = ACPBroker(config)
+    SynthApp(broker, config).run()
+
+
 def main() -> None:
     """Entry point for `synth` CLI."""
     parser = argparse.ArgumentParser(description="SYNTH — multi-agent ACP orchestrator")
@@ -255,6 +268,11 @@ def main() -> None:
         help="Path to .synth.json (default: .synth.json in CWD)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without TUI (stdin/stdout mode)",
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -264,4 +282,7 @@ def main() -> None:
         print(f"Config not found: {args.config}", file=sys.stderr)
         sys.exit(1)
 
-    asyncio.run(_run(args.config))
+    if args.headless:
+        asyncio.run(_run(args.config))
+    else:
+        _run_tui(args.config)

@@ -11,7 +11,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.reactive import reactive
-from textual.widget import Widget  # noqa: F401 — kept for type hints
+from textual.widget import Widget
 from textual.widgets import Footer, Static
 
 # ── Mock data ─────────────────────────────────────────────────────────────────
