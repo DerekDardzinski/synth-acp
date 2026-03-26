@@ -253,6 +253,14 @@ class ACPBroker:
             return
         if session.state != AgentState.TERMINATED:
             await session.terminate()
+            # Cancel the run() task to kill the subprocess
+            task = self._tasks.get(agent_id)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
     async def _cancel(self, agent_id: str) -> None:
         """Cancel the active prompt on an agent."""
@@ -512,9 +520,14 @@ class ACPBroker:
 
         await self._terminate(agent_id)
 
-        # Orphan handling: set children's parent to NULL
+        # Mark agent as inactive in SQLite
         conn = sqlite3.connect(str(self._db_path))
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "UPDATE agents SET status = 'inactive' WHERE agent_id = ? AND session_id = ?",
+            (agent_id, self._session_id),
+        )
+        # Orphan handling: set children's parent to NULL
         conn.execute(
             "UPDATE agents SET parent = NULL WHERE parent = ? AND session_id = ?",
             (agent_id, self._session_id),

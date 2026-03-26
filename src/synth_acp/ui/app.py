@@ -176,7 +176,10 @@ class SynthApp(App):
                     self.log.error(f"Failed to add tile for {event.agent_id}", exc_info=True)
             try:
                 tile = self.query_one(f"#tile-{event.agent_id}", AgentTile)
-                tile.update_state(event.new_state)
+                if event.new_state == AgentState.TERMINATED:
+                    tile.remove()
+                else:
+                    tile.update_state(event.new_state)
             except Exception:
                 pass
 

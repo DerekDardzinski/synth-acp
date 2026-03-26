@@ -62,13 +62,15 @@ class AgentTile(Static):
             if self._state == AgentState.AWAITING_PERMISSION
             else ""
         )
-        if self._agent_task:
-            preview = f"[dim italic]{self._agent_task}[/dim italic]"
-        elif self._parent_agent:
-            preview = f"[dim]via {self._parent_agent}[/dim]"
-        else:
-            preview = PREVIEW_TEXT.get(self._state, DEFAULT_PREVIEW)
-        return f"{dot} [bold {self._color}]{self._agent_id}[/bold {self._color}]{warn}\n  {preview}"
+        name = f"[bold {self._color}]{self._agent_id}[/bold {self._color}]"
+        if self._parent_agent:
+            name += f" [dim](via {self._parent_agent})[/dim]"
+        preview = (
+            f"[dim italic]{self._agent_task}[/dim italic]"
+            if self._agent_task
+            else PREVIEW_TEXT.get(self._state, DEFAULT_PREVIEW)
+        )
+        return f"{dot} {name}{warn}\n  {preview}"
 
     def update_state(self, new_state: AgentState) -> None:
         """Update the tile to reflect a new agent state.

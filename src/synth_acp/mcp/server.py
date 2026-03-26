@@ -247,26 +247,36 @@ def terminate_agent(agent_id: str) -> str:
 
 @mcp.tool()
 def list_agents() -> str:
-    """List all agents in this session visible to the current agent.
+    """List all agents in this session visible to you, plus yourself.
+
+    Each entry includes is_self (true for your own entry), parent (who launched
+    the agent), and task. In LOCAL mode only your family is visible.
 
     Returns:
-        JSON array of agents with status, parent, and task.
+        JSON array of {agent_id, status, parent, task, is_self}.
     """
     conn = _get_db()
     _ensure_registered(conn)
     visible = _get_visible_agents(conn)
-    rows = (
-        conn.execute(
-            "SELECT agent_id, status, parent, task FROM agents WHERE session_id = ? AND agent_id IN ({})".format(
-                ",".join("?" * len(visible))
-            ),
-            (SESSION_ID, *visible),
-        ).fetchall()
-        if visible
-        else []
-    )
+    # Include self so the caller can see its own parent/task
+    all_ids = [*visible, AGENT_ID]
+    rows = conn.execute(
+        "SELECT agent_id, status, parent, task FROM agents WHERE session_id = ? AND agent_id IN ({})".format(
+            ",".join("?" * len(all_ids))
+        ),
+        (SESSION_ID, *all_ids),
+    ).fetchall()
     conn.close()
-    agents = [{"agent_id": r[0], "status": r[1], "parent": r[2], "task": r[3]} for r in rows]
+    agents = [
+        {
+            "agent_id": r[0],
+            "status": r[1],
+            "parent": r[2],
+            "task": r[3],
+            "is_self": r[0] == AGENT_ID,
+        }
+        for r in rows
+    ]
     return json.dumps(agents)
 
 
