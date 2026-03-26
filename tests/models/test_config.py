@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from synth_acp.models.config import SessionConfig, find_config, load_config
+from synth_acp.models.config import CommunicationMode, SessionConfig, find_config, load_config
 
 
 class TestSessionConfigValidation:
@@ -78,3 +78,20 @@ class TestFindConfig:
 
     def test_find_config_when_no_files_returns_none(self, tmp_path: Path):
         assert find_config(tmp_path) is None
+
+
+class TestSettingsConfig:
+    def test_load_config_when_settings_has_local_mode_parses_enum(self, tmp_path: Path):
+        config_file = tmp_path / ".synth.toml"
+        config_file.write_text(
+            'project = "p"\n\n[settings]\ncommunication_mode = "LOCAL"\n\n'
+            '[[agents]]\nid = "a"\ncmd = ["x"]\n'
+        )
+        config = load_config(config_file)
+        assert config.settings.communication_mode == CommunicationMode.LOCAL
+
+    def test_load_config_when_settings_absent_defaults_mesh(self, tmp_path: Path):
+        config_file = tmp_path / ".synth.toml"
+        config_file.write_text('project = "p"\n\n[[agents]]\nid = "a"\ncmd = ["x"]\n')
+        config = load_config(config_file)
+        assert config.settings.communication_mode == CommunicationMode.MESH

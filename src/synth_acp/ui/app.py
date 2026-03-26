@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -52,6 +52,18 @@ PALETTE = [
 _DISABLED_STATES = {AgentState.BUSY, AgentState.AWAITING_PERMISSION}
 
 
+class DynamicAgentInfo(NamedTuple):
+    """Metadata for a dynamically launched agent.
+
+    Attributes:
+        parent: Agent ID of the parent, or None.
+        task: Task description.
+    """
+
+    parent: str | None
+    task: str
+
+
 class SynthApp(App):
     """Textual TUI for SYNTH multi-agent orchestration."""
 
@@ -83,6 +95,7 @@ class SynthApp(App):
         self._mcp_threads: dict[tuple[str, str], list[McpMessageDelivered]] = {}
         self._mcp_count: int = 0
         self._mcp_panel: MessageQueue | None = None
+        self._dynamic_agents: dict[str, DynamicAgentInfo] = {}
 
     def compose(self) -> ComposeResult:
         """Build the top bar, main layout with sidebar, and footer."""
@@ -149,6 +162,17 @@ class SynthApp(App):
 
         if isinstance(event, AgentStateChanged):
             self._agent_states[event.agent_id] = event.new_state
+            if event.agent_id not in self._agent_colors:
+                color = PALETTE[len(self._agent_colors) % len(PALETTE)]
+                self._agent_colors[event.agent_id] = color
+                parent = self.broker._agent_parents.get(event.agent_id)
+                self._dynamic_agents[event.agent_id] = DynamicAgentInfo(parent=parent, task="")
+                self._event_buffers[event.agent_id] = []
+                try:
+                    agent_list = self.query_one(AgentList)
+                    agent_list.add_agent_tile(event.agent_id, color, parent=parent)
+                except Exception:
+                    pass
             try:
                 tile = self.query_one(f"#tile-{event.agent_id}", AgentTile)
                 tile.update_state(event.new_state)
@@ -368,7 +392,11 @@ class SynthApp(App):
 
     async def action_launch(self) -> None:
         """Open the launch agent modal and launch the selected agent."""
-        agents = [(a.id, a.display_name, self._agent_states.get(a.id)) for a in self.config.agents]
+        agents: list[tuple[str, str, AgentState | None]] = [
+            (a.id, a.display_name, self._agent_states.get(a.id)) for a in self.config.agents
+        ]
+        for agent_id in self._dynamic_agents:
+            agents.append((agent_id, agent_id, self._agent_states.get(agent_id)))
         result = await self.push_screen_wait(LaunchAgentScreen(agents))
         if result is not None:
             await self.broker.handle(LaunchAgent(agent_id=result))

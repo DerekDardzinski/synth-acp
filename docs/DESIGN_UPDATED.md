@@ -2,7 +2,7 @@
 
 **SYNTH** — **SY**nchronized **N**etwork of **T**eamed **H**arnesses over ACP
 
-Version: 0.3
+Version: 0.4
 Date: 2026-03-25
 
 ---
@@ -207,17 +207,25 @@ class ACPBroker:
     _permission_engine: PermissionEngine
     _poller: MessagePoller | None
     _session_id: str  # "{config.project}-{uuid4.hex[:8]}"
+    _agent_parents: dict[str, str | None]  # agent_id → parent agent_id (None for config-defined)
+    _pending_initial_prompts: dict[str, str]  # agent_id → message (consumed on first IDLE)
 ```
 
 Key behaviors:
 - `handle(command)` — match/case dispatch for all `BrokerCommand` subclasses
 - `events()` — async iterator over the event queue, terminates on shutdown
-- `_sink(event)` — intercepts `PermissionRequested` for auto-resolve before forwarding to queue
+- `_sink(event)` — intercepts `PermissionRequested` for auto-resolve before forwarding to queue; watches for `AgentStateChanged(new_state=IDLE)` to send initial prompts for dynamically launched agents
 - `get_agent_states()` — returns `{agent_id: state}` for all launched sessions
 - `get_agent_configs()` — returns all `AgentConfig` from the session config
 - Prompt dispatch is fire-and-forget (`create_task`) so `handle(SendPrompt)` doesn't block
 - Pre-registers all config agents in SQLite at startup so `list_agents` works immediately
 - MCP server config injected into each agent's `session/new` using `McpServerStdio` + `EnvVariable`
+- `_process_commands(commands)` — `CommandFn` implementation; dispatches launch/terminate commands from the `agent_commands` table
+- `_handle_launch_command` — resolves harness via `load_harness_registry()`, validates agent_id, checks `SYNTH_MAX_AGENTS` limit, spawns `ACPSession` with parentage tracking
+- `_handle_terminate_command` — enforces parentage (only parent can terminate children), orphans children by setting their `parent` to NULL
+- `_build_mcp_env` — constructs `EnvVariable` list for `McpServerStdio` including `SYNTH_COMMUNICATION_MODE`, `SYNTH_MAX_AGENTS`, and `AgentConfig.env`
+- `_get_visible_agents_for(agent_id)` — computes visibility from in-memory `_agent_parents` (used for join broadcasts without DB round-trip)
+- `_send_join_broadcast(agent_id, task)` — inserts system messages into `messages` table for all visible agents
 
 ### 3.3 PermissionEngine
 
@@ -238,12 +246,20 @@ Polls SQLite via `PRAGMA data_version` at 100ms intervals using a persistent `ai
 
 Key behaviors:
 - Accepts a `DeliverFn` callback (not a broker reference) to avoid circular dependency
+- Accepts an optional `CommandFn` callback for processing `agent_commands` rows
 - Combined delivery: multiple pending messages for one agent become a single `session/prompt`
 - Two-phase status: messages marked `delivered` only after `session/prompt` succeeds
 - Only delivers to IDLE agents; leaves messages pending for BUSY agents
 - Initial sweep on startup to catch messages from before the poller started
 - Session-scoped queries (ignores messages from other sessions)
+- On each poll cycle where `data_version` changed: calls `_deliver_pending` then `_process_pending_commands`
 - `stop()` awaits current poll cycle completion (guarantees no in-flight deliveries)
+
+```python
+DeliverFn = Callable[[str, str, list[str]], Awaitable[bool]]
+CommandFn = Callable[[list[tuple[int, str, str, str]]], Awaitable[None]]
+#                     list of (id, from_agent, command, payload)
+```
 
 ### 3.5 MCP Server (`synth-mcp`)
 
@@ -253,14 +269,25 @@ Tools provided:
 
 | Tool | Description |
 |---|---|
-| `send_message` | Send a message to a teammate (`to_agent="*"` broadcasts, expanded at send time) |
+| `send_message` | Send a message to a visible teammate (`to_agent="*"` broadcasts to visible set) |
 | `check_delivery` | Check delivery status of a sent message |
-| `list_agents` | List all agents in the current session with status |
+| `list_agents` | List visible agents with status, parent, and task |
 | `deregister_agent` | Mark this agent as inactive (does not delete the row) |
+| `launch_agent` | Request the broker to spawn a new agent (caller becomes parent) |
+| `terminate_agent` | Request the broker to terminate a child agent |
 
 `pull_messages` was removed — the broker's poller handles all delivery. Agents receive messages between turns automatically via `session/prompt`.
 
 Auto-registers the agent on first tool call via `INSERT OR IGNORE`. WAL mode enabled.
+
+#### Communication Modes
+
+`_get_visible_agents()` controls what each agent can see and message:
+
+- **MESH** (default): all active agents except self
+- **LOCAL**: parent, children, and siblings (agents sharing the same parent) only
+
+Mode is set via `SYNTH_COMMUNICATION_MODE` env var (passed to each MCP server instance). `list_agents` returns only visible agents. `send_message` validates target is in visible set. Broadcast `"*"` expands to visible agents only.
 
 ---
 
@@ -288,7 +315,9 @@ CREATE TABLE agents (
     agent_id    TEXT PRIMARY KEY,
     session_id  TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'active',
-    registered  INTEGER NOT NULL
+    registered  INTEGER NOT NULL,
+    parent      TEXT,       -- agent_id of launcher, NULL for config-defined
+    task        TEXT        -- one-line task summary
 );
 
 CREATE TABLE messages (
@@ -301,9 +330,20 @@ CREATE TABLE messages (
     created_at  INTEGER NOT NULL,
     claimed_at  INTEGER
 );
+
+CREATE TABLE agent_commands (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    from_agent  TEXT NOT NULL,
+    command     TEXT NOT NULL,       -- 'launch' | 'terminate'
+    payload     TEXT NOT NULL,       -- JSON
+    status      TEXT NOT NULL DEFAULT 'pending',  -- pending | processed | rejected
+    error       TEXT,
+    created_at  INTEGER NOT NULL
+);
 ```
 
-WAL mode enabled. Broadcast `"*"` is expanded to individual rows at send time.
+WAL mode enabled. Broadcast `"*"` is expanded to individual rows at send time. The `agent_commands` table serves as a durable command queue — the poller's `PRAGMA data_version` detects writes and the broker processes pending commands on each poll cycle.
 
 ---
 
@@ -337,6 +377,9 @@ mcp_servers = [McpServerStdio(
         EnvVariable(name="SYNTH_SESSION_ID", value=self._session_id),
         EnvVariable(name="SYNTH_DB_PATH", value=str(self._db_path)),
         EnvVariable(name="SYNTH_AGENT_ID", value=agent_id),
+        EnvVariable(name="SYNTH_COMMUNICATION_MODE", value=self._config.settings.communication_mode.value),
+        EnvVariable(name="SYNTH_MAX_AGENTS", value=os.environ.get("SYNTH_MAX_AGENTS", "10")),
+        # + AgentConfig.env entries forwarded as additional EnvVariables
     ],
 )]
 ```
@@ -345,8 +388,12 @@ mcp_servers = [McpServerStdio(
 
 SYNTH does not enforce a topology. Topology emerges from how agents are prompted:
 - **Human-dispatch**: Human prompts individual agents. Agents don't message each other.
-- **Orchestrator**: One coordinator uses `send_message` to delegate to workers.
+- **Orchestrator**: One coordinator uses `send_message` to delegate to workers. Workers can be dynamically spawned via `launch_agent`.
 - **Peer-to-peer**: Any agent messages any other. Broker delivers to idle agents.
+
+Communication modes (`SYNTH_COMMUNICATION_MODE`) scope visibility:
+- **MESH** (default): every agent sees every other active agent
+- **LOCAL**: agents see only their family (parent, children, siblings) — enables isolated team hierarchies within a single session
 
 ---
 
@@ -505,6 +552,9 @@ Enforced ordering:
 ```toml
 project = "my-api"
 
+[settings]
+communication_mode = "LOCAL"    # or "MESH" (default)
+
 [[agents]]
 id      = "orchestrator"
 cmd     = ["kiro-cli", "acp", "--agent", "orchestrator"]
@@ -544,17 +594,27 @@ Legacy coercion: a `model_validator(mode="before")` converts old `{"binary": "ki
 ### 8.4 SessionConfig Model
 
 ```python
+class CommunicationMode(StrEnum):
+    MESH = "MESH"
+    LOCAL = "LOCAL"
+
+class SettingsConfig(BaseModel, frozen=True):
+    communication_mode: CommunicationMode = CommunicationMode.MESH
+
 class SessionConfig(BaseModel, frozen=True):
     project: str                     # was: session
     agents: list[AgentConfig]
     ui: UIConfig = UIConfig()
+    settings: SettingsConfig = SettingsConfig()
 ```
 
 Legacy coercion: `session` accepted as synonym for `project`. `autostart` removed — all configured agents launch on startup.
 
 ### 8.5 Known Harnesses Registry
 
-Data-driven registry in `src/synth_acp/data/harnesses/*.toml`. Powers PATH probing, `--harness` flag resolution, and install hints. Adding a new harness is a TOML file addition with no Python changes.
+Data-driven registry in `src/synth_acp/data/harnesses/*.toml`. Powers PATH probing, `--harness` flag resolution, dynamic agent harness resolution, and install hints. Adding a new harness is a TOML file addition with no Python changes.
+
+`HarnessEntry` model lives in `models/config.py`. `load_harness_registry()` lives in `synth_acp/harnesses.py`. Both CLI and broker import from these shared locations (broker must not import from CLI layer).
 
 ### 8.6 CLI Flags
 
@@ -613,7 +673,7 @@ Theme: `catppuccin-mocha`. All styles in external `ui/css/app.tcss`. Only Textua
 
 ### 9.3 Widget Hierarchy
 
-- `AgentList` — sidebar (32 chars). `AgentTile` per agent, `LaunchButton`, `MCPButton`. Each tile shows a colored status dot and state-specific text (initializing…, idle, working…, awaiting permission…, terminated).
+- `AgentList` — sidebar (32 chars). `AgentTile` per agent, `LaunchButton`, `MCPButton`. Each tile shows a colored status dot and state-specific text (initializing…, idle, working…, awaiting permission…, terminated). Dynamically launched agents get tiles added at runtime via `add_agent_tile()` with the next palette color. Tile preview shows `task` if available, or `via {parent}` for dynamic agents.
 - `ConversationFeed` — scrollable container, one per agent (lazy-created, stays alive):
   - `LoadingIndicator` — shown during `INITIALIZING`, removed on `IDLE`, re-mounted on re-launch
   - `PromptBubble` — right-aligned, `$primary` border
@@ -720,6 +780,15 @@ Poller stays simple (deliver to named agent). Individual rows independently trac
 ### 11.10 MessagePoller accepts DeliverFn callback
 Avoids circular reference. Poller holds callable, broker passes bound method.
 
+### 11.10a MessagePoller accepts optional CommandFn callback
+Same pattern as DeliverFn. Poller detects `data_version` changes and dispatches to both callbacks. Avoids duplicating the polling mechanism for `agent_commands`.
+
+### 11.10b `agent_commands` table as command queue
+SQLite `status='pending'` rows ARE the queue. No separate in-memory queue needed. The poller's existing `PRAGMA data_version` detection picks up writes from MCP tool processes. Commands that can't be processed (at agent limit) stay `pending` and are retried on the next poll cycle.
+
+### 11.10c Communication mode as env var to MCP server instances
+Each MCP server is a separate process. Passing `SYNTH_COMMUNICATION_MODE` as an env var lets `_get_visible_agents()` filter locally without querying the broker. The broker computes visibility from in-memory state for join broadcasts.
+
 ### 11.11 `pull_messages` removed from MCP server
 Broker poller handles all delivery. Agents receive messages between turns automatically.
 
@@ -772,6 +841,17 @@ Completed. Proper Textual patterns replacing manual stubs:
 - **Textual-1:** `LaunchAgentScreen(ModalScreen)` and `HelpScreen(ModalScreen)` replace notification stubs; `push_screen_wait()` pattern
 - **Textual-5:** `LoadingIndicator` in `ConversationFeed` during `INITIALIZING`; removed on `IDLE`; re-mounted on re-launch preserving conversation history
 
+### Phase 3.6 — Dynamic Agent Management + Communication Modes ✅
+
+Completed. Includes:
+- **Schema:** `agent_commands` table (durable command queue), `parent`/`task` columns on `agents` table
+- **MCP tools:** `launch_agent` and `terminate_agent` write to `agent_commands`; `list_agents` returns `parent`/`task`; `_get_visible_agents()` for MESH/LOCAL filtering
+- **Broker:** `_process_commands` (CommandFn callback), harness resolution via shared `load_harness_registry()`, parentage enforcement, `SYNTH_MAX_AGENTS` limit with pending-queue retry, join broadcasts, IDLE-watch for initial prompts
+- **Config:** `CommunicationMode` StrEnum, `SettingsConfig` model, `[settings]` section in `.synth.toml`
+- **Harness refactor:** `HarnessEntry` → `models/config.py`, `load_harness_registry()` → `harnesses.py`
+- **TUI:** Dynamic `AgentTile` creation, task/parent preview, `LaunchButton` fix, `LaunchAgentScreen` includes dynamic agents
+- **Bug fix:** `opencode.toml` missing `{agent}` placeholder in `run_cmd_with_agent`
+
 ### Phase 4 — Session Management + Control Surface
 
 - **ACP-4:** Session resume via `list_sessions` / `load_session`
@@ -783,7 +863,7 @@ Completed. Proper Textual patterns replacing manual stubs:
 
 ### Phase 5 — Advanced Features
 
-- Dynamic agent management (`launch_agent`/`terminate_agent` in synth-mcp)
+- ~~Dynamic agent management (`launch_agent`/`terminate_agent` in synth-mcp)~~ — **Resolved** (Phase 3.6): `launch_agent`/`terminate_agent` MCP tools, `agent_commands` table, broker command processing, parentage tracking, communication modes (MESH/LOCAL), global agent limit, join broadcasts, TUI dynamic agent display
 - Topology visualization
 - `@file:path` prompt attachments
 - Filesystem/terminal client capabilities (configurable)
@@ -833,9 +913,10 @@ synth-acp/
 ├── pyproject.toml
 ├── src/synth_acp/
 │   ├── __init__.py / __main__.py / cli.py
+│   ├── harnesses.py          # load_harness_registry()
 │   ├── models/
 │   │   ├── agent.py          # AgentConfig, AgentState, transitions
-│   │   ├── config.py         # SessionConfig, load_config
+│   │   ├── config.py         # SessionConfig, SettingsConfig, CommunicationMode, HarnessEntry, load_config
 │   │   ├── events.py         # BrokerEvent subclasses
 │   │   ├── commands.py       # BrokerCommand subclasses
 │   │   └── permissions.py    # PermissionDecision, PermissionRule
@@ -905,6 +986,16 @@ ACP-6, ACP-8, ACP-9, ACP-10, ACP-1d, ACP-1e, Textual-7, Textual-8, Textual-9, Te
 ---
 
 ## Changelog
+
+### v0.4 (2026-03-25)
+- **Dynamic agent management:** `launch_agent`/`terminate_agent` MCP tools write to `agent_commands` SQLite table. Broker processes commands via `CommandFn` callback on `MessagePoller`. Harness resolution via shared `load_harness_registry()`. Parentage tracking (`parent`/`task` columns on `agents` table). Orphaned children get `parent=NULL`.
+- **Communication modes:** `CommunicationMode` StrEnum (`MESH`/`LOCAL`) in `SettingsConfig`. LOCAL mode restricts visibility to parent/children/siblings. `_get_visible_agents()` filters `list_agents`, `send_message`, and broadcast expansion.
+- **Global agent limit:** `SYNTH_MAX_AGENTS` env var (default 10). At-capacity launches queue as `pending` and retry on each poll cycle.
+- **Join broadcasts:** System messages sent to visible agents when a new agent is registered.
+- **Harness refactor:** `HarnessEntry` moved to `models/config.py`, `load_harness_registry()` to `harnesses.py`. Broker imports without CLI dependency.
+- **TUI dynamic agents:** `add_agent_tile()` mounts tiles at runtime. Task/parent preview in `AgentTile`. `LaunchButton` fixed to open modal. `LaunchAgentScreen` includes dynamic agents.
+- **Bug fix:** `opencode.toml` missing `{agent}` placeholder in `run_cmd_with_agent`.
+- **Config:** `[settings]` section with `communication_mode` in `.synth.toml`. `AgentConfig.env` forwarded to MCP server instances.
 
 ### v0.3 (2026-03-25)
 - **Permission fix (ACP-7):** `PermissionDecision` extended to four values (`allow_once`, `allow_always`, `reject_once`, `reject_always`). `PermissionEngine` migrated from JSON to SQLite with session-scoped rules. `persist()` now called on always-options. Auto-resolve works within same session.

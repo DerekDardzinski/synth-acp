@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import sqlite3
 import time
 import uuid
@@ -16,6 +18,7 @@ from acp.schema import EnvVariable, McpServerStdio
 from synth_acp.acp.session import ACPSession
 from synth_acp.broker.permissions import PermissionEngine
 from synth_acp.broker.poller import MessagePoller
+from synth_acp.harnesses import load_harness_registry
 from synth_acp.models.agent import AgentConfig, AgentState
 from synth_acp.models.commands import (
     BrokerCommand,
@@ -25,8 +28,9 @@ from synth_acp.models.commands import (
     SendPrompt,
     TerminateAgent,
 )
-from synth_acp.models.config import SessionConfig
+from synth_acp.models.config import CommunicationMode, SessionConfig
 from synth_acp.models.events import (
+    AgentStateChanged,
     BrokerError,
     BrokerEvent,
     McpMessageDelivered,
@@ -62,6 +66,8 @@ class ACPBroker:
         self._pending_permissions: dict[str, PermissionRequested] = {}
         self._usage: dict[str, UsageUpdated] = {}
         self._poller: MessagePoller | None = None
+        self._pending_initial_prompts: dict[str, str] = {}
+        self._agent_parents: dict[str, str | None] = {a.id: None for a in config.agents}
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -162,6 +168,15 @@ class ACPBroker:
         elif isinstance(event, UsageUpdated):
             self._accumulate_usage(event)
         await self._event_queue.put(event)
+        if (
+            isinstance(event, AgentStateChanged)
+            and event.new_state == AgentState.IDLE
+            and event.agent_id in self._pending_initial_prompts
+        ):
+            msg = self._pending_initial_prompts.pop(event.agent_id)
+            session = self._sessions.get(event.agent_id)
+            if session:
+                self._tasks[f"prompt-{event.agent_id}"] = asyncio.create_task(session.prompt(msg))
 
     @staticmethod
     def _find_option_id(options: list, decision: PermissionDecision) -> str | None:
@@ -197,11 +212,7 @@ class ACPBroker:
                 name="synth-mcp",
                 command="synth-mcp",
                 args=[],
-                env=[
-                    EnvVariable(name="SYNTH_SESSION_ID", value=self._session_id),
-                    EnvVariable(name="SYNTH_DB_PATH", value=str(self._db_path)),
-                    EnvVariable(name="SYNTH_AGENT_ID", value=agent_id),
-                ],
+                env=self._build_mcp_env(agent_id, agent_cfg.env),
             )
         ]
 
@@ -303,7 +314,9 @@ class ACPBroker:
         """Start the message poller if not already running."""
         if self._poller is None:
             self._register_agents()
-            self._poller = MessagePoller(self._db_path, self._deliver_message, self._session_id)
+            self._poller = MessagePoller(
+                self._db_path, self._deliver_message, self._session_id, self._process_commands
+            )
             await self._poller.start()
 
     def _register_agents(self) -> None:
@@ -314,7 +327,15 @@ class ACPBroker:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS agents ("
             "agent_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, "
-            "status TEXT NOT NULL DEFAULT 'active', registered INTEGER NOT NULL)"
+            "status TEXT NOT NULL DEFAULT 'active', registered INTEGER NOT NULL, "
+            "parent TEXT, task TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_commands ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
+            "from_agent TEXT NOT NULL, command TEXT NOT NULL, payload TEXT NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'pending', error TEXT, "
+            "created_at INTEGER NOT NULL)"
         )
         now = int(time.time() * 1000)
         for agent in self._config.agents:
@@ -322,6 +343,264 @@ class ACPBroker:
                 "INSERT OR REPLACE INTO agents (agent_id, session_id, status, registered) "
                 "VALUES (?, ?, 'active', ?)",
                 (agent.id, self._session_id, now),
+            )
+        conn.commit()
+        conn.close()
+
+    def _build_mcp_env(
+        self, agent_id: str, extra_env: dict[str, str] | None = None
+    ) -> list[EnvVariable]:
+        """Build the env var list for an MCP server instance.
+
+        Args:
+            agent_id: The agent this MCP server belongs to.
+            extra_env: Additional env vars from AgentConfig.env.
+
+        Returns:
+            List of EnvVariable entries.
+        """
+        env = [
+            EnvVariable(name="SYNTH_SESSION_ID", value=self._session_id),
+            EnvVariable(name="SYNTH_DB_PATH", value=str(self._db_path)),
+            EnvVariable(name="SYNTH_AGENT_ID", value=agent_id),
+            EnvVariable(
+                name="SYNTH_COMMUNICATION_MODE",
+                value=self._config.settings.communication_mode.value,
+            ),
+            EnvVariable(
+                name="SYNTH_MAX_AGENTS",
+                value=os.environ.get("SYNTH_MAX_AGENTS", "10"),
+            ),
+        ]
+        if extra_env:
+            env.extend(EnvVariable(name=k, value=v) for k, v in extra_env.items())
+        return env
+
+    # ------------------------------------------------------------------
+    # Command processing (CommandFn implementation)
+    # ------------------------------------------------------------------
+
+    async def _process_commands(self, commands: list[tuple[int, str, str, str]]) -> None:
+        """Process pending agent commands from the poller.
+
+        Args:
+            commands: List of (cmd_id, from_agent, command, payload) tuples.
+        """
+        for cmd_id, from_agent, command, payload in commands:
+            try:
+                data = json.loads(payload)
+                if command == "launch":
+                    await self._handle_launch_command(cmd_id, from_agent, data)
+                elif command == "terminate":
+                    await self._handle_terminate_command(cmd_id, from_agent, data)
+                else:
+                    self._update_command_status(cmd_id, "rejected", f"Unknown command: {command}")
+            except Exception as exc:
+                self._update_command_status(cmd_id, "rejected", str(exc))
+
+    async def _handle_launch_command(
+        self, cmd_id: int, from_agent: str, data: dict[str, str]
+    ) -> None:
+        """Handle a launch command from an agent.
+
+        Args:
+            cmd_id: The command row ID.
+            from_agent: The agent requesting the launch.
+            data: Parsed JSON payload with agent_id, agent_name, harness, cwd, task, message.
+        """
+        agent_id = data["agent_id"]
+        agent_name = data["agent_name"]
+        harness = data["harness"]
+        cwd = data.get("cwd", ".")
+        task = data.get("task", "")
+        message = data.get("message", "")
+
+        # Validate agent_id format
+        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", agent_id):
+            self._update_command_status(
+                cmd_id,
+                "rejected",
+                "Invalid agent_id: must match [a-zA-Z0-9][a-zA-Z0-9_-]*",
+            )
+            return
+
+        # Check uniqueness
+        if agent_id in self._sessions:
+            self._update_command_status(cmd_id, "rejected", f"Agent already exists: {agent_id}")
+            return
+
+        # Check global agent limit
+        max_agents = int(os.environ.get("SYNTH_MAX_AGENTS", "10"))
+        active = len([s for s in self._sessions.values() if s.state != AgentState.TERMINATED])
+        if active >= max_agents:
+            return  # Leave as pending
+
+        # Resolve harness
+        registry = load_harness_registry()
+        entry = next((e for e in registry if e.short_name == harness), None)
+        if not entry:
+            self._update_command_status(cmd_id, "rejected", f"Unknown harness: {harness}")
+            return
+
+        cmd = entry.run_cmd_with_agent.format(agent=agent_name).split()
+        agent_cfg = AgentConfig(id=agent_id, cmd=cmd, cwd=cwd)
+
+        # Register in SQLite
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        now = int(time.time() * 1000)
+        conn.execute(
+            "INSERT OR REPLACE INTO agents (agent_id, session_id, status, registered, parent, task) "
+            "VALUES (?, ?, 'active', ?, ?, ?)",
+            (agent_id, self._session_id, now, from_agent, task),
+        )
+        conn.commit()
+        conn.close()
+
+        # Track parentage
+        self._agent_parents[agent_id] = from_agent
+
+        # Spawn session
+        mcp_servers = [
+            McpServerStdio(
+                name="synth-mcp",
+                command="synth-mcp",
+                args=[],
+                env=self._build_mcp_env(agent_id, agent_cfg.env),
+            )
+        ]
+        session = ACPSession(
+            agent_id=agent_cfg.id,
+            binary=agent_cfg.binary,
+            args=agent_cfg.args,
+            cwd=agent_cfg.cwd,
+            event_sink=self._sink,
+            mcp_servers=mcp_servers,
+        )
+        self._sessions[agent_id] = session
+        self._tasks[agent_id] = asyncio.create_task(session.run())
+
+        if message:
+            self._pending_initial_prompts[agent_id] = message
+
+        self._update_command_status(cmd_id, "processed")
+
+        # Join broadcast
+        self._send_join_broadcast(agent_id, task)
+
+    async def _handle_terminate_command(
+        self, cmd_id: int, from_agent: str, data: dict[str, str]
+    ) -> None:
+        """Handle a terminate command from an agent.
+
+        Args:
+            cmd_id: The command row ID.
+            from_agent: The agent requesting termination.
+            data: Parsed JSON payload with agent_id.
+        """
+        agent_id = data["agent_id"]
+
+        # Check parentage
+        parent = self._agent_parents.get(agent_id)
+        if parent != from_agent:
+            self._update_command_status(
+                cmd_id,
+                "rejected",
+                f"Not authorized: {from_agent} is not parent of {agent_id}",
+            )
+            return
+
+        await self._terminate(agent_id)
+
+        # Orphan handling: set children's parent to NULL
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "UPDATE agents SET parent = NULL WHERE parent = ? AND session_id = ?",
+            (agent_id, self._session_id),
+        )
+        conn.commit()
+        conn.close()
+        for aid, p in self._agent_parents.items():
+            if p == agent_id:
+                self._agent_parents[aid] = None
+
+        self._update_command_status(cmd_id, "processed")
+
+    def _update_command_status(self, cmd_id: int, status: str, error: str | None = None) -> None:
+        """Update a command's status in SQLite.
+
+        Args:
+            cmd_id: The command row ID.
+            status: New status ('processed' or 'rejected').
+            error: Error message if rejected.
+        """
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "UPDATE agent_commands SET status = ?, error = ? WHERE id = ?",
+            (status, error, cmd_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def _get_visible_agents_for(self, agent_id: str) -> list[str]:
+        """Compute visible agents for a given agent using in-memory parentage.
+
+        Args:
+            agent_id: The agent to compute visibility for.
+
+        Returns:
+            List of agent_ids visible to the given agent.
+        """
+        active = {
+            aid
+            for aid, s in self._sessions.items()
+            if s.state != AgentState.TERMINATED and aid != agent_id
+        }
+        if self._config.settings.communication_mode == CommunicationMode.MESH:
+            return list(active)
+
+        # LOCAL mode: parent, children, siblings
+        parent = self._agent_parents.get(agent_id)
+        visible: set[str] = set()
+        if parent and parent in active:
+            visible.add(parent)
+        # Children
+        for aid, p in self._agent_parents.items():
+            if p == agent_id and aid in active:
+                visible.add(aid)
+        # Siblings (same parent, excluding self)
+        if parent:
+            for aid, p in self._agent_parents.items():
+                if p == parent and aid in active and aid != agent_id:
+                    visible.add(aid)
+        return list(visible)
+
+    def _send_join_broadcast(self, agent_id: str, task: str) -> None:
+        """Insert system join messages for visible agents.
+
+        Args:
+            agent_id: The newly joined agent.
+            task: The agent's task description.
+        """
+        recipients = self._get_visible_agents_for(agent_id)
+        if not recipients:
+            return
+
+        if task:
+            body = f'[System] Agent "{agent_id}" has joined. Task: {task}.'
+        else:
+            body = f'[System] Agent "{agent_id}" has joined.'
+
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        now = int(time.time() * 1000)
+        for recipient in recipients:
+            conn.execute(
+                "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at) "
+                "VALUES (?, 'system', ?, ?, 'pending', ?)",
+                (self._session_id, recipient, body, now),
             )
         conn.commit()
         conn.close()

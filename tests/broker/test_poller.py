@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from synth_acp.broker.poller import MessagePoller
 
@@ -119,3 +120,63 @@ class TestPollerStop:
         await asyncio.sleep(0.2)
 
         assert deliver_count == 0
+
+
+def _init_db_with_commands(db_path: Path) -> None:
+    """Create the schema including agent_commands table."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS messages ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
+        "from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, "
+        "claimed_at INTEGER);"
+        "CREATE TABLE IF NOT EXISTS agent_commands ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
+        "from_agent TEXT NOT NULL, command TEXT NOT NULL, payload TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'pending', error TEXT, "
+        "created_at INTEGER NOT NULL);"
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestPollerCommands:
+    async def test_poller_when_command_inserted_calls_command_fn(self, tmp_path: Path) -> None:
+        import aiosqlite
+
+        db_path = tmp_path / "test.db"
+        _init_db_with_commands(db_path)
+
+        received: list[list[tuple[int, str, str, str]]] = []
+
+        async def process_commands(cmds: list[tuple[int, str, str, str]]) -> None:
+            received.append(cmds)
+
+        poller = MessagePoller(
+            db_path,
+            deliver=AsyncMock(return_value=True),
+            session_id="sess-1",
+            process_commands=process_commands,
+        )
+
+        # Insert a pending command
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) "
+            "VALUES ('sess-1', 'agent-a', 'launch', '{\"agent_id\":\"w1\"}', 'pending', 1000)",
+        )
+        conn.commit()
+        conn.close()
+
+        # Call _process_pending_commands directly
+        async with aiosqlite.connect(db_path) as db:
+            await poller._process_pending_commands(db)
+
+        assert len(received) == 1
+        assert len(received[0]) == 1
+        cmd_id, from_agent, command, payload = received[0][0]
+        assert from_agent == "agent-a"
+        assert command == "launch"
+        assert "w1" in payload

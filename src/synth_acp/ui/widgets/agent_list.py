@@ -36,10 +36,20 @@ class AgentTile(Static):
         state: Initial agent state.
     """
 
-    def __init__(self, agent_id: str, color: str, state: AgentState = AgentState.IDLE) -> None:
+    def __init__(
+        self,
+        agent_id: str,
+        color: str,
+        state: AgentState = AgentState.IDLE,
+        *,
+        task: str = "",
+        parent: str | None = None,
+    ) -> None:
         self._agent_id = agent_id
         self._color = color
         self._state = state
+        self._task = task
+        self._parent = parent
         super().__init__(self._build_markup(), id=f"tile-{agent_id}")
         if state == AgentState.AWAITING_PERMISSION:
             self.add_class("tile-permission")
@@ -52,7 +62,12 @@ class AgentTile(Static):
             if self._state == AgentState.AWAITING_PERMISSION
             else ""
         )
-        preview = PREVIEW_TEXT.get(self._state, DEFAULT_PREVIEW)
+        if self._task:
+            preview = f"[dim italic]{self._task}[/dim italic]"
+        elif self._parent:
+            preview = f"[dim]via {self._parent}[/dim]"
+        else:
+            preview = PREVIEW_TEXT.get(self._state, DEFAULT_PREVIEW)
         return f"{dot} [bold {self._color}]{self._agent_id}[/bold {self._color}]{warn}\n  {preview}"
 
     def update_state(self, new_state: AgentState) -> None:
@@ -84,8 +99,8 @@ class LaunchButton(Static):
         super().__init__("[dim]+ launch agent[/dim]", id="launch-btn")
 
     def on_click(self) -> None:
-        """Notify that launch is not yet implemented."""
-        self.app.notify("Launch not implemented")
+        """Open the launch agent modal."""
+        self.app.action_launch()
 
 
 class MCPButton(Static):
@@ -137,3 +152,18 @@ class AgentList(Vertical):
                 yield AgentTile(agent_id, color)
             yield LaunchButton()
         yield MCPButton()
+
+    def add_agent_tile(
+        self, agent_id: str, color: str, *, task: str = "", parent: str | None = None
+    ) -> None:
+        """Mount a new agent tile into the scrollable container.
+
+        Args:
+            agent_id: Unique agent identifier.
+            color: Hex color for the agent name.
+            task: Optional task description.
+            parent: Optional parent agent ID.
+        """
+        tile = AgentTile(agent_id, color, task=task, parent=parent)
+        launch_btn = self.query_one("#launch-btn", LaunchButton)
+        self.query_one("#agent-list", ScrollableContainer).mount(tile, before=launch_btn)

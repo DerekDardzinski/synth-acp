@@ -115,3 +115,20 @@ class TestAgentStateChangedRouting:
 
             assert len(app._event_buffers["agent-1"]) == 1
             assert app._event_buffers["agent-1"][0] is event
+
+
+class TestAddAgentTile:
+    async def test_agent_list_when_add_agent_tile_called_mounts_new_tile(self) -> None:
+        """Dynamic tile appears in the DOM after add_agent_tile is called."""
+        broker = _make_broker()
+        config = _make_config("agent-1")
+        app = SynthApp(broker, config)
+
+        async with app.run_test(headless=True, size=(120, 40)):
+            from synth_acp.ui.widgets.agent_list import AgentList
+
+            agent_list = app.query_one(AgentList)
+            agent_list.add_agent_tile("new-agent", "#ff0000")
+            await app.workers.wait_for_complete()
+            tile = app.query_one("#tile-new-agent", AgentTile)
+            assert tile._agent_id == "new-agent"

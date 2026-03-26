@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from textual.app import App, ComposeResult
+from textual.widgets import Button
+
 from synth_acp.models.agent import AgentState
 from synth_acp.ui.screens.launch import _RUNNING_STATES, LaunchAgentScreen
 
@@ -45,3 +48,23 @@ class TestLaunchScreen:
             screen.action_dismiss_none()
 
         mock_dismiss.assert_called_once_with(None)
+
+
+class TestLaunchScreenDynamicAgents:
+    async def test_launch_screen_when_dynamic_agents_exist_shows_them(self) -> None:
+        """Both config-defined and dynamic agents appear as buttons."""
+        agents = [
+            ("config-agent", "Config Agent", AgentState.TERMINATED),
+            ("dynamic-agent", "dynamic-agent", AgentState.TERMINATED),
+        ]
+
+        class ShellApp(App):
+            def compose(self) -> ComposeResult:
+                yield Button("open", id="open-btn")
+
+        app = ShellApp()
+        async with app.run_test(headless=True, size=(120, 40)):
+            screen = LaunchAgentScreen(agents)
+            await app.push_screen(screen)
+            assert screen.query_one("#launch-config-agent", Button)
+            assert screen.query_one("#launch-dynamic-agent", Button)

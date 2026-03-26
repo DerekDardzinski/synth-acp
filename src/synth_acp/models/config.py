@@ -4,12 +4,53 @@ from __future__ import annotations
 
 import json
 import tomllib
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from synth_acp.models.agent import AgentConfig
+
+
+class CommunicationMode(StrEnum):
+    """Communication scoping mode for inter-agent visibility."""
+
+    MESH = "MESH"
+    LOCAL = "LOCAL"
+
+
+class SettingsConfig(BaseModel, frozen=True):
+    """Global session settings."""
+
+    communication_mode: CommunicationMode = CommunicationMode.MESH
+
+
+class HarnessEntry(BaseModel, frozen=True):
+    """A known ACP-capable harness from the registry.
+
+    Attributes:
+        identity: Unique key for the harness.
+        name: Human-readable display name.
+        short_name: Used with ``--harness`` flag.
+        binary_names: Executables searched in PATH.
+        run_cmd: Command template without agent.
+        run_cmd_with_agent: Command template with ``{agent}`` placeholder.
+    """
+
+    identity: str
+    name: str
+    short_name: str
+    binary_names: list[str]
+    run_cmd: str
+    run_cmd_with_agent: str
+
+    @field_validator("run_cmd_with_agent")
+    @classmethod
+    def _must_contain_agent_placeholder(cls, v: str) -> str:
+        if "{agent}" not in v:
+            raise ValueError("run_cmd_with_agent must contain {agent} placeholder")
+        return v
 
 
 class UIConfig(BaseModel, frozen=True):
@@ -28,6 +69,7 @@ class SessionConfig(BaseModel, frozen=True):
     project: str
     agents: list[AgentConfig]
     ui: UIConfig = UIConfig()
+    settings: SettingsConfig = SettingsConfig()
 
     @model_validator(mode="before")
     @classmethod

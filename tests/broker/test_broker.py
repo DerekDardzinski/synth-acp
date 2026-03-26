@@ -164,3 +164,295 @@ class TestBrokerUsageAccumulation:
         assert result.size == 128000
         assert result.used == 32000
         assert result.cost_currency == "USD"
+
+
+class TestProcessCommands:
+    """Tests for broker command processing (Phase 3)."""
+
+    def _init_broker_db(self, broker: ACPBroker) -> None:
+        """Initialize the broker DB with schema."""
+        broker._register_agents()
+
+    def _insert_command(
+        self,
+        broker: ACPBroker,
+        from_agent: str,
+        command: str,
+        payload: str,
+        cmd_id: int = 1,
+    ) -> int:
+        """Insert a pending command into the DB and return its ID."""
+        import sqlite3
+        import time
+
+        conn = sqlite3.connect(str(broker._db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        now = int(time.time() * 1000)
+        cursor = conn.execute(
+            "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'pending', ?)",
+            (broker._session_id, from_agent, command, payload, now),
+        )
+        row_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return row_id  # type: ignore[return-value]
+
+    def _get_command_status(self, broker: ACPBroker, cmd_id: int) -> tuple[str, str | None]:
+        """Read command status and error from DB."""
+        import sqlite3
+
+        conn = sqlite3.connect(str(broker._db_path))
+        row = conn.execute(
+            "SELECT status, error FROM agent_commands WHERE id = ?", (cmd_id,)
+        ).fetchone()
+        conn.close()
+        return (row[0], row[1]) if row else ("not_found", None)
+
+    async def test_process_commands_when_launch_with_valid_harness_spawns_session(
+        self, tmp_path: Path
+    ) -> None:
+        broker = _make_broker("orchestrator", tmp_path=tmp_path)
+        self._init_broker_db(broker)
+
+        # Mock ACPSession to avoid real subprocess
+        mock_session = AsyncMock()
+        mock_session.state = AgentState.IDLE
+        mock_session.run = AsyncMock()
+
+        import json
+
+        payload = json.dumps(
+            {
+                "agent_id": "worker-1",
+                "agent_name": "implementor",
+                "harness": "kiro",
+                "cwd": "/tmp",
+                "task": "Fix auth",
+                "message": "",
+            }
+        )
+        cmd_id = self._insert_command(broker, "orchestrator", "launch", payload)
+
+        with patch("synth_acp.broker.broker.ACPSession", return_value=mock_session):
+            await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
+
+        # Session created
+        assert "worker-1" in broker._sessions
+        # Command processed
+        status, error = self._get_command_status(broker, cmd_id)
+        assert status == "processed"
+        assert error is None
+        # Parentage tracked
+        assert broker._agent_parents["worker-1"] == "orchestrator"
+
+    async def test_process_commands_when_launch_with_unknown_harness_rejects(
+        self, tmp_path: Path
+    ) -> None:
+        broker = _make_broker("orchestrator", tmp_path=tmp_path)
+        self._init_broker_db(broker)
+
+        import json
+
+        payload = json.dumps(
+            {
+                "agent_id": "worker-1",
+                "agent_name": "implementor",
+                "harness": "nonexistent",
+                "cwd": ".",
+                "task": "",
+                "message": "",
+            }
+        )
+        cmd_id = self._insert_command(broker, "orchestrator", "launch", payload)
+
+        await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
+
+        status, error = self._get_command_status(broker, cmd_id)
+        assert status == "rejected"
+        assert "Unknown harness" in (error or "")
+
+    async def test_process_commands_when_terminate_by_non_parent_rejects(
+        self, tmp_path: Path
+    ) -> None:
+        broker = _make_broker("orchestrator", tmp_path=tmp_path)
+        self._init_broker_db(broker)
+
+        # Set up child agent with parent
+        mock_session = AsyncMock()
+        mock_session.state = AgentState.IDLE
+        broker._sessions["child"] = mock_session
+        broker._agent_parents["child"] = "orchestrator"
+
+        import json
+
+        payload = json.dumps({"agent_id": "child"})
+        cmd_id = self._insert_command(broker, "stranger", "terminate", payload)
+
+        await broker._process_commands([(cmd_id, "stranger", "terminate", payload)])
+
+        status, error = self._get_command_status(broker, cmd_id)
+        assert status == "rejected"
+        assert "Not authorized" in (error or "")
+        # Session still alive
+        assert "child" in broker._sessions
+
+    async def test_process_commands_when_slot_opens_processes_queued_launch(
+        self, tmp_path: Path
+    ) -> None:
+        broker = _make_broker("orchestrator", tmp_path=tmp_path)
+        self._init_broker_db(broker)
+
+        # Set up 1 active agent at capacity
+        mock_active = AsyncMock()
+        mock_active.state = AgentState.IDLE
+        broker._sessions["orchestrator"] = mock_active
+
+        import json
+
+        payload = json.dumps(
+            {
+                "agent_id": "worker-1",
+                "agent_name": "implementor",
+                "harness": "kiro",
+                "cwd": ".",
+                "task": "",
+                "message": "",
+            }
+        )
+        cmd_id = self._insert_command(broker, "orchestrator", "launch", payload)
+
+        # At capacity — should leave as pending
+        with patch.dict("os.environ", {"SYNTH_MAX_AGENTS": "1"}):
+            await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
+
+        status, _ = self._get_command_status(broker, cmd_id)
+        assert status == "pending"
+
+        # Terminate the active agent to free a slot
+        mock_active.state = AgentState.TERMINATED
+
+        mock_new = AsyncMock()
+        mock_new.state = AgentState.IDLE
+        mock_new.run = AsyncMock()
+
+        with (
+            patch.dict("os.environ", {"SYNTH_MAX_AGENTS": "1"}),
+            patch("synth_acp.broker.broker.ACPSession", return_value=mock_new),
+        ):
+            await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
+
+        assert "worker-1" in broker._sessions
+        status, _ = self._get_command_status(broker, cmd_id)
+        assert status == "processed"
+
+    async def test_process_commands_when_agent_reaches_idle_sends_initial_message(
+        self, tmp_path: Path
+    ) -> None:
+        broker = _make_broker("orchestrator", tmp_path=tmp_path)
+        self._init_broker_db(broker)
+
+        mock_session = AsyncMock()
+        mock_session.state = AgentState.IDLE
+        mock_session.run = AsyncMock()
+        mock_session.prompt = AsyncMock()
+
+        import json
+
+        payload = json.dumps(
+            {
+                "agent_id": "worker-1",
+                "agent_name": "implementor",
+                "harness": "kiro",
+                "cwd": ".",
+                "task": "Fix auth",
+                "message": "Start working on auth",
+            }
+        )
+        cmd_id = self._insert_command(broker, "orchestrator", "launch", payload)
+
+        with patch("synth_acp.broker.broker.ACPSession", return_value=mock_session):
+            await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
+
+        # Pending initial prompt stored
+        assert "worker-1" in broker._pending_initial_prompts
+
+        # Simulate IDLE transition
+        from synth_acp.models.events import AgentStateChanged
+
+        await broker._sink(
+            AgentStateChanged(
+                agent_id="worker-1",
+                old_state=AgentState.INITIALIZING,
+                new_state=AgentState.IDLE,
+            )
+        )
+        await asyncio.sleep(0)  # Let create_task fire
+
+        mock_session.prompt.assert_awaited_once_with("Start working on auth")
+        assert "worker-1" not in broker._pending_initial_prompts
+
+    async def test_join_broadcast_when_agent_registered_sends_to_visible_agents(
+        self, tmp_path: Path
+    ) -> None:
+        from synth_acp.models.config import CommunicationMode, SettingsConfig
+
+        config = SessionConfig(
+            project="test-session",
+            agents=[{"id": "orchestrator", "cmd": ["echo"], "cwd": "."}],
+            settings=SettingsConfig(communication_mode=CommunicationMode.LOCAL),
+        )
+        broker = ACPBroker(config=config, db_path=tmp_path / "synth.db")
+        self._init_broker_db(broker)
+
+        # Set up orchestrator as active
+        mock_orch = AsyncMock()
+        mock_orch.state = AgentState.IDLE
+        broker._sessions["orchestrator"] = mock_orch
+
+        mock_worker = AsyncMock()
+        mock_worker.state = AgentState.IDLE
+        mock_worker.run = AsyncMock()
+
+        import json
+        import sqlite3
+
+        # Create messages table (normally done by poller)
+        conn = sqlite3.connect(str(broker._db_path))
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
+            "from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, "
+            "claimed_at INTEGER)"
+        )
+        conn.commit()
+        conn.close()
+
+        payload = json.dumps(
+            {
+                "agent_id": "worker",
+                "agent_name": "implementor",
+                "harness": "kiro",
+                "cwd": ".",
+                "task": "Fix auth",
+                "message": "",
+            }
+        )
+        cmd_id = self._insert_command(broker, "orchestrator", "launch", payload)
+
+        with patch("synth_acp.broker.broker.ACPSession", return_value=mock_worker):
+            await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
+
+        # Check messages table for join broadcast
+        conn = sqlite3.connect(str(broker._db_path))
+        rows = conn.execute(
+            "SELECT from_agent, to_agent, body FROM messages WHERE session_id = ?",
+            (broker._session_id,),
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == "system"
+        assert rows[0][1] == "orchestrator"
+        assert rows[0][2] == '[System] Agent "worker" has joined. Task: Fix auth.'

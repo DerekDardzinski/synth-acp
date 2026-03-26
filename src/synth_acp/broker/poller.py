@@ -12,6 +12,7 @@ import aiosqlite
 log = logging.getLogger(__name__)
 
 DeliverFn = Callable[[str, str, list[str]], Awaitable[bool]]
+CommandFn = Callable[[list[tuple[int, str, str, str]]], Awaitable[None]]
 
 
 class MessagePoller:
@@ -21,12 +22,21 @@ class MessagePoller:
         db_path: Path to the SQLite database.
         deliver: Callback to deliver combined message text to an agent.
             Returns True on success, False if agent is not idle or delivery fails.
+        session_id: The session ID to filter messages and commands.
+        process_commands: Optional callback to process pending agent commands.
     """
 
-    def __init__(self, db_path: Path, deliver: DeliverFn, session_id: str) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        deliver: DeliverFn,
+        session_id: str,
+        process_commands: CommandFn | None = None,
+    ) -> None:
         self._db_path = db_path
         self._deliver = deliver
         self._session_id = session_id
+        self._process_commands = process_commands
         self._stopped = False
         self._task: asyncio.Task[None] | None = None
         self._last_version: int = 0
@@ -57,10 +67,22 @@ class MessagePoller:
                     "created_at INTEGER NOT NULL,"
                     "claimed_at INTEGER)"
                 )
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS agent_commands ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "session_id TEXT NOT NULL,"
+                    "from_agent TEXT NOT NULL,"
+                    "command TEXT NOT NULL,"
+                    "payload TEXT NOT NULL,"
+                    "status TEXT NOT NULL DEFAULT 'pending',"
+                    "error TEXT,"
+                    "created_at INTEGER NOT NULL)"
+                )
                 await db.commit()
 
                 # Initial sweep + baseline: deliver anything pending, then snapshot version
                 await self._deliver_pending(db)
+                await self._process_pending_commands(db)
                 cursor = await db.execute("PRAGMA data_version")
                 row = await cursor.fetchone()
                 self._last_version = row[0] if row else 0
@@ -73,6 +95,7 @@ class MessagePoller:
                         if version != self._last_version:
                             self._last_version = version
                             await self._deliver_pending(db)
+                            await self._process_pending_commands(db)
                     except Exception:
                         log.exception("Poller error")
                     await asyncio.sleep(0.1)
@@ -101,3 +124,19 @@ class MessagePoller:
                     ids,
                 )
                 await db.commit()
+
+    async def _process_pending_commands(self, db: aiosqlite.Connection) -> None:
+        """Query pending agent commands and pass them to the command callback.
+
+        Args:
+            db: Active aiosqlite connection.
+        """
+        if self._process_commands is None:
+            return
+        rows = await db.execute_fetchall(
+            "SELECT id, from_agent, command, payload FROM agent_commands "
+            "WHERE status = 'pending' AND session_id = ? ORDER BY created_at",
+            [self._session_id],
+        )
+        if rows:
+            await self._process_commands([(r[0], r[1], r[2], r[3]) for r in rows])

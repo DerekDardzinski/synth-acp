@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.resources
 import logging
 import shutil
 import sys
-import tomllib
 from pathlib import Path
 from typing import Any
 
 import typer
-from pydantic import BaseModel
 
 from synth_acp.broker.broker import ACPBroker
+from synth_acp.harnesses import load_harness_registry
 from synth_acp.models.commands import LaunchAgent, RespondPermission, SendPrompt
-from synth_acp.models.config import SessionConfig, find_config, load_config, write_toml_config
+from synth_acp.models.config import (
+    HarnessEntry,
+    SessionConfig,
+    find_config,
+    load_config,
+    write_toml_config,
+)
 from synth_acp.models.events import (
     AgentStateChanged,
     BrokerError,
@@ -32,46 +36,6 @@ from synth_acp.models.events import (
 log = logging.getLogger(__name__)
 
 app = typer.Typer(invoke_without_command=True)
-
-
-# ------------------------------------------------------------------
-# HarnessEntry model
-# ------------------------------------------------------------------
-
-
-class HarnessEntry(BaseModel, frozen=True):
-    """A known ACP-capable harness from the registry.
-
-    Attributes:
-        identity: Unique key for the harness.
-        name: Human-readable display name.
-        short_name: Used with ``--harness`` flag.
-        binary_names: Executables searched in PATH.
-        run_cmd: Command template without agent.
-        run_cmd_with_agent: Command template with ``{agent}`` placeholder.
-    """
-
-    identity: str
-    name: str
-    short_name: str
-    binary_names: list[str]
-    run_cmd: str
-    run_cmd_with_agent: str
-
-
-def load_harness_registry() -> list[HarnessEntry]:
-    """Load all harness definitions from package data.
-
-    Returns:
-        List of HarnessEntry objects.
-    """
-    entries: list[HarnessEntry] = []
-    harness_dir = importlib.resources.files("synth_acp.data.harnesses")
-    for item in harness_dir.iterdir():
-        if hasattr(item, "name") and item.name.endswith(".toml"):
-            data = tomllib.loads(item.read_text())
-            entries.append(HarnessEntry.model_validate(data))
-    return entries
 
 
 # ------------------------------------------------------------------
