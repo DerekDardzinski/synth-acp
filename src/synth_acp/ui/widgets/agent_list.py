@@ -48,8 +48,8 @@ class AgentTile(Static):
         self._agent_id = agent_id
         self._color = color
         self._state = state
-        self._task = task
-        self._parent = parent
+        self._agent_task = task
+        self._parent_agent = parent
         super().__init__(self._build_markup(), id=f"tile-{agent_id}")
         if state == AgentState.AWAITING_PERMISSION:
             self.add_class("tile-permission")
@@ -62,10 +62,10 @@ class AgentTile(Static):
             if self._state == AgentState.AWAITING_PERMISSION
             else ""
         )
-        if self._task:
-            preview = f"[dim italic]{self._task}[/dim italic]"
-        elif self._parent:
-            preview = f"[dim]via {self._parent}[/dim]"
+        if self._agent_task:
+            preview = f"[dim italic]{self._agent_task}[/dim italic]"
+        elif self._parent_agent:
+            preview = f"[dim]via {self._parent_agent}[/dim]"
         else:
             preview = PREVIEW_TEXT.get(self._state, DEFAULT_PREVIEW)
         return f"{dot} [bold {self._color}]{self._agent_id}[/bold {self._color}]{warn}\n  {preview}"
@@ -100,7 +100,7 @@ class LaunchButton(Static):
 
     def on_click(self) -> None:
         """Open the launch agent modal."""
-        self.app.action_launch()
+        self.app.run_action("launch")
 
 
 class MCPButton(Static):

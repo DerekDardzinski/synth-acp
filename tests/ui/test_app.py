@@ -269,7 +269,7 @@ class TestActionLaunchModal:
         app = _make_app("agent-1")
 
         with patch.object(app, "push_screen_wait", new_callable=AsyncMock, return_value="agent-1"):
-            await app.action_launch()
+            await app._do_launch()
 
         app.broker.handle.assert_called_once_with(LaunchAgent(agent_id="agent-1"))
 
@@ -278,7 +278,7 @@ class TestActionLaunchModal:
         app = _make_app("agent-1")
 
         with patch.object(app, "push_screen_wait", new_callable=AsyncMock, return_value=None):
-            await app.action_launch()
+            await app._do_launch()
 
         app.broker.handle.assert_not_called()
 

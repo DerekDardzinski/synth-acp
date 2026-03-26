@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import ClassVar, NamedTuple
 
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -146,7 +147,7 @@ class SynthApp(App):
                 self._mcp_panel is not None
                 and self.query_one(ContentSwitcher).current == "messages"
             ):
-                self._mcp_panel.update_threads(self._mcp_threads)
+                await self._mcp_panel.update_threads(self._mcp_threads)
             # Show in recipient's conversation feed
             recipient = event.to_agent
             if recipient in self._panels:
@@ -172,7 +173,7 @@ class SynthApp(App):
                     agent_list = self.query_one(AgentList)
                     agent_list.add_agent_tile(event.agent_id, color, parent=parent)
                 except Exception:
-                    pass
+                    self.log.error(f"Failed to add tile for {event.agent_id}", exc_info=True)
             try:
                 tile = self.query_one(f"#tile-{event.agent_id}", AgentTile)
                 tile.update_state(event.new_state)
@@ -374,7 +375,7 @@ class SynthApp(App):
             self._mcp_panel = panel
             await switcher.mount(panel)
         else:
-            self._mcp_panel.update_threads(self._mcp_threads)
+            await self._mcp_panel.update_threads(self._mcp_threads)
 
         switcher.current = "messages"
 
@@ -390,8 +391,13 @@ class SynthApp(App):
         """Show the MCP messages panel."""
         await self.show_messages()
 
+    @work
     async def action_launch(self) -> None:
         """Open the launch agent modal and launch the selected agent."""
+        await self._do_launch()
+
+    async def _do_launch(self) -> None:
+        """Launch modal logic, separated for testability."""
         agents: list[tuple[str, str, AgentState | None]] = [
             (a.id, a.display_name, self._agent_states.get(a.id)) for a in self.config.agents
         ]

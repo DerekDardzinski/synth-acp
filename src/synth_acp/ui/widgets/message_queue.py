@@ -153,7 +153,9 @@ class MessageQueue(Vertical):
                     yield ThreadItem(key, msgs, self._colors)
             yield ThreadDetail()
 
-    def update_threads(self, threads: dict[tuple[str, str], list[McpMessageDelivered]]) -> None:
+    async def update_threads(
+        self, threads: dict[tuple[str, str], list[McpMessageDelivered]]
+    ) -> None:
         """Rebuild the thread list from current data.
 
         Args:
@@ -164,7 +166,7 @@ class MessageQueue(Vertical):
             thread_list = self.query_one("#thread-list", ScrollableContainer)
         except Exception:
             return
-        thread_list.remove_children()
+        await thread_list.remove_children()
         for key, msgs in threads.items():
             thread_list.mount(ThreadItem(key, msgs, self._colors))
         # Re-select active thread if still present
