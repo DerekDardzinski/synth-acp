@@ -1,16 +1,29 @@
-"""Tests for SynthApp broker event bridge and CLI mode selection."""
+"""Tests for SynthApp: event routing, panel switching, modals, loading states."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from textual.css.query import NoMatches
+from textual.widgets import LoadingIndicator
+from textual.worker import WorkerState
 
+from synth_acp.models.agent import AgentState
+from synth_acp.models.commands import LaunchAgent
 from synth_acp.models.config import SessionConfig
-from synth_acp.models.events import AgentStateChanged, BrokerEvent
+from synth_acp.models.events import (
+    AgentStateChanged,
+    AgentThoughtReceived,
+    BrokerEvent,
+    MessageChunkReceived,
+    UsageUpdated,
+)
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.messages import BrokerEventMessage
+from synth_acp.ui.widgets.message_queue import MessageQueue
 
 
 def _make_config(*agent_ids: str) -> SessionConfig:
@@ -21,8 +34,8 @@ def _make_config(*agent_ids: str) -> SessionConfig:
     )
 
 
-def _make_broker_mock(events: list[BrokerEvent] | None = None) -> MagicMock:
-    """Create a mock broker with an async events() iterator."""
+def _make_broker(events: list[BrokerEvent] | None = None) -> MagicMock:
+    """Create a mock broker with async stubs and optional event iterator."""
     broker = MagicMock()
     broker.handle = AsyncMock()
     broker.shutdown = AsyncMock()
@@ -35,12 +48,19 @@ def _make_broker_mock(events: list[BrokerEvent] | None = None) -> MagicMock:
     return broker
 
 
+def _make_app(*agent_ids: str) -> SynthApp:
+    """Create a SynthApp with a mock broker and given agents."""
+    return SynthApp(_make_broker(), _make_config(*agent_ids))
+
+
+# ── Broker event bridge ──
+
+
 class TestConsumeEvents:
     async def test_consume_broker_events_when_event_emitted_posts_message(self) -> None:
         event = AgentStateChanged(agent_id="a", old_state="idle", new_state="busy")
-        broker = _make_broker_mock([event])
-        config = _make_config("a")
-        app = SynthApp(broker, config)
+        broker = _make_broker([event])
+        app = SynthApp(broker, _make_config("a"))
 
         posted: list[BrokerEventMessage] = []
         app.post_message = MagicMock(side_effect=lambda m: posted.append(m))  # type: ignore[method-assign]
@@ -71,7 +91,6 @@ class TestCLIModeSelection:
             main()
 
         mock_run.assert_called_once()
-        # Close the unawaited coroutine to suppress RuntimeWarning
         mock_run.call_args[0][0].close()
 
     def test_main_when_default_calls_tui(self, tmp_path: Path) -> None:
@@ -91,3 +110,265 @@ class TestCLIModeSelection:
             main()
 
         mock_tui.assert_called_once()
+
+
+# ── Event routing ──
+
+
+class TestRouteEventThought:
+    async def test_route_event_when_thought_received_adds_to_feed(self) -> None:
+        """AgentThoughtReceived routes to feed.add_thought_chunk."""
+        app = _make_app("a")
+        feed = MagicMock()
+        feed.add_thought_chunk = AsyncMock()
+        event = AgentThoughtReceived(agent_id="a", chunk="text")
+
+        await app._route_event_to_feed(feed, event)
+
+        feed.add_thought_chunk.assert_called_once_with("text")
+
+
+class TestRouteEventUsage:
+    async def test_route_event_when_usage_updated_calls_handler(self) -> None:
+        """UsageUpdated routes to _update_usage_display."""
+        app = _make_app("a")
+        feed = MagicMock()
+        event = UsageUpdated(agent_id="a", size=128000, used=32000, cost_amount=0.14)
+
+        with patch.object(app, "_update_usage_display") as mock_handler:
+            await app._route_event_to_feed(feed, event)
+
+        mock_handler.assert_called_once_with(event)
+
+
+class TestWorkerErrorHandling:
+    def test_worker_state_changed_when_error_notifies_and_restarts(self) -> None:
+        """Broker consumer error triggers notification and restart."""
+        app = _make_app("a")
+
+        mock_worker = MagicMock()
+        mock_worker.name = "broker-consumer"
+        mock_worker.error = RuntimeError("test")
+
+        mock_event = MagicMock()
+        mock_event.worker = mock_worker
+        mock_event.state = WorkerState.ERROR
+
+        with (
+            patch.object(app, "notify") as mock_notify,
+            patch.object(app, "run_worker") as mock_run_worker,
+        ):
+            app.on_worker_state_changed(mock_event)
+
+        mock_notify.assert_called_once()
+        assert mock_notify.call_args.kwargs["severity"] == "error"
+        mock_run_worker.assert_called_once()
+        assert mock_run_worker.call_args.kwargs["name"] == "broker-consumer"
+
+
+# ── ContentSwitcher panel switching ──
+
+
+class TestSelectAgentContentSwitcher:
+    async def test_select_agent_when_first_visit_mounts_feed_in_switcher(self) -> None:
+        """First visit creates panel, mounts into ContentSwitcher, sets reactive."""
+        app = _make_app("agent-1")
+        app._event_buffers["agent-1"] = []
+
+        mock_switcher = AsyncMock()
+        with (
+            patch.object(app, "query_one", return_value=mock_switcher),
+            patch.object(app, "watch_selected_agent"),
+        ):
+            await app.select_agent("agent-1")
+
+        assert "agent-1" in app._panels
+        mock_switcher.mount.assert_called_once()
+        assert app.selected_agent == "agent-1"
+
+    async def test_select_agent_when_revisit_sets_switcher_current(self) -> None:
+        """Revisit skips mount, just sets the reactive (watcher handles switch)."""
+        app = _make_app("agent-1")
+        app._event_buffers["agent-1"] = []
+
+        mock_switcher = AsyncMock()
+        with (
+            patch.object(app, "query_one", return_value=mock_switcher),
+            patch.object(app, "watch_selected_agent"),
+        ):
+            await app.select_agent("agent-1")
+            mock_switcher.reset_mock()
+            await app.select_agent("agent-1")
+
+        mock_switcher.mount.assert_not_called()
+        assert app.selected_agent == "agent-1"
+
+    async def test_select_agent_when_buffered_events_drains_before_switch(self) -> None:
+        """Buffered events are drained via _replay_event before reactive is set."""
+        app = _make_app("agent-1")
+        events = [
+            MessageChunkReceived(agent_id="agent-1", chunk="hello"),
+            MessageChunkReceived(agent_id="agent-1", chunk=" world"),
+        ]
+        app._event_buffers["agent-1"] = list(events)
+
+        mock_switcher = AsyncMock()
+        replayed: list[object] = []
+
+        async def _track_replay(feed, event):  # type: ignore[no-untyped-def]
+            replayed.append(event)
+
+        with (
+            patch.object(app, "query_one", return_value=mock_switcher),
+            patch.object(app, "_replay_event", side_effect=_track_replay),
+            patch.object(app, "watch_selected_agent"),
+        ):
+            await app.select_agent("agent-1")
+
+        assert replayed == events
+        assert app._event_buffers["agent-1"] == []
+
+
+class TestWatchSelectedAgent:
+    def test_watch_selected_agent_when_empty_string_skips_switch(self) -> None:
+        """Empty string guard prevents crash on initial reactive value."""
+        app = _make_app("agent-1")
+        mock_query_one = MagicMock()
+        with patch.object(app, "query_one", mock_query_one):
+            app.watch_selected_agent("")
+
+        mock_query_one.assert_not_called()
+
+
+class TestShowMessagesContentSwitcher:
+    async def test_show_messages_when_first_call_mounts_mcp_panel(self) -> None:
+        """First call creates MessageQueue with id='messages' and mounts it."""
+        app = _make_app("agent-1")
+
+        mock_switcher = SimpleNamespace(current=None, mount=AsyncMock())
+        with (
+            patch.object(app, "query_one", return_value=mock_switcher),
+            patch.object(app, "query", return_value=[]),
+        ):
+            await app.show_messages()
+
+        assert app._mcp_panel is not None
+        assert isinstance(app._mcp_panel, MessageQueue)
+        mock_switcher.mount.assert_called_once()
+        mounted = mock_switcher.mount.call_args[0][0]
+        assert mounted.id == "messages"
+        assert mock_switcher.current == "messages"
+
+
+# ── Modal screens ──
+
+
+class TestActionLaunchModal:
+    async def test_action_launch_when_modal_returns_id_sends_launch_command(self) -> None:
+        """Selecting an agent in the modal triggers broker.handle(LaunchAgent(...))."""
+        app = _make_app("agent-1")
+
+        with patch.object(app, "push_screen_wait", new_callable=AsyncMock, return_value="agent-1"):
+            await app.action_launch()
+
+        app.broker.handle.assert_called_once_with(LaunchAgent(agent_id="agent-1"))
+
+    async def test_action_launch_when_modal_returns_none_skips_launch(self) -> None:
+        """Escape from modal (None result) does not call broker.handle."""
+        app = _make_app("agent-1")
+
+        with patch.object(app, "push_screen_wait", new_callable=AsyncMock, return_value=None):
+            await app.action_launch()
+
+        app.broker.handle.assert_not_called()
+
+
+# ── LoadingIndicator ──
+
+
+class TestConversationFeedCompose:
+    async def test_conversation_feed_when_composed_includes_loading_spinner(self) -> None:
+        """Compose yields a LoadingIndicator with id='loading-spinner' inside scroll."""
+        app = _make_app("agent-1")
+
+        async with app.run_test(headless=True, size=(120, 40)):
+            await app.select_agent("agent-1")
+            feed = app._panels["agent-1"]
+            spinner = feed.query_one("#loading-spinner", LoadingIndicator)
+            assert spinner.id == "loading-spinner"
+
+
+class TestRouteEventSpinner:
+    async def test_route_event_when_state_idle_hides_spinner(self) -> None:
+        """AgentStateChanged(IDLE) removes the LoadingIndicator from the feed."""
+        app = _make_app("agent-1")
+
+        async with app.run_test(headless=True, size=(120, 40)):
+            await app.select_agent("agent-1")
+            feed = app._panels["agent-1"]
+            assert feed.query("#loading-spinner")
+
+            event = AgentStateChanged(
+                agent_id="agent-1",
+                old_state=AgentState.INITIALIZING,
+                new_state=AgentState.IDLE,
+            )
+            await app.on_broker_event_message(BrokerEventMessage(event))
+            assert not feed.query("#loading-spinner")
+
+    async def test_route_event_when_state_initializing_mounts_spinner(self) -> None:
+        """AgentStateChanged(INITIALIZING) mounts new LoadingIndicator on re-launch."""
+        app = _make_app("agent-1")
+
+        async with app.run_test(headless=True, size=(120, 40)):
+            await app.select_agent("agent-1")
+            feed = app._panels["agent-1"]
+
+            # Simulate agent went IDLE (removes spinner)
+            idle_event = AgentStateChanged(
+                agent_id="agent-1",
+                old_state=AgentState.INITIALIZING,
+                new_state=AgentState.IDLE,
+            )
+            await app.on_broker_event_message(BrokerEventMessage(idle_event))
+            assert not feed.query("#loading-spinner")
+
+            # Re-launch: INITIALIZING mounts a new spinner
+            init_event = AgentStateChanged(
+                agent_id="agent-1",
+                old_state=AgentState.TERMINATED,
+                new_state=AgentState.INITIALIZING,
+            )
+            await app.on_broker_event_message(BrokerEventMessage(init_event))
+            spinner = feed.query_one("#loading-spinner", LoadingIndicator)
+            assert spinner is not None
+
+    async def test_route_event_when_state_idle_and_no_spinner_exists_does_not_raise(
+        self,
+    ) -> None:
+        """NoMatches caught silently when spinner already removed."""
+        app = _make_app("a")
+        feed = MagicMock()
+        feed.query_one.side_effect = NoMatches()
+        event = AgentStateChanged(
+            agent_id="a", old_state=AgentState.INITIALIZING, new_state=AgentState.IDLE
+        )
+
+        await app._route_event_to_feed(feed, event)  # should not raise
+
+
+class TestReplayEventSkipsSpinner:
+    async def test_replay_event_when_state_changed_skips(self) -> None:
+        """_replay_event does not call spinner logic for AgentStateChanged."""
+        app = _make_app("a")
+        feed = MagicMock()
+        feed.add_chunk = AsyncMock()
+        feed.add_thought_chunk = AsyncMock()
+        feed.finalize_current_message = AsyncMock()
+        event = AgentStateChanged(
+            agent_id="a", old_state=AgentState.INITIALIZING, new_state=AgentState.IDLE
+        )
+
+        await app._replay_event(feed, event)
+
+        feed.query_one.assert_not_called()

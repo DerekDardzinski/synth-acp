@@ -613,8 +613,9 @@ Theme: `catppuccin-mocha`. All styles in external `ui/css/app.tcss`. Only Textua
 
 ### 9.3 Widget Hierarchy
 
-- `AgentList` — sidebar (32 chars). `AgentTile` per agent, `LaunchButton`, `MCPButton`.
+- `AgentList` — sidebar (32 chars). `AgentTile` per agent, `LaunchButton`, `MCPButton`. Each tile shows a colored status dot and state-specific text (initializing…, idle, working…, awaiting permission…, terminated).
 - `ConversationFeed` — scrollable container, one per agent (lazy-created, stays alive):
+  - `LoadingIndicator` — shown during `INITIALIZING`, removed on `IDLE`, re-mounted on re-launch
   - `PromptBubble` — right-aligned, `$primary` border
   - `ThoughtBlock` — `Collapsible` wrapping `MarkdownStream`, collapsed when finalized
   - `AgentMessage` — extends `Markdown`, uses `MarkdownStream` for incremental rendering
@@ -645,7 +646,7 @@ Panels are created lazily on first selection with event buffering:
 
 - The app maintains `dict[str, list[BrokerEvent]]` per agent from broker start
 - On first selection: panel is created, drains buffer, renders backlog
-- Once created: panel stays in DOM, switching is CSS `display` toggle via `ContentSwitcher`
+- Once created: panel stays in DOM, switching via `ContentSwitcher(id="right")` — `switcher.current = f"feed-{agent_id}"` or `"messages"`
 - After creation: events flow directly to the mounted panel
 
 This gives fast startup, no lost events, and instant switching after first view.
@@ -763,6 +764,14 @@ Completed across spec phases 1-4. Includes:
 - **ACP-1b:** `usage_update` → `UsageUpdated` event, topbar context/cost display
 - Remaining: Textual-1 (modal screens), Textual-5 (LoadingIndicator), Textual-2+3 (ContentSwitcher + reactive watchers)
 
+### Phase 3.5 — TUI Refactor ✅
+
+Completed. Proper Textual patterns replacing manual stubs:
+- **Textual-2:** `ContentSwitcher(id="right")` replaces manual `display` toggling in `select_agent()`/`show_messages()`
+- **Textual-3:** `watch_selected_agent` reactive watcher drives panel switching, tile styling, topbar, input bar state; `select_agent()` reduced to lazy creation + reactive set
+- **Textual-1:** `LaunchAgentScreen(ModalScreen)` and `HelpScreen(ModalScreen)` replace notification stubs; `push_screen_wait()` pattern
+- **Textual-5:** `LoadingIndicator` in `ConversationFeed` during `INITIALIZING`; removed on `IDLE`; re-mounted on re-launch preserving conversation history
+
 ### Phase 4 — Session Management + Control Surface
 
 - **ACP-4:** Session resume via `list_sessions` / `load_session`
@@ -874,7 +883,7 @@ Detailed analysis in `docs/references/design_gaps.md`. Key items by priority:
 | ~~ACP-1b~~ | ~~`usage_update` dropped~~ — **Resolved** (Phase 3/4): `UsageUpdated` event, topbar display with context/cost |
 | ~~ACP-3~~ | ~~`InitializeResponse` discarded~~ — **Resolved** (Phase 3): `_capabilities` captured on `ACPSession` |
 | ACP-4 | No `load_session`/`list_sessions` — session context lost on restart |
-| Textual-1 | No `ModalScreen` — launch/help are notification stubs |
+| ~~Textual-1~~ | ~~No `ModalScreen` — launch/help are notification stubs~~ — **Resolved** (Phase 3.5): `LaunchAgentScreen` and `HelpScreen` modals with `push_screen_wait()` |
 | ~~Textual-10~~ | ~~Worker error swallowed silently~~ — **Resolved** (Phase 4): named `"broker-consumer"` worker, `on_worker_state_changed` with notify + auto-restart |
 
 ### 🟡 Medium
@@ -884,10 +893,10 @@ Detailed analysis in `docs/references/design_gaps.md`. Key items by priority:
 | ACP-2 | `SessionAccumulator` unused — manual event dispatch growing fragile |
 | ACP-1c | `AgentPlanUpdate` dropped — no plan visibility |
 | ACP-5 | No `set_session_mode`/`set_session_model` — can't control agents at runtime |
-| Textual-2 | Manual display toggling instead of `ContentSwitcher` |
-| Textual-3 | `reactive` declared but never watched |
+| ~~Textual-2~~ | ~~Manual display toggling instead of `ContentSwitcher`~~ — **Resolved** (Phase 3.5): `ContentSwitcher(id="right")` with reactive watcher |
+| ~~Textual-3~~ | ~~`reactive` declared but never watched~~ — **Resolved** (Phase 3.5): `watch_selected_agent` drives all panel-switch side effects |
 | Textual-4 | No command palette |
-| Textual-5 | No `LoadingIndicator` during INITIALIZING |
+| ~~Textual-5~~ | ~~No `LoadingIndicator` during INITIALIZING~~ — **Resolved** (Phase 3.5): spinner in `ConversationFeed`, removed on IDLE, re-mounted on re-launch |
 
 ### 🟢 Low
 

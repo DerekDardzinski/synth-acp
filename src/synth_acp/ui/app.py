@@ -7,8 +7,9 @@ from typing import ClassVar
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.reactive import reactive
-from textual.widgets import Footer, Static
+from textual.widgets import ContentSwitcher, Footer, LoadingIndicator, Static
 from textual.worker import WorkerState
 
 from synth_acp.broker.broker import ACPBroker
@@ -29,6 +30,8 @@ from synth_acp.models.events import (
     UsageUpdated,
 )
 from synth_acp.ui.messages import BrokerEventMessage
+from synth_acp.ui.screens.help import HelpScreen
+from synth_acp.ui.screens.launch import LaunchAgentScreen
 from synth_acp.ui.widgets.agent_list import AgentList, AgentTile, MCPButton
 from synth_acp.ui.widgets.conversation import ConversationFeed
 from synth_acp.ui.widgets.message_queue import MessageQueue
@@ -92,7 +95,7 @@ class SynthApp(App):
             agents = [(a.id, self._agent_colors[a.id]) for a in self.config.agents]
             with Vertical(id="sidebar"):
                 yield AgentList(agents)
-            yield Vertical(id="right")
+            yield ContentSwitcher(id="right")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -126,7 +129,10 @@ class SynthApp(App):
             except Exception:
                 pass
             # Update MCP panel if visible
-            if self._mcp_panel is not None and self._mcp_panel.display:
+            if (
+                self._mcp_panel is not None
+                and self.query_one(ContentSwitcher).current == "messages"
+            ):
                 self._mcp_panel.update_threads(self._mcp_threads)
             # Show in recipient's conversation feed
             recipient = event.to_agent
@@ -185,6 +191,14 @@ class SynthApp(App):
             self._update_usage_display(event)
         elif isinstance(event, BrokerError):
             self.notify(event.message, severity=event.severity)
+        elif isinstance(event, AgentStateChanged):
+            if event.new_state == AgentState.IDLE:
+                try:
+                    await feed.query_one("#loading-spinner", LoadingIndicator).remove()
+                except NoMatches:
+                    pass
+            elif event.new_state == AgentState.INITIALIZING:
+                await feed.query_one(".conv-scroll").mount(LoadingIndicator(id="loading-spinner"))
 
     async def _replay_event(self, feed: ConversationFeed, event: BrokerEvent) -> None:
         """Replay a buffered event to a conversation feed during drain.
@@ -269,80 +283,76 @@ class SynthApp(App):
     async def select_agent(self, agent_id: str) -> None:
         """Switch the right panel to the given agent.
 
-        Drains buffered events on first panel creation before live routing.
-        Uses display toggling to preserve widget state across switches.
+        Creates the panel and drains buffered events on first visit,
+        then sets the reactive to trigger the watcher.
 
         Args:
             agent_id: The agent to display.
         """
-        # Clear tile-active from all tiles
+        if agent_id not in self._panels:
+            color = self._agent_colors.get(agent_id, "#94a3b8")
+            feed = ConversationFeed(agent_id, color, id=f"feed-{agent_id}")
+            self._panels[agent_id] = feed
+            await self.query_one("#right").mount(feed)
+            for event in self._event_buffers.get(agent_id, []):
+                await self._replay_event(feed, event)
+            self._event_buffers[agent_id] = []
+            # Remove spinner if agent already passed INITIALIZING while buffered
+            state = self._agent_states.get(agent_id)
+            if state != AgentState.INITIALIZING:
+                try:
+                    feed.query_one("#loading-spinner", LoadingIndicator).remove()
+                except NoMatches:
+                    pass
+
+        self.selected_agent = agent_id
+
+    def watch_selected_agent(self, agent_id: str) -> None:
+        """React to selected_agent changes — switch panel, update tiles and topbar.
+
+        Args:
+            agent_id: The newly selected agent ID.
+        """
+        if not agent_id:
+            return
+        self.query_one(ContentSwitcher).current = f"feed-{agent_id}"
         for tile in self.query(AgentTile):
-            tile.remove_class("tile-active")
-        # Remove btn-active from MCPButton
+            tile.set_class(tile._agent_id == agent_id, "tile-active")
         try:
             self.query_one("#mcp-btn", MCPButton).remove_class("btn-active")
         except Exception:
             pass
-        # Add tile-active to selected tile
+        # Update topbar with agent display name
+        display_name = agent_id
+        for a in self.config.agents:
+            if a.id == agent_id:
+                display_name = getattr(a, "display_name", a.id)
+                break
         try:
-            self.query_one(f"#tile-{agent_id}", AgentTile).add_class("tile-active")
+            self.query_one("#tb-session", Static).update(display_name)
         except Exception:
             pass
-
-        right = self.query_one("#right")
-
-        # Hide all current children
-        for child in right.children:
-            child.display = False
-
-        color = self._agent_colors.get(agent_id, "#94a3b8")
-
-        if agent_id not in self._panels:
-            # Create panel on first selection
-            feed = ConversationFeed(agent_id, color, id=f"feed-{agent_id}")
-            self._panels[agent_id] = feed
-            await right.mount(feed)
-            # Drain buffered events synchronously before live routing
-            buffered = self._event_buffers.get(agent_id, [])
-            for event in buffered:
-                await self._replay_event(feed, event)
-            self._event_buffers[agent_id] = []
-        else:
-            # Show cached panel
-            feed = self._panels[agent_id]
-            feed.display = True
-
-        # Set InputBar disabled state based on current agent state
-        state = self._agent_states.get(agent_id, AgentState.IDLE)
-        self._update_input_bar_state(agent_id, state)
-
-        self.selected_agent = agent_id
+        self._update_input_bar_state(agent_id, self._agent_states.get(agent_id, AgentState.IDLE))
 
     async def show_messages(self) -> None:
         """Switch the right panel to the MCP messages view."""
-        # Clear tile-active from all tiles
         for tile in self.query(AgentTile):
             tile.remove_class("tile-active")
-        # Add btn-active to MCPButton
         try:
             self.query_one("#mcp-btn", MCPButton).add_class("btn-active")
         except Exception:
             pass
 
-        right = self.query_one("#right")
+        switcher = self.query_one("#right", ContentSwitcher)
 
-        # Hide all current children
-        for child in right.children:
-            child.display = False
-
-        # Create or show the MCP panel
         if self._mcp_panel is None:
-            panel = MessageQueue(self._mcp_threads, self._agent_colors)
+            panel = MessageQueue(self._mcp_threads, self._agent_colors, id="messages")
             self._mcp_panel = panel
-            await right.mount(panel)
+            await switcher.mount(panel)
         else:
             self._mcp_panel.update_threads(self._mcp_threads)
-            self._mcp_panel.display = True
+
+        switcher.current = "messages"
 
     async def action_next_agent(self) -> None:
         """Cycle to the next agent in config order."""
@@ -356,17 +366,16 @@ class SynthApp(App):
         """Show the MCP messages panel."""
         await self.show_messages()
 
-    def action_launch(self) -> None:
-        """Placeholder for launch agent dialog."""
-        self.notify("Launch agent dialog — not yet implemented", title="SYNTH")
+    async def action_launch(self) -> None:
+        """Open the launch agent modal and launch the selected agent."""
+        agents = [(a.id, a.display_name, self._agent_states.get(a.id)) for a in self.config.agents]
+        result = await self.push_screen_wait(LaunchAgentScreen(agents))
+        if result is not None:
+            await self.broker.handle(LaunchAgent(agent_id=result))
 
-    def action_help(self) -> None:
-        """Show keybinding help."""
-        self.notify(
-            "Tab: cycle agents   m: MCP messages   l: launch   q: quit",
-            title="Keybindings",
-            timeout=4,
-        )
+    async def action_help(self) -> None:
+        """Open the help modal showing key bindings and usage."""
+        await self.push_screen_wait(HelpScreen())
 
     async def action_quit(self) -> None:
         """Shut down the broker and exit.

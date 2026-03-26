@@ -95,10 +95,10 @@ uv run pytest -k "test_foo"        # Run matching tests
 
 ### Conventions
 
-- **File structure**: Test files mirror the source tree. `src/synth_acp/acp/session.py` → `tests/acp/test_session.py`.
+- **File structure**: Test files mirror the source tree. `src/synth_acp/acp/session.py` → `tests/acp/test_session.py`. One test file per source module — don't split a module's tests across multiple files (e.g. `test_app_loading.py`, `test_app_modals.py`). Use test classes within the file to organize by feature.
 - **Async**: Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. All async tests are plain `async def` functions.
 - **Fixtures**: Shared fixtures in `tests/conftest.py`.
-- **No Textual app launch**: Tests must never call `app.run_test()` or start a TUI. Test UI logic via direct method calls with mocks.
+- **Textual UI tests**: Use `app.run_test(headless=True, size=(120, 40))` when tests need a live widget tree (querying DOM, checking classes, mounting widgets). Use direct method calls with mocks for pure logic/routing tests that don't need a widget tree.
 
 ### What to Test
 

@@ -9,6 +9,7 @@ from textual.widgets import Static
 from synth_acp.models.agent import AgentState
 
 STATUS_DOT: dict[AgentState, str] = {
+    AgentState.INITIALIZING: "[cyan]●[/cyan]",
     AgentState.IDLE: "[green]●[/green]",
     AgentState.BUSY: "[yellow]●[/yellow]",
     AgentState.AWAITING_PERMISSION: "[bold yellow]●[/bold yellow]",
@@ -16,6 +17,9 @@ STATUS_DOT: dict[AgentState, str] = {
 }
 
 PREVIEW_TEXT: dict[AgentState, str] = {
+    AgentState.INITIALIZING: "[dim italic]initializing…[/dim italic]",
+    AgentState.IDLE: "[dim italic]idle[/dim italic]",
+    AgentState.BUSY: "[yellow italic]working…[/yellow italic]",
     AgentState.TERMINATED: "[dim italic]terminated[/dim italic]",
     AgentState.AWAITING_PERMISSION: "[bold yellow italic]awaiting permission…[/bold yellow italic]",
 }

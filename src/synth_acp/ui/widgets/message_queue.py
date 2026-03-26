@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from textual.app import ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Collapsible, Static
@@ -113,7 +115,7 @@ class ThreadItem(Static):
         app = self.app
         assert isinstance(app, SynthApp)
         try:
-            panel = app.query_one("#messages-panel", MessageQueue)
+            panel = app.query_one("#messages", MessageQueue)
             panel.show_thread(self._thread_key)
         except Exception:
             pass
@@ -131,8 +133,9 @@ class MessageQueue(Vertical):
         self,
         threads: dict[tuple[str, str], list[McpMessageDelivered]],
         colors: dict[str, str],
+        **kwargs: Any,
     ) -> None:
-        super().__init__(id="messages-panel", classes="right-panel")
+        super().__init__(classes="right-panel", **kwargs)
         self._threads = threads
         self._colors = colors
         self._active_key: tuple[str, str] | None = None

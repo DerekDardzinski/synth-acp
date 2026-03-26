@@ -21,8 +21,9 @@ class TestClient(Client):
     async def request_permission(
         self, options: Any, session_id: str, tool_call: Any, **kwargs: Any
     ) -> Any:
-        from acp import RequestPermissionResponse
         from acp.schema import AllowedOutcome
+
+        from acp import RequestPermissionResponse
 
         # Auto-allow everything
         return RequestPermissionResponse(
@@ -74,7 +75,7 @@ async def main() -> None:
             session_id=session.session_id,
             prompt=[text_block("Say hello in one sentence")],
         )
-        print(f"\n[DONE] Response received", file=sys.stderr)
+        print("\n[DONE] Response received", file=sys.stderr)
         print(f"[RESP] stop_reason={resp.stop_reason}", file=sys.stderr)
         print(f"[RESP] usage={resp.usage}", file=sys.stderr)
         if resp.usage:

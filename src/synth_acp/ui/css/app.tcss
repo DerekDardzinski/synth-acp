@@ -79,7 +79,9 @@ AgentTile.tile-permission.tile-active { border: round $warning;  }
 #mcp-btn.btn-active { border-top: tall $border; color: $foreground; }
 
 /* ── Right panels ── */
-#right { height: 1fr; width: 1fr; layout: vertical; }
+#right { height: 1fr; width: 1fr; }
+
+ContentSwitcher > * { height: 1fr; }
 
 .right-panel {
     height: 1fr;
@@ -256,6 +258,42 @@ ThreadDetail {
 }
 
 Footer { background: $background; color: $text-muted; }
+
+/* ── Modal screens ── */
+LaunchAgentScreen, HelpScreen {
+    background: rgba(0, 0, 0, 0.65);
+    align: center middle;
+}
+
+#launch-container, #help-container {
+    width: 60;
+    max-height: 80%;
+    background: $surface;
+    border: round $primary;
+    padding: 1 2;
+    overflow-y: auto;
+}
+
+#launch-container Button {
+    width: 1fr;
+    margin: 0 0 1 0;
+}
+
+#launch-container Button:disabled {
+    color: $text-muted;
+    opacity: 50%;
+}
+
+#help-bindings, #help-routing, #help-layout {
+    width: 1fr;
+    padding: 0 0 1 0;
+}
+
+/* ── Loading spinner ── */
+#loading-spinner {
+    height: 3;
+    color: $primary;
+}
 
 /* ── MCP message notification in conversation ── */
 .mcp-msg {

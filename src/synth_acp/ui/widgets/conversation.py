@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from acp.schema import PermissionOption
 from textual.containers import ScrollableContainer, Vertical
-from textual.widgets import Static
+from textual.widgets import LoadingIndicator, Static
 
 from synth_acp.ui.widgets.agent_message import AgentMessage
 from synth_acp.ui.widgets.input_bar import InputBar
@@ -35,7 +35,8 @@ class ConversationFeed(Vertical):
 
     def compose(self):
         """Yield the scrollable container and input bar."""
-        yield ScrollableContainer(classes="conv-scroll")
+        with ScrollableContainer(classes="conv-scroll"):
+            yield LoadingIndicator(id="loading-spinner")
         yield InputBar(self._agent_id, self._color)
 
     def on_mount(self) -> None:
