@@ -438,9 +438,6 @@ async def _run(config: SessionConfig) -> None:
 
 _STYLE_CSS = {
     "default": "css/app.tcss",
-    "leftbar": "css/app-leftbar.tcss",
-    "minimal": "css/app-minimal.tcss",
-    "heavy": "css/app-heavy.tcss",
 }
 
 
@@ -474,7 +471,7 @@ def cli(
         "default",
         "-s",
         "--style",
-        help="TUI style variant: default, leftbar, minimal, heavy",
+        help="TUI style variant",
     ),
 ) -> None:
     """SYNTH — multi-agent ACP orchestrator."""

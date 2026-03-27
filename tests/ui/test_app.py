@@ -22,7 +22,7 @@ from synth_acp.models.events import (
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.messages import BrokerEventMessage
 from synth_acp.ui.widgets.message_queue import MessageQueue
-from synth_acp.ui.widgets.throbber import Throbber
+from synth_acp.ui.widgets.gradient_bar import GradientBar
 
 
 def _make_config(*agent_ids: str) -> SessionConfig:
@@ -282,24 +282,24 @@ class TestActionLaunchModal:
         app.broker.handle.assert_not_called()
 
 
-# ── Throbber ──
+# ── GradientBar ──
 
 
 class TestConversationFeedCompose:
     async def test_conversation_feed_when_composed_includes_loading_spinner(self) -> None:
-        """Compose yields a Throbber with id='loading-spinner'."""
+        """Compose yields a GradientBar with id='loading-spinner'."""
         app = _make_app("agent-1")
 
         async with app.run_test(headless=True, size=(120, 40)):
             await app.select_agent("agent-1")
             feed = app._panels["agent-1"]
-            spinner = feed.query_one("#loading-spinner", Throbber)
+            spinner = feed.query_one("#loading-spinner", GradientBar)
             assert spinner.id == "loading-spinner"
 
 
 class TestRouteEventSpinner:
     async def test_route_event_when_state_idle_hides_spinner(self) -> None:
-        """AgentStateChanged(IDLE) hides the Throbber in the feed."""
+        """AgentStateChanged(IDLE) hides the GradientBar in the feed."""
         app = _make_app("agent-1")
 
         async with app.run_test(headless=True, size=(120, 40)):
@@ -318,7 +318,7 @@ class TestRouteEventSpinner:
             assert spinner.display is False
 
     async def test_route_event_when_state_busy_shows_spinner(self) -> None:
-        """AgentStateChanged(BUSY) shows the Throbber in the feed."""
+        """AgentStateChanged(BUSY) shows the GradientBar in the feed."""
         app = _make_app("agent-1")
 
         async with app.run_test(headless=True, size=(120, 40)):

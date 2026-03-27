@@ -1,4 +1,4 @@
-"""Pulsating gradient throbber widget."""
+"""Pulsating gradient bar widget."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from textual.visual import RenderOptions, Visual
 from textual.widget import Widget
 
 
-class ThrobberVisual(Visual):
+class GradientBarVisual(Visual):
 
     def __init__(
         self,
@@ -52,7 +52,7 @@ class ThrobberVisual(Visual):
     ) -> list[Strip]:
         time = self.get_time()
         segments = self._make_segments(width, style.rich_style.bgcolor)
-        offset = width - int((time % 1.0) * width)
+        offset = width - int((time % 2.0) / 2.0 * width)
         return [Strip(segments[offset : offset + width], cell_length=width)]
 
     def get_optimal_width(self, rules: RulesMap, container_width: int) -> int:  # noqa: ARG002
@@ -62,8 +62,8 @@ class ThrobberVisual(Visual):
         return 1
 
 
-class Throbber(Widget):
-    """A throbbing gradient line that reacts to theme changes."""
+class GradientBar(Widget):
+    """An animated gradient line that reacts to theme changes."""
 
     def on_mount(self) -> None:
         self.auto_refresh = 1 / 15
@@ -71,21 +71,25 @@ class Throbber(Widget):
 
     def on_app_theme_changed(self) -> None:
         self._gradient = self._build_gradient()
+        self.refresh()
 
     def _build_gradient(self) -> Gradient:
-        base = Color.parse(self.app.current_theme.primary)
-        shades = [
-            base.darken(0.4),
-            base.darken(0.2),
-            base,
-            base.lighten(0.3),
-            base.lighten(0.5),
-            base.lighten(0.3),
-            base,
-            base.darken(0.2),
-            base.darken(0.4),
-        ]
-        return Gradient.from_colors(*[s.hex for s in shades])
+        theme = self.app.current_theme
+        primary = Color.parse(theme.primary)
+        secondary = Color.parse(theme.secondary or theme.primary)
+        accent = Color.parse(theme.accent or theme.primary)
+        return Gradient.from_colors(
+            primary.darken(0.3).hex,
+            primary.hex,
+            secondary.hex,
+            secondary.lighten(0.2).hex,
+            accent.hex,
+            accent.lighten(0.2).hex,
+            accent.hex,
+            secondary.hex,
+            primary.hex,
+            primary.darken(0.3).hex,
+        )
 
-    def render(self) -> ThrobberVisual:
-        return ThrobberVisual(self._gradient)
+    def render(self) -> GradientBarVisual:
+        return GradientBarVisual(self._gradient)

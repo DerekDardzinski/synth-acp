@@ -218,16 +218,22 @@ class SynthApp(App):
             feed.remove_permission(event.request_id)
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
-            feed.query_one("#loading-spinner").display = False
+            feed.query_one(".input-gradient").display = False
+            feed.query_one(".input-gradient-bg").display = True
+            feed.input_bar.set_busy(False)
         elif isinstance(event, UsageUpdated):
             self._update_usage_display(event)
         elif isinstance(event, BrokerError):
             self.notify(event.message, severity=event.severity)
         elif isinstance(event, AgentStateChanged):
             if event.new_state in {AgentState.IDLE, AgentState.TERMINATED}:
-                feed.query_one("#loading-spinner").display = False
+                feed.query_one(".input-gradient").display = False
+                feed.query_one(".input-gradient-bg").display = True
+                feed.input_bar.set_busy(False)
             elif event.new_state in {AgentState.INITIALIZING, AgentState.BUSY}:
-                feed.query_one("#loading-spinner").display = True
+                feed.query_one(".input-gradient").display = True
+                feed.query_one(".input-gradient-bg").display = False
+                feed.input_bar.set_busy(True)
 
     async def _replay_event(self, feed: ConversationFeed, event: BrokerEvent) -> None:
         """Replay a buffered event to a conversation feed during drain.
@@ -320,7 +326,9 @@ class SynthApp(App):
         """
         if agent_id not in self._panels:
             color = self._agent_colors.get(agent_id, "#94a3b8")
-            feed = ConversationFeed(agent_id, color, id=f"feed-{agent_id}")
+            agent_cfg = next((a for a in self.config.agents if a.id == agent_id), None)
+            agent_name = agent_cfg.display_name if agent_cfg else agent_id
+            feed = ConversationFeed(agent_id, agent_name, color, id=f"feed-{agent_id}")
             self._panels[agent_id] = feed
             await self.query_one("#right").mount(feed)
             for event in self._event_buffers.get(agent_id, []):
@@ -330,7 +338,9 @@ class SynthApp(App):
             state = self._agent_states.get(agent_id)
             if state not in {AgentState.INITIALIZING, AgentState.BUSY}:
                 try:
-                    feed.query_one("#loading-spinner").display = False
+                    feed.query_one(".input-gradient").display = False
+                    feed.query_one(".input-gradient-bg").display = True
+                    feed.input_bar.set_busy(False)
                 except NoMatches:
                     pass
 

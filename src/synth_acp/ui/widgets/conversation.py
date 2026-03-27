@@ -13,7 +13,6 @@ from synth_acp.ui.widgets.input_bar import InputBar
 from synth_acp.ui.widgets.permission import PermissionRequest
 from synth_acp.ui.widgets.prompt_bubble import PromptBubble
 from synth_acp.ui.widgets.thought_block import ThoughtBlock
-from synth_acp.ui.widgets.throbber import Throbber
 from synth_acp.ui.widgets.tool_call import ToolCallBlock
 
 
@@ -25,9 +24,10 @@ class ConversationFeed(Vertical):
         color: Hex color for the agent.
     """
 
-    def __init__(self, agent_id: str, color: str, **kwargs: object) -> None:
+    def __init__(self, agent_id: str, agent_name: str, color: str, **kwargs: object) -> None:
         super().__init__(**kwargs)
         self._agent_id = agent_id
+        self._agent_name = agent_name
         self._color = color
         self._current_message: AgentMessage | None = None
         self._current_thought: ThoughtBlock | None = None
@@ -36,10 +36,9 @@ class ConversationFeed(Vertical):
 
     def compose(self):
         """Yield the scrollable container and input bar."""
-        yield Throbber(id="loading-spinner")
         with ScrollableContainer(classes="conv-scroll"):
             pass
-        yield InputBar(self._agent_id, self._color)
+        yield InputBar(self._agent_id, self._agent_name, self._color)
 
     def on_mount(self) -> None:
         """Cache the scroll container and input bar references."""

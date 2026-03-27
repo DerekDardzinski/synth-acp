@@ -2,19 +2,81 @@
 
 from __future__ import annotations
 
-from textual import events
-from textual.containers import Vertical
-from textual.message import Message
-from textual.widgets import TextArea
+import re
 
-from synth_acp.models.commands import SendPrompt
+from rich.text import Text
+from textual import events, on
+from textual.containers import Horizontal, Vertical
+from textual.content import Content
+from textual.highlight import highlight
+from textual.message import Message
+from textual.widgets import Button, Static, TextArea
+
+from synth_acp.models.commands import CancelTurn, SendPrompt
+from synth_acp.ui.widgets.gradient_bar import GradientBar
+
+# Matches @agent-id and @"agent id with spaces"
+RE_AGENT_MENTION = re.compile(r'(@\S+)|@"(.*?)"')
+# Matches /slash-command at start of single-line input
+RE_SLASH_COMMAND = re.compile(r"^(/\S+)")
 
 
 class PromptTextArea(TextArea):
     """TextArea where Enter submits and Ctrl+J inserts newlines."""
 
     def __init__(self, **kwargs: object) -> None:
-        super().__init__(language=None, soft_wrap=True, show_line_numbers=False, **kwargs)
+        self._highlight_cache: list[Content] | None = None
+        super().__init__(
+            soft_wrap=True,
+            show_line_numbers=True,
+            highlight_cursor_line=False,
+            **kwargs,
+        )
+        self.compact = True
+
+    # --- Highlighting ---
+
+    def _get_highlighted_lines(self) -> list[Content]:
+        if self._highlight_cache is not None:
+            return self._highlight_cache
+
+        text = self.text
+
+        # Slash command: entire single line goes green
+        if text.startswith("/") and "\n" not in text:
+            self._highlight_cache = [Content.styled(text, "$text-success")]
+            return self._highlight_cache
+
+        # Markdown highlighting + @mention overlay
+        content = highlight(text + "\n```", language="markdown")
+        content = content.highlight_regex(RE_AGENT_MENTION, style="$primary")
+        self._highlight_cache = content.split("\n", allow_blank=True)[:-1]
+        return self._highlight_cache
+
+    def get_line(self, line_index: int) -> Text:
+        """Override to inject custom highlighting."""
+        lines = self._get_highlighted_lines()
+        try:
+            line = lines[line_index]
+        except IndexError:
+            return Text("", end="", no_wrap=True)
+
+        rendered = list(line.render_segments(self.visual_style))
+        return Text.assemble(
+            *[(text, str(style) if style else "") for text, style, _ in rendered],
+            end="",
+            no_wrap=True,
+        )
+
+    @on(TextArea.Changed)
+    def _on_text_changed(self, event: TextArea.Changed) -> None:  # noqa: ARG002
+        self._highlight_cache = None
+
+    def notify_style_update(self) -> None:
+        self._highlight_cache = None
+        super().notify_style_update()
+
+    # --- Key handling ---
 
     def _on_key(self, event: events.Key) -> None:
         """Enter submits, Ctrl+J inserts newline."""
@@ -43,17 +105,48 @@ class InputBar(Vertical):
 
     Args:
         agent_id: Default target agent.
+        agent_name: Display name for the agent.
         color: Hex color for the agent prompt indicator.
     """
 
-    def __init__(self, agent_id: str, color: str, **kwargs: object) -> None:
+    def __init__(self, agent_id: str, agent_name: str, color: str, **kwargs: object) -> None:
         super().__init__(classes="input-bar", **kwargs)
         self._agent_id = agent_id
+        self._agent_name = agent_name
         self._color = color
 
     def compose(self):
-        """Yield the text area widget."""
+        """Yield the text area and info bar."""
         yield PromptTextArea(id="prompt-input")
+        with Horizontal(classes="info-bar"):
+            yield Static(
+                f"[{self._color}]{self._agent_name}[/] · {self._agent_id}",
+                classes="info-bar-left",
+            )
+            yield Button("Submit ⏎", id="submit-btn", classes="info-bar-right")
+            yield Button("Cancel ■", id="cancel-btn", classes="info-bar-right cancel-btn")
+        yield GradientBar(classes="input-gradient")
+        yield Static("", classes="input-gradient-bg")
+
+    @on(Button.Pressed, "#submit-btn")
+    def _on_submit_click(self, event: Button.Pressed) -> None:
+        event.stop()
+        ta = self.query_one("#prompt-input", PromptTextArea)
+        ta.post_message(PromptTextArea.Submitted(ta))
+
+    @on(Button.Pressed, "#cancel-btn")
+    def _on_cancel_click(self, event: Button.Pressed) -> None:
+        event.stop()
+        from synth_acp.ui.app import SynthApp
+
+        app = self.app
+        assert isinstance(app, SynthApp)
+        app.run_worker(app.broker.handle(CancelTurn(agent_id=self._agent_id)))
+
+    def set_busy(self, busy: bool) -> None:
+        """Toggle between submit and cancel button."""
+        self.query_one("#submit-btn").display = not busy
+        self.query_one("#cancel-btn").display = busy
 
     def on_prompt_text_area_submitted(self, message: PromptTextArea.Submitted) -> None:
         """Parse @agent-id routing and send prompt to broker."""
