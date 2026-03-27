@@ -10,7 +10,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.reactive import reactive
-from textual.widgets import ContentSwitcher, Footer, LoadingIndicator, Static
+from textual.widgets import ContentSwitcher, Footer, Static
 from textual.worker import WorkerState
 
 from synth_acp.broker.broker import ACPBroker
@@ -83,7 +83,9 @@ class SynthApp(App):
     selected_agent: reactive[str] = reactive("")
     selected_thread: reactive[str] = reactive("")
 
-    def __init__(self, broker: ACPBroker, config: SessionConfig) -> None:
+    def __init__(self, broker: ACPBroker, config: SessionConfig, css_path: str | None = None) -> None:
+        if css_path:
+            self.CSS_PATH = css_path
         super().__init__()
         self.broker = broker
         self.config = config
@@ -114,6 +116,7 @@ class SynthApp(App):
 
     async def on_mount(self) -> None:
         """Launch all agents and start the broker event consumer."""
+        self.theme = "catppuccin-mocha"
         for agent in self.config.agents:
             self._event_buffers[agent.id] = []
         for agent in self.config.agents:
@@ -206,7 +209,7 @@ class SynthApp(App):
         elif isinstance(event, AgentThoughtReceived):
             await feed.add_thought_chunk(event.chunk)
         elif isinstance(event, ToolCallUpdated):
-            feed.add_tool_call(event.tool_call_id, event.title, event.kind, event.status)
+            await feed.add_tool_call(event.tool_call_id, event.title, event.kind, event.status)
         elif isinstance(event, PermissionRequested):
             feed.add_permission(
                 event.agent_id, event.request_id, event.title, event.kind, event.options
@@ -215,18 +218,16 @@ class SynthApp(App):
             feed.remove_permission(event.request_id)
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
+            feed.query_one("#loading-spinner").display = False
         elif isinstance(event, UsageUpdated):
             self._update_usage_display(event)
         elif isinstance(event, BrokerError):
             self.notify(event.message, severity=event.severity)
         elif isinstance(event, AgentStateChanged):
-            if event.new_state == AgentState.IDLE:
-                try:
-                    await feed.query_one("#loading-spinner", LoadingIndicator).remove()
-                except NoMatches:
-                    pass
-            elif event.new_state == AgentState.INITIALIZING:
-                await feed.query_one(".conv-scroll").mount(LoadingIndicator(id="loading-spinner"))
+            if event.new_state in {AgentState.IDLE, AgentState.TERMINATED}:
+                feed.query_one("#loading-spinner").display = False
+            elif event.new_state in {AgentState.INITIALIZING, AgentState.BUSY}:
+                feed.query_one("#loading-spinner").display = True
 
     async def _replay_event(self, feed: ConversationFeed, event: BrokerEvent) -> None:
         """Replay a buffered event to a conversation feed during drain.
@@ -243,7 +244,7 @@ class SynthApp(App):
         elif isinstance(event, AgentThoughtReceived):
             await feed.add_thought_chunk(event.chunk)
         elif isinstance(event, ToolCallUpdated):
-            feed.add_tool_call(event.tool_call_id, event.title, event.kind, event.status)
+            await feed.add_tool_call(event.tool_call_id, event.title, event.kind, event.status)
         elif isinstance(event, PermissionRequested):
             feed.add_permission(
                 event.agent_id, event.request_id, event.title, event.kind, event.options
@@ -325,11 +326,11 @@ class SynthApp(App):
             for event in self._event_buffers.get(agent_id, []):
                 await self._replay_event(feed, event)
             self._event_buffers[agent_id] = []
-            # Remove spinner if agent already passed INITIALIZING while buffered
+            # Hide spinner if agent already passed INITIALIZING while buffered
             state = self._agent_states.get(agent_id)
-            if state != AgentState.INITIALIZING:
+            if state not in {AgentState.INITIALIZING, AgentState.BUSY}:
                 try:
-                    feed.query_one("#loading-spinner", LoadingIndicator).remove()
+                    feed.query_one("#loading-spinner").display = False
                 except NoMatches:
                     pass
 
@@ -417,11 +418,11 @@ class SynthApp(App):
     async def action_quit(self) -> None:
         """Shut down the broker and exit.
 
-        Exits the TUI immediately and runs broker shutdown in background
-        to avoid blocking on agent process termination.
+        Shuts down the broker first so agent subprocesses are terminated
+        while the event loop is still alive, then exits the TUI.
         """
-        self.exit()
         try:
             await self.broker.shutdown()
         except Exception:
             pass
+        self.exit()

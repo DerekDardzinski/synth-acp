@@ -7,8 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from textual.css.query import NoMatches
-from textual.widgets import LoadingIndicator
 from textual.worker import WorkerState
 
 from synth_acp.models.agent import AgentState
@@ -24,6 +22,7 @@ from synth_acp.models.events import (
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.messages import BrokerEventMessage
 from synth_acp.ui.widgets.message_queue import MessageQueue
+from synth_acp.ui.widgets.throbber import Throbber
 
 
 def _make_config(*agent_ids: str) -> SessionConfig:
@@ -283,30 +282,32 @@ class TestActionLaunchModal:
         app.broker.handle.assert_not_called()
 
 
-# ── LoadingIndicator ──
+# ── Throbber ──
 
 
 class TestConversationFeedCompose:
     async def test_conversation_feed_when_composed_includes_loading_spinner(self) -> None:
-        """Compose yields a LoadingIndicator with id='loading-spinner' inside scroll."""
+        """Compose yields a Throbber with id='loading-spinner'."""
         app = _make_app("agent-1")
 
         async with app.run_test(headless=True, size=(120, 40)):
             await app.select_agent("agent-1")
             feed = app._panels["agent-1"]
-            spinner = feed.query_one("#loading-spinner", LoadingIndicator)
+            spinner = feed.query_one("#loading-spinner", Throbber)
             assert spinner.id == "loading-spinner"
 
 
 class TestRouteEventSpinner:
     async def test_route_event_when_state_idle_hides_spinner(self) -> None:
-        """AgentStateChanged(IDLE) removes the LoadingIndicator from the feed."""
+        """AgentStateChanged(IDLE) hides the Throbber in the feed."""
         app = _make_app("agent-1")
 
         async with app.run_test(headless=True, size=(120, 40)):
+            app._agent_states["agent-1"] = AgentState.INITIALIZING
             await app.select_agent("agent-1")
             feed = app._panels["agent-1"]
-            assert feed.query("#loading-spinner")
+            spinner = feed.query_one("#loading-spinner")
+            assert spinner.display is True
 
             event = AgentStateChanged(
                 agent_id="agent-1",
@@ -314,47 +315,40 @@ class TestRouteEventSpinner:
                 new_state=AgentState.IDLE,
             )
             await app.on_broker_event_message(BrokerEventMessage(event))
-            assert not feed.query("#loading-spinner")
+            assert spinner.display is False
 
-    async def test_route_event_when_state_initializing_mounts_spinner(self) -> None:
-        """AgentStateChanged(INITIALIZING) mounts new LoadingIndicator on re-launch."""
+    async def test_route_event_when_state_busy_shows_spinner(self) -> None:
+        """AgentStateChanged(BUSY) shows the Throbber in the feed."""
         app = _make_app("agent-1")
 
         async with app.run_test(headless=True, size=(120, 40)):
             await app.select_agent("agent-1")
             feed = app._panels["agent-1"]
+            spinner = feed.query_one("#loading-spinner")
+            assert spinner.display is False
 
-            # Simulate agent went IDLE (removes spinner)
-            idle_event = AgentStateChanged(
+            busy_event = AgentStateChanged(
                 agent_id="agent-1",
-                old_state=AgentState.INITIALIZING,
-                new_state=AgentState.IDLE,
+                old_state=AgentState.IDLE,
+                new_state=AgentState.BUSY,
             )
-            await app.on_broker_event_message(BrokerEventMessage(idle_event))
-            assert not feed.query("#loading-spinner")
-
-            # Re-launch: INITIALIZING mounts a new spinner
-            init_event = AgentStateChanged(
-                agent_id="agent-1",
-                old_state=AgentState.TERMINATED,
-                new_state=AgentState.INITIALIZING,
-            )
-            await app.on_broker_event_message(BrokerEventMessage(init_event))
-            spinner = feed.query_one("#loading-spinner", LoadingIndicator)
-            assert spinner is not None
+            await app.on_broker_event_message(BrokerEventMessage(busy_event))
+            assert spinner.display is True
 
     async def test_route_event_when_state_idle_and_no_spinner_exists_does_not_raise(
         self,
     ) -> None:
-        """NoMatches caught silently when spinner already removed."""
+        """NoMatches caught silently when spinner missing."""
         app = _make_app("a")
         feed = MagicMock()
-        feed.query_one.side_effect = NoMatches()
+        mock_spinner = MagicMock()
+        feed.query_one.return_value = mock_spinner
         event = AgentStateChanged(
             agent_id="a", old_state=AgentState.INITIALIZING, new_state=AgentState.IDLE
         )
 
-        await app._route_event_to_feed(feed, event)  # should not raise
+        await app._route_event_to_feed(feed, event)
+        assert mock_spinner.display is False
 
 
 class TestReplayEventSkipsSpinner:

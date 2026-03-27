@@ -1,4 +1,4 @@
-/* SYNTH TUI — polished styles */
+/* SYNTH TUI — heavy: wide left border with tinted background */
 
 Screen { background: $background; layout: vertical; }
 
@@ -120,47 +120,50 @@ ConversationFeed {
 /* ── Message widgets ── */
 PromptBubble {
     height: auto;
-    margin-left: 18;
-    background: $background;
-    border: round $primary;
-    padding: 0 1;
+    margin-left: 12;
+    background: $primary-background;
+    border-left: wide $primary;
+    padding: 0 2;
     color: $foreground;
 }
 
 AgentMessage {
     height: auto;
-    margin-right: 8;
-    background: $background;
-    border-left: wide $surface-lighten-2;
-    padding: 0 1;
+    margin-right: 4;
+    background: $success-background;
+    border-left: wide $success;
+    padding: 0 2;
     color: $text-muted;
 }
 
 ThoughtBlock {
     height: auto;
-    margin-right: 8;
-    border: round $surface;
+    margin-right: 4;
+    background: $surface;
+    border-left: wide $surface-lighten-2;
+    padding: 0 2;
     color: $text-muted;
 }
 
 ToolCallBlock {
     height: auto;
-    background: $background;
-    border: round $surface-lighten-1;
-    padding: 0 1;
+    background: $accent-background;
+    border-left: wide $accent;
+    padding: 0 2;
     color: $text-muted;
 }
 ToolCallBlock.tool-permission {
-    border: round $warning;
+    border-left: wide $warning;
+    background: $warning-background;
 }
 
 /* ── Permission box ── */
 .permission-box {
     height: auto;
     margin: 0 1;
-    background: $background;
-    border: round $warning;
-    padding: 0 1;
+    background: $warning-background;
+    border-left: wide $warning;
+    padding: 0 2;
     color: $text-muted;
 }
 

@@ -436,16 +436,26 @@ async def _run(config: SessionConfig) -> None:
 # ------------------------------------------------------------------
 
 
-def _run_tui(config: SessionConfig) -> None:
+_STYLE_CSS = {
+    "default": "css/app.tcss",
+    "leftbar": "css/app-leftbar.tcss",
+    "minimal": "css/app-minimal.tcss",
+    "heavy": "css/app-heavy.tcss",
+}
+
+
+def _run_tui(config: SessionConfig, style: str = "default") -> None:
     """Launch the Textual TUI.
 
     Args:
         config: Resolved session configuration.
+        style: CSS style variant name.
     """
     from synth_acp.ui.app import SynthApp
 
     broker = ACPBroker(config)
-    SynthApp(broker, config).run()
+    css_path = _STYLE_CSS.get(style, _STYLE_CSS["default"])
+    SynthApp(broker, config, css_path=css_path).run()
 
 
 # ------------------------------------------------------------------
@@ -460,6 +470,12 @@ def cli(
     config: Path | None = typer.Option(None, "-c", "--config", help="Path to config file"),
     headless: bool = typer.Option(False, help="Run without TUI (stdin/stdout mode)"),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Enable debug logging"),
+    style: str = typer.Option(
+        "default",
+        "-s",
+        "--style",
+        help="TUI style variant: default, leftbar, minimal, heavy",
+    ),
 ) -> None:
     """SYNTH — multi-agent ACP orchestrator."""
     if verbose:
@@ -471,7 +487,7 @@ def cli(
     if headless:
         asyncio.run(_run(resolved))
     else:
-        _run_tui(resolved)
+        _run_tui(resolved, style=style)
 
 
 main = app

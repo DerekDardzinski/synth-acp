@@ -6,13 +6,14 @@ from datetime import UTC, datetime
 
 from acp.schema import PermissionOption
 from textual.containers import ScrollableContainer, Vertical
-from textual.widgets import LoadingIndicator, Static
+from textual.widgets import Static
 
 from synth_acp.ui.widgets.agent_message import AgentMessage
 from synth_acp.ui.widgets.input_bar import InputBar
 from synth_acp.ui.widgets.permission import PermissionRequest
 from synth_acp.ui.widgets.prompt_bubble import PromptBubble
 from synth_acp.ui.widgets.thought_block import ThoughtBlock
+from synth_acp.ui.widgets.throbber import Throbber
 from synth_acp.ui.widgets.tool_call import ToolCallBlock
 
 
@@ -35,8 +36,9 @@ class ConversationFeed(Vertical):
 
     def compose(self):
         """Yield the scrollable container and input bar."""
+        yield Throbber(id="loading-spinner")
         with ScrollableContainer(classes="conv-scroll"):
-            yield LoadingIndicator(id="loading-spinner")
+            pass
         yield InputBar(self._agent_id, self._color)
 
     def on_mount(self) -> None:
@@ -63,7 +65,7 @@ class ConversationFeed(Vertical):
             chunk: Markdown fragment from the agent.
         """
         if self._current_message is None:
-            self._current_message = AgentMessage(self._agent_id, self._color)
+            self._current_message = AgentMessage(self._agent_id)
             assert self._scroll is not None
             self._scroll.mount(self._current_message)
         await self._current_message.append_chunk(chunk)
@@ -84,8 +86,11 @@ class ConversationFeed(Vertical):
         assert self._scroll is not None
         self._scroll.scroll_end(animate=False)
 
-    def add_tool_call(self, tool_call_id: str, title: str, kind: str, status: str) -> None:
+    async def add_tool_call(self, tool_call_id: str, title: str, kind: str, status: str) -> None:
         """Mount a new ToolCallBlock or update an existing one.
+
+        Finalizes any in-progress AgentMessage so the tool call visually
+        splits the response stream.
 
         Args:
             tool_call_id: Unique tool call identifier.
@@ -97,6 +102,9 @@ class ConversationFeed(Vertical):
             existing = self.query_one(f"#tool-{tool_call_id}", ToolCallBlock)
             existing.update_status(status)
         except Exception:
+            if self._current_message is not None:
+                await self._current_message.finalize()
+                self._current_message = None
             block = ToolCallBlock(tool_call_id, title, kind, status)
             assert self._scroll is not None
             self._scroll.mount(block)

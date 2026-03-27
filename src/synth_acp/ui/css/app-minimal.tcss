@@ -1,4 +1,4 @@
-/* SYNTH TUI — polished styles */
+/* SYNTH TUI — minimal: thin left border, no background, tight spacing */
 
 Screen { background: $background; layout: vertical; }
 
@@ -120,38 +120,36 @@ ConversationFeed {
 /* ── Message widgets ── */
 PromptBubble {
     height: auto;
-    margin-left: 18;
     background: $background;
-    border: round $primary;
+    border-left: tall $primary;
     padding: 0 1;
     color: $foreground;
 }
 
 AgentMessage {
     height: auto;
-    margin-right: 8;
     background: $background;
-    border-left: wide $surface-lighten-2;
+    border-left: tall $success;
     padding: 0 1;
     color: $text-muted;
 }
 
 ThoughtBlock {
     height: auto;
-    margin-right: 8;
-    border: round $surface;
+    border-left: tall $surface;
+    padding: 0 1;
     color: $text-muted;
 }
 
 ToolCallBlock {
     height: auto;
     background: $background;
-    border: round $surface-lighten-1;
+    border-left: tall $accent;
     padding: 0 1;
     color: $text-muted;
 }
 ToolCallBlock.tool-permission {
-    border: round $warning;
+    border-left: tall $warning;
 }
 
 /* ── Permission box ── */
@@ -159,7 +157,7 @@ ToolCallBlock.tool-permission {
     height: auto;
     margin: 0 1;
     background: $background;
-    border: round $warning;
+    border-left: tall $warning;
     padding: 0 1;
     color: $text-muted;
 }

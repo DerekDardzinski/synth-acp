@@ -10,14 +10,12 @@ class AgentMessage(Markdown):
 
     Args:
         agent_id: The agent that produced this message.
-        color: Hex color for the agent's border.
     """
 
-    def __init__(self, agent_id: str, color: str) -> None:
+    def __init__(self, agent_id: str) -> None:
         super().__init__("")
         self._agent_id = agent_id
         self._stream: MarkdownStream | None = None
-        self.styles.border = ("round", color)
 
     async def append_chunk(self, chunk: str) -> None:
         """Append a streaming markdown chunk.
