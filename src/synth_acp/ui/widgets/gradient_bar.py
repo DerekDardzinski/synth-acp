@@ -8,11 +8,14 @@ from time import monotonic
 from rich.segment import Segment
 from rich.style import Style as RichStyle
 from textual.color import Color, Gradient
+from textual.css.query import NoMatches
 from textual.css.styles import RulesMap
+from textual.reactive import reactive
 from textual.strip import Strip
 from textual.style import Style
 from textual.visual import RenderOptions, Visual
 from textual.widget import Widget
+from textual.widgets import Static
 
 
 class GradientBarVisual(Visual):
@@ -26,10 +29,10 @@ class GradientBarVisual(Visual):
         self.character = character
         self.get_time = get_time
         self._gradient = gradient
-        self._cache: dict[tuple[int], list[Segment]] = {}
+        self._cache: dict[tuple, list[Segment]] = {}
 
     def _make_segments(self, width: int, background: object) -> list[Segment]:
-        key = (width,)
+        key = (width, background)
         if key not in self._cache:
             self._cache[key] = [
                 Segment(
@@ -68,28 +71,59 @@ class GradientBar(Widget):
     def on_mount(self) -> None:
         self.auto_refresh = 1 / 15
         self._gradient = self._build_gradient()
+        self._visual = GradientBarVisual(self._gradient)
 
     def on_app_theme_changed(self) -> None:
         self._gradient = self._build_gradient()
+        self._visual = GradientBarVisual(self._gradient)
         self.refresh()
 
     def _build_gradient(self) -> Gradient:
         theme = self.app.current_theme
         primary = Color.parse(theme.primary)
         secondary = Color.parse(theme.secondary or theme.primary)
-        accent = Color.parse(theme.accent or theme.primary)
         return Gradient.from_colors(
-            primary.darken(0.3).hex,
             primary.hex,
             secondary.hex,
-            secondary.lighten(0.2).hex,
-            accent.hex,
-            accent.lighten(0.2).hex,
-            accent.hex,
-            secondary.hex,
             primary.hex,
-            primary.darken(0.3).hex,
         )
 
     def render(self) -> GradientBarVisual:
-        return GradientBarVisual(self._gradient)
+        return self._visual
+
+
+class ActivityBar(Widget):
+    """Animated gradient bar with static fallback to prevent layout shift.
+
+    Set ``active`` to toggle between animated gradient and static placeholder.
+    """
+
+    DEFAULT_CSS = """
+    ActivityBar {
+        height: 1;
+        hatch: none;
+    }
+    ActivityBar > GradientBar {
+        height: 1;
+        hatch: none;
+    }
+    ActivityBar > .activity-bar-bg {
+        height: 1;
+        background: transparent;
+        display: none;
+    }
+    """
+
+    active: reactive[bool] = reactive(True)
+
+    def compose(self):
+        yield GradientBar()
+        yield Static("", classes="activity-bar-bg")
+
+    def watch_active(self, value: bool) -> None:
+        """Toggle gradient vs static fallback."""
+        try:
+            self.query_one(GradientBar).display = value
+            self.query_one(".activity-bar-bg").display = not value
+        except NoMatches:
+            pass

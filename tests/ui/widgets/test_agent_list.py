@@ -128,7 +128,7 @@ class TestAddAgentTile:
             from synth_acp.ui.widgets.agent_list import AgentList
 
             agent_list = app.query_one(AgentList)
-            agent_list.add_agent_tile("new-agent", "#ff0000")
+            agent_list.add_agent_tile("new-agent")
             await app.workers.wait_for_complete()
             tile = app.query_one("#tile-new-agent", AgentTile)
             assert tile._agent_id == "new-agent"

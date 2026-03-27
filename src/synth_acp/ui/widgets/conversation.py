@@ -21,14 +21,13 @@ class ConversationFeed(Vertical):
 
     Args:
         agent_id: The agent this feed belongs to.
-        color: Hex color for the agent.
+        agent_name: Display name for the agent.
     """
 
-    def __init__(self, agent_id: str, agent_name: str, color: str, **kwargs: object) -> None:
+    def __init__(self, agent_id: str, agent_name: str, **kwargs: object) -> None:
         super().__init__(**kwargs)
         self._agent_id = agent_id
         self._agent_name = agent_name
-        self._color = color
         self._current_message: AgentMessage | None = None
         self._current_thought: ThoughtBlock | None = None
         self._scroll: ScrollableContainer | None = None
@@ -38,7 +37,7 @@ class ConversationFeed(Vertical):
         """Yield the scrollable container and input bar."""
         with ScrollableContainer(classes="conv-scroll"):
             pass
-        yield InputBar(self._agent_id, self._agent_name, self._color)
+        yield InputBar(self._agent_id, self._agent_name)
 
     def on_mount(self) -> None:
         """Cache the scroll container and input bar references."""

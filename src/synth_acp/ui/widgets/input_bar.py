@@ -13,7 +13,7 @@ from textual.message import Message
 from textual.widgets import Button, Static, TextArea
 
 from synth_acp.models.commands import CancelTurn, SendPrompt
-from synth_acp.ui.widgets.gradient_bar import GradientBar
+from synth_acp.ui.widgets.gradient_bar import ActivityBar
 
 # Matches @agent-id and @"agent id with spaces"
 RE_AGENT_MENTION = re.compile(r'(@\S+)|@"(.*?)"')
@@ -109,24 +109,22 @@ class InputBar(Vertical):
         color: Hex color for the agent prompt indicator.
     """
 
-    def __init__(self, agent_id: str, agent_name: str, color: str, **kwargs: object) -> None:
+    def __init__(self, agent_id: str, agent_name: str, **kwargs: object) -> None:
         super().__init__(classes="input-bar", **kwargs)
         self._agent_id = agent_id
         self._agent_name = agent_name
-        self._color = color
 
     def compose(self):
         """Yield the text area and info bar."""
         yield PromptTextArea(id="prompt-input")
         with Horizontal(classes="info-bar"):
             yield Static(
-                f"[{self._color}]{self._agent_name}[/] · {self._agent_id}",
+                f"[$primary]{self._agent_name}[/] · {self._agent_id}",
                 classes="info-bar-left",
             )
             yield Button("Submit ⏎", id="submit-btn", classes="info-bar-right")
             yield Button("Cancel ■", id="cancel-btn", classes="info-bar-right cancel-btn")
-        yield GradientBar(classes="input-gradient")
-        yield Static("", classes="input-gradient-bg")
+        yield ActivityBar(classes="input-activity")
 
     @on(Button.Pressed, "#submit-btn")
     def _on_submit_click(self, event: Button.Pressed) -> None:
@@ -144,9 +142,10 @@ class InputBar(Vertical):
         app.run_worker(app.broker.handle(CancelTurn(agent_id=self._agent_id)))
 
     def set_busy(self, busy: bool) -> None:
-        """Toggle between submit and cancel button."""
+        """Toggle between submit/cancel button and activity bar."""
         self.query_one("#submit-btn").display = not busy
         self.query_one("#cancel-btn").display = busy
+        self.query_one(ActivityBar).active = busy
 
     def on_prompt_text_area_submitted(self, message: PromptTextArea.Submitted) -> None:
         """Parse @agent-id routing and send prompt to broker."""

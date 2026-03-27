@@ -7,64 +7,72 @@ from textual.containers import ScrollableContainer, Vertical
 from textual.widgets import Static
 
 from synth_acp.models.agent import AgentState
+from synth_acp.ui.widgets.gradient_bar import ActivityBar
 
 STATUS_DOT: dict[AgentState, str] = {
-    AgentState.INITIALIZING: "[cyan]●[/cyan]",
-    AgentState.IDLE: "[green]●[/green]",
-    AgentState.BUSY: "[yellow]●[/yellow]",
-    AgentState.AWAITING_PERMISSION: "[bold yellow]●[/bold yellow]",
-    AgentState.TERMINATED: "[dim]○[/dim]",
+    AgentState.INITIALIZING: "[$accent]●[/]",
+    AgentState.IDLE: "[$success]●[/]",
+    AgentState.BUSY: "[$warning]●[/]",
+    AgentState.AWAITING_PERMISSION: "[$warning bold]●[/]",
+    AgentState.TERMINATED: "[$text-muted]○[/]",
 }
 
 PREVIEW_TEXT: dict[AgentState, str] = {
-    AgentState.INITIALIZING: "[dim italic]initializing…[/dim italic]",
-    AgentState.IDLE: "[dim italic]idle[/dim italic]",
-    AgentState.BUSY: "[yellow italic]working…[/yellow italic]",
-    AgentState.TERMINATED: "[dim italic]terminated[/dim italic]",
-    AgentState.AWAITING_PERMISSION: "[bold yellow italic]awaiting permission…[/bold yellow italic]",
+    AgentState.INITIALIZING: "[$text-muted italic]initializing…[/]",
+    AgentState.IDLE: "[$text-muted italic]idle[/]",
+    AgentState.BUSY: "[$warning italic]working…[/]",
+    AgentState.TERMINATED: "[$text-muted italic]terminated[/]",
+    AgentState.AWAITING_PERMISSION: "[$warning bold italic]awaiting permission…[/]",
 }
 
-DEFAULT_PREVIEW = "[dim italic]idle[/dim italic]"
+DEFAULT_PREVIEW = "[$text-muted italic]idle[/]"
 
 
-class AgentTile(Static):
-    """Clickable agent tile showing status dot, colored name, and activity preview.
+_BUSY_STATES = {AgentState.INITIALIZING, AgentState.BUSY, AgentState.AWAITING_PERMISSION}
+
+
+class AgentTile(Vertical):
+    """Clickable agent tile showing status dot, name, activity preview, and activity bar.
 
     Args:
         agent_id: Unique agent identifier.
-        color: Hex color for the agent name.
         state: Initial agent state.
     """
 
     def __init__(
         self,
         agent_id: str,
-        color: str,
         state: AgentState = AgentState.IDLE,
         *,
         task: str = "",
         parent: str | None = None,
     ) -> None:
         self._agent_id = agent_id
-        self._color = color
         self._state = state
         self._agent_task = task
         self._parent_agent = parent
-        super().__init__(self._build_markup(), id=f"tile-{agent_id}")
+        super().__init__(id=f"tile-{agent_id}")
         if state == AgentState.AWAITING_PERMISSION:
             self.add_class("tile-permission")
 
+    def compose(self) -> ComposeResult:
+        yield Static(self._build_markup(), classes="tile-label")
+        yield ActivityBar(classes="tile-activity")
+
+    def on_mount(self) -> None:
+        self.query_one(ActivityBar).active = self._state in _BUSY_STATES
+
     def _build_markup(self) -> str:
         """Build the tile markup from current state."""
-        dot = STATUS_DOT.get(self._state, "[dim]○[/dim]")
+        dot = STATUS_DOT.get(self._state, "[$text-muted]○[/]")
         warn = (
-            "  [bold yellow]⚠[/bold yellow]"
+            "  [$warning bold]⚠[/]"
             if self._state == AgentState.AWAITING_PERMISSION
             else ""
         )
-        name = f"[bold {self._color}]{self._agent_id}[/bold {self._color}]"
+        name = f"[$primary bold]{self._agent_id}[/]"
         if self._parent_agent:
-            name += f" [dim](via {self._parent_agent})[/dim]"
+            name += f" [$text-muted](via {self._parent_agent})[/]"
         preview = (
             f"[dim italic]{self._agent_task}[/dim italic]"
             if self._agent_task
@@ -79,7 +87,8 @@ class AgentTile(Static):
             new_state: The new agent state.
         """
         self._state = new_state
-        self.update(self._build_markup())
+        self.query_one(".tile-label", Static).update(self._build_markup())
+        self.query_one(ActivityBar).active = new_state in _BUSY_STATES
         if new_state == AgentState.AWAITING_PERMISSION:
             self.add_class("tile-permission")
         else:
@@ -114,7 +123,7 @@ class MCPButton(Static):
 
     def _build_markup(self, count: int) -> str:
         """Build button markup with optional badge."""
-        badge = f"  [bold #f97316]{count}[/bold #f97316]" if count else ""
+        badge = f"  [$warning bold]{count}[/]" if count else ""
         return f"◈  MCP Messages{badge}"
 
     def update_count(self, count: int) -> None:
@@ -139,10 +148,10 @@ class AgentList(Vertical):
     """Sidebar container with agent tiles, launch button, and MCP button.
 
     Args:
-        agents: List of (agent_id, color) pairs.
+        agents: List of agent IDs.
     """
 
-    def __init__(self, agents: list[tuple[str, str]]) -> None:
+    def __init__(self, agents: list[str]) -> None:
         super().__init__()
         self._agents = agents
 
@@ -150,22 +159,21 @@ class AgentList(Vertical):
         """Yield sidebar label, scrollable agent tiles, and buttons."""
         yield Static("AGENTS", id="sidebar-label")
         with ScrollableContainer(id="agent-list"):
-            for agent_id, color in self._agents:
-                yield AgentTile(agent_id, color)
+            for agent_id in self._agents:
+                yield AgentTile(agent_id)
             yield LaunchButton()
         yield MCPButton()
 
     def add_agent_tile(
-        self, agent_id: str, color: str, *, task: str = "", parent: str | None = None
+        self, agent_id: str, *, task: str = "", parent: str | None = None
     ) -> None:
         """Mount a new agent tile into the scrollable container.
 
         Args:
             agent_id: Unique agent identifier.
-            color: Hex color for the agent name.
             task: Optional task description.
             parent: Optional parent agent ID.
         """
-        tile = AgentTile(agent_id, color, task=task, parent=parent)
+        tile = AgentTile(agent_id, task=task, parent=parent)
         launch_btn = self.query_one("#launch-btn", LaunchButton)
         self.query_one("#agent-list", ScrollableContainer).mount(tile, before=launch_btn)

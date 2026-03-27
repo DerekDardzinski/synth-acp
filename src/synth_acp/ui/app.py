@@ -8,7 +8,6 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.css.query import NoMatches
 from textual.reactive import reactive
 from textual.widgets import ContentSwitcher, Footer, Static
 from textual.worker import WorkerState
@@ -36,19 +35,6 @@ from synth_acp.ui.screens.launch import LaunchAgentScreen
 from synth_acp.ui.widgets.agent_list import AgentList, AgentTile, MCPButton
 from synth_acp.ui.widgets.conversation import ConversationFeed
 from synth_acp.ui.widgets.message_queue import MessageQueue
-
-PALETTE = [
-    "#3b82f6",
-    "#a78bfa",
-    "#f97316",
-    "#2dd4bf",
-    "#f472b6",
-    "#06b6d4",
-    "#84cc16",
-    "#e879f9",
-    "#fb923c",
-    "#4ade80",
-]
 
 _DISABLED_STATES = {AgentState.BUSY, AgentState.AWAITING_PERMISSION}
 
@@ -89,9 +75,6 @@ class SynthApp(App):
         super().__init__()
         self.broker = broker
         self.config = config
-        self._agent_colors: dict[str, str] = {
-            agent.id: PALETTE[i % len(PALETTE)] for i, agent in enumerate(config.agents)
-        }
         self._event_buffers: dict[str, list[BrokerEvent]] = {}
         self._panels: dict[str, ConversationFeed] = {}
         self._agent_states: dict[str, AgentState] = {}
@@ -108,7 +91,7 @@ class SynthApp(App):
             yield Static(f"project: {self.config.project}", id="tb-session")
             yield Static("", id="tb-right")
         with Horizontal(id="main"):
-            agents = [(a.id, self._agent_colors[a.id]) for a in self.config.agents]
+            agents = [a.id for a in self.config.agents]
             with Vertical(id="sidebar"):
                 yield AgentList(agents)
             yield ContentSwitcher(id="right")
@@ -166,15 +149,13 @@ class SynthApp(App):
 
         if isinstance(event, AgentStateChanged):
             self._agent_states[event.agent_id] = event.new_state
-            if event.agent_id not in self._agent_colors:
-                color = PALETTE[len(self._agent_colors) % len(PALETTE)]
-                self._agent_colors[event.agent_id] = color
+            if event.agent_id not in self._dynamic_agents and event.agent_id not in {a.id for a in self.config.agents}:
                 parent = self.broker._agent_parents.get(event.agent_id)
                 self._dynamic_agents[event.agent_id] = DynamicAgentInfo(parent=parent, task="")
                 self._event_buffers[event.agent_id] = []
                 try:
                     agent_list = self.query_one(AgentList)
-                    agent_list.add_agent_tile(event.agent_id, color, parent=parent)
+                    agent_list.add_agent_tile(event.agent_id, parent=parent)
                 except Exception:
                     self.log.error(f"Failed to add tile for {event.agent_id}", exc_info=True)
             try:
@@ -218,8 +199,6 @@ class SynthApp(App):
             feed.remove_permission(event.request_id)
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
-            feed.query_one(".input-gradient").display = False
-            feed.query_one(".input-gradient-bg").display = True
             feed.input_bar.set_busy(False)
         elif isinstance(event, UsageUpdated):
             self._update_usage_display(event)
@@ -227,12 +206,8 @@ class SynthApp(App):
             self.notify(event.message, severity=event.severity)
         elif isinstance(event, AgentStateChanged):
             if event.new_state in {AgentState.IDLE, AgentState.TERMINATED}:
-                feed.query_one(".input-gradient").display = False
-                feed.query_one(".input-gradient-bg").display = True
                 feed.input_bar.set_busy(False)
             elif event.new_state in {AgentState.INITIALIZING, AgentState.BUSY}:
-                feed.query_one(".input-gradient").display = True
-                feed.query_one(".input-gradient-bg").display = False
                 feed.input_bar.set_busy(True)
 
     async def _replay_event(self, feed: ConversationFeed, event: BrokerEvent) -> None:
@@ -325,10 +300,9 @@ class SynthApp(App):
             agent_id: The agent to display.
         """
         if agent_id not in self._panels:
-            color = self._agent_colors.get(agent_id, "#94a3b8")
             agent_cfg = next((a for a in self.config.agents if a.id == agent_id), None)
             agent_name = agent_cfg.display_name if agent_cfg else agent_id
-            feed = ConversationFeed(agent_id, agent_name, color, id=f"feed-{agent_id}")
+            feed = ConversationFeed(agent_id, agent_name, id=f"feed-{agent_id}")
             self._panels[agent_id] = feed
             await self.query_one("#right").mount(feed)
             for event in self._event_buffers.get(agent_id, []):
@@ -337,12 +311,8 @@ class SynthApp(App):
             # Hide spinner if agent already passed INITIALIZING while buffered
             state = self._agent_states.get(agent_id)
             if state not in {AgentState.INITIALIZING, AgentState.BUSY}:
-                try:
-                    feed.query_one(".input-gradient").display = False
-                    feed.query_one(".input-gradient-bg").display = True
+                if feed.input_bar is not None:
                     feed.input_bar.set_busy(False)
-                except NoMatches:
-                    pass
 
         self.selected_agent = agent_id
 
@@ -385,7 +355,7 @@ class SynthApp(App):
         switcher = self.query_one("#right", ContentSwitcher)
 
         if self._mcp_panel is None:
-            panel = MessageQueue(self._mcp_threads, self._agent_colors, id="messages")
+            panel = MessageQueue(self._mcp_threads, id="messages")
             self._mcp_panel = panel
             await switcher.mount(panel)
         else:

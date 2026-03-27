@@ -33,22 +33,18 @@ class ThreadDetail(Vertical):
         self,
         thread_key: tuple[str, str],
         messages: list[McpMessageDelivered],
-        colors: dict[str, str],
     ) -> None:
         """Populate the detail pane with messages for a thread.
 
         Args:
             thread_key: Sorted (agent_a, agent_b) pair.
             messages: List of delivered messages in this thread.
-            colors: Agent ID to hex color mapping.
         """
         a, b = thread_key
-        ca = colors.get(a, "#94a3b8")
-        cb = colors.get(b, "#94a3b8")
         n = len(messages)
         header = self.query_one("#thread-detail-header", ThreadDetailHeader)
         header.update(
-            f" [bold {ca}]{a}[/bold {ca}] [dim]→[/dim] [bold {cb}]{b}[/bold {cb}]"
+            f" [$primary bold]{a}[/] [dim]→[/dim] [$primary bold]{b}[/]"
             f"  [dim]{n} message{'s' if n != 1 else ''}[/dim]"
         )
 
@@ -56,12 +52,11 @@ class ThreadDetail(Vertical):
         scroll.remove_children()
         prev_from: str | None = None
         for msg in messages:
-            fc = colors.get(msg.from_agent, "#94a3b8")
             ts = msg.timestamp.strftime("%H:%M")
             if msg.from_agent != prev_from:
                 scroll.mount(
                     Static(
-                        f"[bold {fc}]● {msg.from_agent}[/bold {fc}] [dim]→ {msg.to_agent}   {ts}[/dim]",
+                        f"[$primary bold]● {msg.from_agent}[/] [dim]→ {msg.to_agent}   {ts}[/dim]",
                         classes="tmsg-from",
                     )
                 )
@@ -85,25 +80,21 @@ class ThreadItem(Static):
     Args:
         thread_key: Sorted (agent_a, agent_b) pair.
         messages: Messages in this thread.
-        colors: Agent ID to hex color mapping.
     """
 
     def __init__(
         self,
         thread_key: tuple[str, str],
         messages: list[McpMessageDelivered],
-        colors: dict[str, str],
     ) -> None:
         self._thread_key = thread_key
         a, b = thread_key
-        ca = colors.get(a, "#94a3b8")
-        cb = colors.get(b, "#94a3b8")
         last = messages[-1]
         ts = last.timestamp.strftime("%H:%M")
         snippet = last.preview[:30] + "…" if len(last.preview) > 30 else last.preview
         preview_line = f"  [dim]{snippet}[/dim]" if snippet else f"  [dim]{ts}[/dim]"
         content = (
-            f"[bold {ca}]{a}[/bold {ca}] [dim]→[/dim] [bold {cb}]{b}[/bold {cb}]\n{preview_line}"
+            f"[$primary bold]{a}[/] [dim]→[/dim] [$primary bold]{b}[/]\n{preview_line}"
         )
         key_id = f"titem-{a}-{b}"
         super().__init__(content, id=key_id, classes="thread-item")
@@ -126,18 +117,15 @@ class MessageQueue(Vertical):
 
     Args:
         threads: Thread data keyed by sorted agent pair.
-        colors: Agent ID to hex color mapping.
     """
 
     def __init__(
         self,
         threads: dict[tuple[str, str], list[McpMessageDelivered]],
-        colors: dict[str, str],
         **kwargs: Any,
     ) -> None:
         super().__init__(classes="right-panel", **kwargs)
         self._threads = threads
-        self._colors = colors
         self._active_key: tuple[str, str] | None = None
 
     def compose(self) -> ComposeResult:
@@ -150,7 +138,7 @@ class MessageQueue(Vertical):
         with Horizontal(id="msg-body"):
             with ScrollableContainer(id="thread-list"):
                 for key, msgs in self._threads.items():
-                    yield ThreadItem(key, msgs, self._colors)
+                    yield ThreadItem(key, msgs)
             yield ThreadDetail()
 
     async def update_threads(
@@ -168,7 +156,7 @@ class MessageQueue(Vertical):
             return
         await thread_list.remove_children()
         for key, msgs in threads.items():
-            thread_list.mount(ThreadItem(key, msgs, self._colors))
+            thread_list.mount(ThreadItem(key, msgs))
         # Re-select active thread if still present
         if self._active_key and self._active_key in threads:
             self.show_thread(self._active_key)
@@ -193,6 +181,6 @@ class MessageQueue(Vertical):
         msgs = self._threads.get(thread_key, [])
         try:
             detail = self.query_one("#thread-detail", ThreadDetail)
-            detail.show_thread(thread_key, msgs, self._colors)
+            detail.show_thread(thread_key, msgs)
         except Exception:
             pass

@@ -43,28 +43,31 @@ Screen { background: $background; layout: vertical; }
     scrollbar-size-vertical: 1;
     scrollbar-color: $scrollbar;
     scrollbar-background: transparent;
+    hatch: left $panel 60%;
 }
 
 AgentTile {
     height: auto;
     width: 1fr;
-    padding: 0 1;
-    background: $background;
-    border: round $surface-lighten-1;
+    padding: 0 1 0 1;
+    margin: 1 0 0 0;
+    background: $background-lighten-1;
+    border-top: tall $accent;
     transition: border 0.15s in_out_cubic;
     transition: background 0.15s in_out_cubic;
 }
 AgentTile:hover {
-    border: round $surface-lighten-3;
-    background: $background;
+    border-top: tall $accent-lighten-2;
+    background: $background-lighten-1;
 }
 AgentTile.tile-active {
-    background: $background;
-    border: round $border;
-    
+    background: $background-lighten-1;
+    border-top: tall $accent;
 }
-AgentTile.tile-permission { border: round $warning; }
-AgentTile.tile-permission.tile-active { border: round $warning;  }
+AgentTile.tile-permission { border-top: tall $warning; }
+AgentTile.tile-permission.tile-active { border-top: tall $warning; }
+.tile-label { height: auto; }
+.tile-activity { margin: 0; }
 
 #mcp-btn {
     height: 3;
@@ -79,15 +82,15 @@ AgentTile.tile-permission.tile-active { border: round $warning;  }
 #mcp-btn.btn-active { border-top: tall $border; color: $foreground; }
 
 /* ── Right panels ── */
-#right { height: 1fr; width: 1fr; hatch: right $surface 70%; }
+#right { height: 1fr; width: 1fr; hatch: right $panel 60%; }
 
-ContentSwitcher > * { height: 1fr; hatch: right $surface 70%; }
+ContentSwitcher > * { height: 1fr; hatch: right $panel 60%; }
 
 .right-panel {
     height: 1fr;
     width: 1fr;
     layout: vertical;
-    hatch: right $surface 70%;
+    hatch: right $panel 60%;
 }
 
 /* ── Panel header ── */
@@ -106,7 +109,7 @@ ConversationFeed {
     height: 1fr;
     width: 1fr;
     layout: vertical;
-    hatch: right $surface 70%;
+    hatch: right $panel 60%;
 }
 
 /* ── Conversation scroll area ── */
@@ -117,7 +120,7 @@ ConversationFeed {
     scrollbar-color: $scrollbar;
     scrollbar-background: transparent;
     align-vertical: bottom;
-    hatch: right $surface 70%;
+    hatch: right $panel 60%;
 }
 
 /* ── Message widgets ── */
@@ -177,7 +180,7 @@ ToolCallBlock.tool-permission {
     border: none;
     margin-bottom: 1;
     color: $text-muted;
-    hatch: right $surface 70%;
+    hatch: right $panel 60%;
 }
 .input-bar:focus-within {
     border: none;
@@ -201,15 +204,8 @@ PromptTextArea {
     color: $text-muted;
 }
 
-.input-gradient {
-    height: 1;
+.input-activity {
     margin: 0 3;
-}
-.input-gradient-bg {
-    height: 1;
-    margin: 0 3;
-    background: transparent;
-    display: none;
 }
 .info-bar-left {
     width: 1fr;
@@ -297,7 +293,7 @@ ThreadDetail {
     scrollbar-size-vertical: 1;
     scrollbar-color: $scrollbar;
     scrollbar-background: transparent;
-    hatch: right $surface 70%;
+    hatch: right $panel 60%;
 }
 .tmsg-from { height: auto; color: $text-muted; }
 .tmsg-body {

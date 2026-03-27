@@ -21,8 +21,8 @@ from synth_acp.models.events import (
 )
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.messages import BrokerEventMessage
+from synth_acp.ui.widgets.gradient_bar import ActivityBar
 from synth_acp.ui.widgets.message_queue import MessageQueue
-from synth_acp.ui.widgets.gradient_bar import GradientBar
 
 
 def _make_config(*agent_ids: str) -> SessionConfig:
@@ -282,32 +282,29 @@ class TestActionLaunchModal:
         app.broker.handle.assert_not_called()
 
 
-# ── GradientBar ──
+# ── ActivityBar ──
 
 
-class TestConversationFeedCompose:
-    async def test_conversation_feed_when_composed_includes_loading_spinner(self) -> None:
-        """Compose yields a GradientBar with id='loading-spinner'."""
+class TestActivityBar:
+    async def test_activity_bar_inactive_when_agent_idle(self) -> None:
+        """InputBar's ActivityBar is inactive when agent is idle."""
         app = _make_app("agent-1")
 
         async with app.run_test(headless=True, size=(120, 40)):
             await app.select_agent("agent-1")
             feed = app._panels["agent-1"]
-            spinner = feed.query_one("#loading-spinner", GradientBar)
-            assert spinner.id == "loading-spinner"
+            bar = feed.input_bar.query_one(ActivityBar)
+            assert bar.active is False
 
-
-class TestRouteEventSpinner:
-    async def test_route_event_when_state_idle_hides_spinner(self) -> None:
-        """AgentStateChanged(IDLE) hides the GradientBar in the feed."""
+    async def test_set_busy_false_deactivates_activity_bar(self) -> None:
+        """set_busy(False) sets ActivityBar.active to False."""
         app = _make_app("agent-1")
 
         async with app.run_test(headless=True, size=(120, 40)):
             app._agent_states["agent-1"] = AgentState.INITIALIZING
             await app.select_agent("agent-1")
             feed = app._panels["agent-1"]
-            spinner = feed.query_one("#loading-spinner")
-            assert spinner.display is True
+            bar = feed.input_bar.query_one(ActivityBar)
 
             event = AgentStateChanged(
                 agent_id="agent-1",
@@ -315,17 +312,16 @@ class TestRouteEventSpinner:
                 new_state=AgentState.IDLE,
             )
             await app.on_broker_event_message(BrokerEventMessage(event))
-            assert spinner.display is False
+            assert bar.active is False
 
-    async def test_route_event_when_state_busy_shows_spinner(self) -> None:
-        """AgentStateChanged(BUSY) shows the GradientBar in the feed."""
+    async def test_set_busy_true_activates_activity_bar(self) -> None:
+        """set_busy(True) sets ActivityBar.active to True."""
         app = _make_app("agent-1")
 
         async with app.run_test(headless=True, size=(120, 40)):
             await app.select_agent("agent-1")
             feed = app._panels["agent-1"]
-            spinner = feed.query_one("#loading-spinner")
-            assert spinner.display is False
+            bar = feed.input_bar.query_one(ActivityBar)
 
             busy_event = AgentStateChanged(
                 agent_id="agent-1",
@@ -333,22 +329,19 @@ class TestRouteEventSpinner:
                 new_state=AgentState.BUSY,
             )
             await app.on_broker_event_message(BrokerEventMessage(busy_event))
-            assert spinner.display is True
+            assert bar.active is True
 
-    async def test_route_event_when_state_idle_and_no_spinner_exists_does_not_raise(
-        self,
-    ) -> None:
-        """NoMatches caught silently when spinner missing."""
+    async def test_route_event_idle_calls_set_busy_false(self) -> None:
+        """AgentStateChanged(IDLE) calls set_busy(False) on input_bar."""
         app = _make_app("a")
         feed = MagicMock()
-        mock_spinner = MagicMock()
-        feed.query_one.return_value = mock_spinner
+        feed.input_bar = MagicMock()
         event = AgentStateChanged(
             agent_id="a", old_state=AgentState.INITIALIZING, new_state=AgentState.IDLE
         )
 
         await app._route_event_to_feed(feed, event)
-        assert mock_spinner.display is False
+        feed.input_bar.set_busy.assert_called_once_with(False)
 
 
 class TestReplayEventSkipsSpinner:
