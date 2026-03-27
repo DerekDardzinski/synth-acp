@@ -62,6 +62,7 @@ class ACPSession:
         self._event_sink = event_sink
         self._mcp_servers = mcp_servers or []
         self._conn: Any = None
+        self._proc: Any = None
         self._session_id: str | None = None
         self._permission_future: asyncio.Future[str] | None = None
         self._capabilities: Any = None
@@ -85,6 +86,7 @@ class ACPSession:
                 proc,
             ):
                 self._conn = conn
+                self._proc = proc
                 init_response = await conn.initialize(
                     protocol_version=1,
                     client_capabilities=ClientCapabilities(
@@ -131,9 +133,14 @@ class ACPSession:
             await self._conn.cancel(session_id=self._session_id)
 
     async def terminate(self) -> None:
-        """Request termination. The run() finally block handles state."""
+        """Terminate the agent subprocess directly via SIGTERM."""
         if self._permission_future and not self._permission_future.done():
             self._permission_future.cancel()
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except OSError:
+                pass
 
     # --- ACP Client callbacks (called by SDK) ---
     # ARG002 suppressed: these signatures are required by the acp.interfaces.Client protocol.

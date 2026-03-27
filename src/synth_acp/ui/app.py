@@ -416,13 +416,12 @@ class SynthApp(App):
         await self.push_screen_wait(HelpScreen())
 
     async def action_quit(self) -> None:
-        """Shut down the broker and exit.
+        """Quit the app. Cleanup happens in on_unmount."""
+        self.exit()
 
-        Shuts down the broker first so agent subprocesses are terminated
-        while the event loop is still alive, then exits the TUI.
-        """
+    async def on_unmount(self) -> None:
+        """Terminate all agent subprocesses during Textual shutdown."""
         try:
             await self.broker.shutdown()
         except Exception:
             pass
-        self.exit()
