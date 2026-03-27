@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
+import signal
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -87,6 +90,14 @@ class ACPSession:
             ):
                 self._conn = conn
                 self._proc = proc
+
+                # Put agent in its own process group so grandchildren (synth-mcp)
+                # inherit the group and can be killed together.
+                try:
+                    os.setpgid(proc.pid, proc.pid)
+                except OSError:
+                    pass
+
                 init_response = await conn.initialize(
                     protocol_version=1,
                     client_capabilities=ClientCapabilities(
@@ -133,14 +144,25 @@ class ACPSession:
             await self._conn.cancel(session_id=self._session_id)
 
     async def terminate(self) -> None:
-        """Terminate the agent subprocess directly via SIGTERM."""
+        """Terminate the agent and all its children via process group kill.
+
+        Sends SIGTERM to the entire process group, waits up to 2 seconds,
+        then escalates to SIGKILL if processes remain.
+        """
         if self._permission_future and not self._permission_future.done():
             self._permission_future.cancel()
         if self._proc is not None:
             try:
-                self._proc.terminate()
-            except OSError:
-                pass
+                pgid = os.getpgid(self._proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=2.0)
+                except TimeoutError:
+                    with contextlib.suppress(OSError):
+                        os.killpg(pgid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                with contextlib.suppress(OSError):
+                    self._proc.terminate()
 
     # --- ACP Client callbacks (called by SDK) ---
     # ARG002 suppressed: these signatures are required by the acp.interfaces.Client protocol.
