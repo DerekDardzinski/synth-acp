@@ -55,7 +55,7 @@ class GradientBarVisual(Visual):
     ) -> list[Strip]:
         time = self.get_time()
         segments = self._make_segments(width, style.rich_style.bgcolor)
-        offset = width - int((time % 2.0) / 2.0 * width)
+        offset = width - int((time % 1.0) * width)
         return [Strip(segments[offset : offset + width], cell_length=width)]
 
     def get_optimal_width(self, rules: RulesMap, container_width: int) -> int:  # noqa: ARG002
@@ -72,8 +72,12 @@ class GradientBar(Widget):
         self.auto_refresh = 1 / 15
         self._gradient = self._build_gradient()
         self._visual = GradientBarVisual(self._gradient)
+        self.app.theme_changed_signal.subscribe(self, self._on_theme_changed)
 
-    def on_app_theme_changed(self) -> None:
+    def on_unmount(self) -> None:
+        self.app.theme_changed_signal.unsubscribe(self)
+
+    def _on_theme_changed(self, theme: object) -> None:  # noqa: ARG002
         self._gradient = self._build_gradient()
         self._visual = GradientBarVisual(self._gradient)
         self.refresh()
@@ -82,10 +86,22 @@ class GradientBar(Widget):
         theme = self.app.current_theme
         primary = Color.parse(theme.primary)
         secondary = Color.parse(theme.secondary or theme.primary)
+        accent = Color.parse(theme.accent or theme.secondary or theme.primary)
+
+        def variants(c: Color) -> tuple[str, str, str]:
+            dark = c.darken(0.05)
+            light = c.lighten(0.05)
+            return dark.hex, c.hex, light.hex
+
+        p_d, p, p_l = variants(primary)
+        s_d, s, s_l = variants(secondary)
+        a_d, a, a_l = variants(accent)
+
         return Gradient.from_colors(
-            primary.hex,
-            secondary.hex,
-            primary.hex,
+            p_d, p, p_l,
+            s_d, s, s_l,
+            a_d, a, a_l,
+            p_d,
         )
 
     def render(self) -> GradientBarVisual:
@@ -109,7 +125,6 @@ class ActivityBar(Widget):
     }
     ActivityBar > .activity-bar-bg {
         height: 1;
-        background: transparent;
         display: none;
     }
     """
