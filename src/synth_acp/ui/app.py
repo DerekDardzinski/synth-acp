@@ -14,7 +14,7 @@ from textual.worker import WorkerState
 
 from synth_acp.broker.broker import ACPBroker
 from synth_acp.models.agent import AgentState
-from synth_acp.models.commands import LaunchAgent
+from synth_acp.models.commands import LaunchAgent, RespondPermission
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
     AgentStateChanged,
@@ -23,7 +23,6 @@ from synth_acp.models.events import (
     BrokerEvent,
     McpMessageDelivered,
     MessageChunkReceived,
-    PermissionAutoResolved,
     PermissionRequested,
     ToolCallUpdated,
     TurnComplete,
@@ -32,6 +31,7 @@ from synth_acp.models.events import (
 from synth_acp.ui.messages import BrokerEventMessage
 from synth_acp.ui.screens.help import HelpScreen
 from synth_acp.ui.screens.launch import LaunchAgentScreen
+from synth_acp.ui.screens.permission import PermissionBar
 from synth_acp.ui.widgets.agent_list import AgentList, AgentTile, MCPButton
 from synth_acp.ui.widgets.conversation import ConversationFeed
 from synth_acp.ui.widgets.message_queue import MessageQueue
@@ -185,18 +185,24 @@ class SynthApp(App):
             feed: Target conversation feed.
             event: The broker event to route.
         """
+        if isinstance(event, PermissionRequested):
+            self._mount_permission_bar(feed, event)
+            return
         if isinstance(event, MessageChunkReceived):
             await feed.add_chunk(event.chunk)
         elif isinstance(event, AgentThoughtReceived):
             await feed.add_thought_chunk(event.chunk)
         elif isinstance(event, ToolCallUpdated):
-            await feed.add_tool_call(event.tool_call_id, event.title, event.kind, event.status)
-        elif isinstance(event, PermissionRequested):
-            feed.add_permission(
-                event.agent_id, event.request_id, event.title, event.kind, event.options
+            await feed.add_tool_call(
+                event.tool_call_id,
+                event.title,
+                event.kind,
+                event.status,
+                locations=event.locations,
+                raw_input=event.raw_input,
+                diffs=event.diffs,
+                text_content=event.text_content,
             )
-        elif isinstance(event, PermissionAutoResolved):
-            feed.remove_permission(event.request_id)
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
             feed.input_bar.set_busy(False)
@@ -209,6 +215,30 @@ class SynthApp(App):
                 feed.input_bar.set_busy(False)
             elif event.new_state in {AgentState.INITIALIZING, AgentState.BUSY}:
                 feed.input_bar.set_busy(True)
+
+    def _mount_permission_bar(self, feed: ConversationFeed, event: PermissionRequested) -> None:
+        """Mount a PermissionBar above the InputBar in the feed.
+
+        Args:
+            feed: Target conversation feed.
+            event: The permission request event.
+        """
+        bar = PermissionBar(event.agent_id, event.title, event.options)
+        if feed.input_bar is not None:
+            feed.mount(bar, before=feed.input_bar)
+        else:
+            feed.mount(bar)
+
+    async def on_permission_bar_resolved(self, message: PermissionBar.Resolved) -> None:
+        """Handle the resolved permission from the PermissionBar.
+
+        Args:
+            message: The resolved permission message.
+        """
+        if message.option_id:
+            await self.broker.handle(
+                RespondPermission(agent_id=message.agent_id, option_id=message.option_id)
+            )
 
     async def _replay_event(self, feed: ConversationFeed, event: BrokerEvent) -> None:
         """Replay a buffered event to a conversation feed during drain.
@@ -225,11 +255,19 @@ class SynthApp(App):
         elif isinstance(event, AgentThoughtReceived):
             await feed.add_thought_chunk(event.chunk)
         elif isinstance(event, ToolCallUpdated):
-            await feed.add_tool_call(event.tool_call_id, event.title, event.kind, event.status)
-        elif isinstance(event, PermissionRequested):
-            feed.add_permission(
-                event.agent_id, event.request_id, event.title, event.kind, event.options
+            await feed.add_tool_call(
+                event.tool_call_id,
+                event.title,
+                event.kind,
+                event.status,
+                locations=event.locations,
+                raw_input=event.raw_input,
+                diffs=event.diffs,
+                text_content=event.text_content,
             )
+        elif isinstance(event, PermissionRequested):
+            if event.agent_id in self.broker._pending_permissions:
+                self._mount_permission_bar(feed, event)
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
         elif isinstance(event, McpMessageDelivered):

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
-from acp.schema import PermissionOption
 from textual.containers import ScrollableContainer, Vertical
 from textual.widgets import Static
 
+from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.widgets.agent_message import AgentMessage
 from synth_acp.ui.widgets.input_bar import InputBar
-from synth_acp.ui.widgets.permission import PermissionRequest
 from synth_acp.ui.widgets.prompt_bubble import PromptBubble
 from synth_acp.ui.widgets.thought_block import ThoughtBlock
 from synth_acp.ui.widgets.tool_call import ToolCallBlock
@@ -84,7 +84,18 @@ class ConversationFeed(Vertical):
         assert self._scroll is not None
         self._scroll.scroll_end(animate=False)
 
-    async def add_tool_call(self, tool_call_id: str, title: str, kind: str, status: str) -> None:
+    async def add_tool_call(
+        self,
+        tool_call_id: str,
+        title: str,
+        kind: str,
+        status: str,
+        *,
+        locations: list[ToolCallLocation] | None = None,
+        raw_input: Any = None,
+        diffs: list[ToolCallDiff] | None = None,
+        text_content: str | None = None,
+    ) -> None:
         """Mount a new ToolCallBlock or update an existing one.
 
         Finalizes any in-progress AgentMessage so the tool call visually
@@ -95,51 +106,37 @@ class ConversationFeed(Vertical):
             title: Human-readable tool call description.
             kind: Tool kind string.
             status: Current status string.
+            locations: File locations referenced by the tool call.
+            raw_input: Raw input payload from the ACP SDK.
+            diffs: File edit diffs extracted from the tool call.
+            text_content: Extracted text content from the tool call.
         """
         try:
             existing = self.query_one(f"#tool-{tool_call_id}", ToolCallBlock)
             existing.update_status(status)
+            await existing.update_content(
+                locations=locations,
+                raw_input=raw_input,
+                diffs=diffs,
+                text_content=text_content,
+            )
         except Exception:
             if self._current_message is not None:
                 await self._current_message.finalize()
                 self._current_message = None
-            block = ToolCallBlock(tool_call_id, title, kind, status)
+            block = ToolCallBlock(
+                tool_call_id,
+                title,
+                kind,
+                status,
+                locations=locations,
+                raw_input=raw_input,
+                diffs=diffs,
+                text_content=text_content,
+            )
             assert self._scroll is not None
-            self._scroll.mount(block)
+            await self._scroll.mount(block)
             self._scroll.scroll_end(animate=False)
-
-    def add_permission(
-        self,
-        agent_id: str,
-        request_id: str,
-        title: str,
-        kind: str,
-        options: list[PermissionOption],
-    ) -> None:
-        """Mount a permission request widget.
-
-        Args:
-            agent_id: Agent requesting permission.
-            request_id: Unique request identifier.
-            title: Permission title.
-            kind: Permission kind.
-            options: List of permission options.
-        """
-        widget = PermissionRequest(agent_id, request_id, title, kind, options)
-        assert self._scroll is not None
-        self._scroll.mount(widget)
-        self._scroll.scroll_end(animate=False)
-
-    def remove_permission(self, request_id: str) -> None:
-        """Remove a permission request widget by request_id.
-
-        Args:
-            request_id: The request to remove.
-        """
-        try:
-            self.query_one(f"#perm-{request_id}", PermissionRequest).remove()
-        except Exception:
-            pass
 
     async def finalize_current_message(self) -> None:
         """Finalize the active streaming message and thought block."""

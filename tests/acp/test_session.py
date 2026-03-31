@@ -12,6 +12,9 @@ from synth_acp.models.events import (
     AgentStateChanged,
     AgentThoughtReceived,
     BrokerEvent,
+    ToolCallDiff,
+    ToolCallLocation,
+    ToolCallUpdated,
     UsageUpdated,
 )
 
@@ -93,3 +96,91 @@ class TestSessionUpdate:
         assert events[0].used == 32000
         assert events[0].cost_amount == 0.14
         assert events[0].cost_currency == "USD"
+
+    async def test_session_update_when_tool_call_branch_has_diff_extracts_diffs(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Diffs on initial tool_call must be extracted — otherwise file edits are silently lost."""
+        diff_item = SimpleNamespace(type="diff", path="src/main.py", old_text="old", new_text="new")
+        update = SimpleNamespace(
+            session_update="tool_call",
+            tool_call_id="tc-1",
+            title="Edit file",
+            kind="edit",
+            status="pending",
+            content=[diff_item],
+            locations=None,
+            raw_input=None,
+        )
+        await session.session_update("sess-1", update)
+        assert len(events) == 1
+        evt = events[0]
+        assert isinstance(evt, ToolCallUpdated)
+        assert len(evt.diffs) == 1
+        assert evt.diffs[0] == ToolCallDiff(path="src/main.py", old_text="old", new_text="new")
+
+    async def test_session_update_when_tool_call_update_branch_has_diff_extracts_diffs(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Diffs on streaming tool_call_update must be extracted — otherwise incremental edits are lost."""
+        diff_item = SimpleNamespace(type="diff", path="lib.py", old_text=None, new_text="added")
+        update = SimpleNamespace(
+            session_update="tool_call_update",
+            tool_call_id="tc-2",
+            title="Create file",
+            kind="edit",
+            status="in_progress",
+            content=[diff_item],
+            locations=None,
+            raw_input=None,
+        )
+        await session.session_update("sess-1", update)
+        assert len(events) == 1
+        evt = events[0]
+        assert isinstance(evt, ToolCallUpdated)
+        assert len(evt.diffs) == 1
+        assert evt.diffs[0] == ToolCallDiff(path="lib.py", old_text=None, new_text="added")
+
+    async def test_session_update_when_tool_call_has_text_content_extracts_text(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Text content must be extracted — otherwise command output is silently dropped."""
+        text_block = SimpleNamespace(type="text", text="hello world")
+        content_item = SimpleNamespace(type="content", content=text_block)
+        update = SimpleNamespace(
+            session_update="tool_call",
+            tool_call_id="tc-3",
+            title="Run command",
+            kind="execute",
+            status="pending",
+            content=[content_item],
+            locations=None,
+            raw_input=None,
+        )
+        await session.session_update("sess-1", update)
+        assert len(events) == 1
+        evt = events[0]
+        assert isinstance(evt, ToolCallUpdated)
+        assert evt.text_content == "hello world"
+
+    async def test_session_update_when_tool_call_has_locations_extracts_locations(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Locations must be extracted — otherwise file path context is silently lost."""
+        loc = SimpleNamespace(path="/abs/path.py", line=42)
+        update = SimpleNamespace(
+            session_update="tool_call",
+            tool_call_id="tc-4",
+            title="Read file",
+            kind="read",
+            status="pending",
+            content=None,
+            locations=[loc],
+            raw_input=None,
+        )
+        await session.session_update("sess-1", update)
+        assert len(events) == 1
+        evt = events[0]
+        assert isinstance(evt, ToolCallUpdated)
+        assert len(evt.locations) == 1
+        assert evt.locations[0] == ToolCallLocation(path="/abs/path.py", line=42)

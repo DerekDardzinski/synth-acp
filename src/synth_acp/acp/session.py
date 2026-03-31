@@ -31,6 +31,8 @@ from synth_acp.models.events import (
     BrokerEvent,
     MessageChunkReceived,
     PermissionRequested,
+    ToolCallDiff,
+    ToolCallLocation,
     ToolCallUpdated,
     TurnComplete,
     UsageUpdated,
@@ -39,6 +41,48 @@ from synth_acp.models.events import (
 log = logging.getLogger(__name__)
 
 EventSink = Callable[[BrokerEvent], Awaitable[None]]
+
+
+def _extract_tool_call_content(update: Any) -> dict[str, Any]:
+    """Extract diffs, text_content, locations, and raw_input from an ACP update.
+
+    Args:
+        update: ACP SDK ToolCallUpdate or similar object.
+
+    Returns:
+        Dict with keys diffs, text_content, locations, raw_input suitable
+        for passing to ToolCallUpdated.
+    """
+    diffs: list[ToolCallDiff] = []
+    text_parts: list[str] = []
+    for item in getattr(update, "content", None) or []:
+        item_type = getattr(item, "type", None)
+        if item_type == "diff":
+            diffs.append(
+                ToolCallDiff(
+                    path=getattr(item, "path", ""),
+                    old_text=getattr(item, "old_text", None),
+                    new_text=getattr(item, "new_text", ""),
+                )
+            )
+        elif item_type == "content":
+            inner = getattr(item, "content", None)
+            if inner and getattr(inner, "type", None) == "text":
+                text = getattr(inner, "text", None)
+                if text:
+                    text_parts.append(text)
+    locations: list[ToolCallLocation] = []
+    for loc in getattr(update, "locations", None) or []:
+        locations.append(
+            ToolCallLocation(path=getattr(loc, "path", ""), line=getattr(loc, "line", None))
+        )
+    text_content = "\n".join(text_parts) if text_parts else None
+    return {
+        "diffs": diffs,
+        "text_content": text_content,
+        "locations": locations,
+        "raw_input": getattr(update, "raw_input", None),
+    }
 
 
 class ACPSession:
@@ -178,6 +222,7 @@ class ACPSession:
                 if text:
                     await self._event_sink(MessageChunkReceived(agent_id=self.agent_id, chunk=text))
         elif su in ("tool_call",):
+            extra = _extract_tool_call_content(update)
             await self._event_sink(
                 ToolCallUpdated(
                     agent_id=self.agent_id,
@@ -185,9 +230,11 @@ class ACPSession:
                     title=getattr(update, "title", "") or "",
                     kind=getattr(update, "kind", "other") or "other",
                     status=getattr(update, "status", "pending") or "pending",
+                    **extra,
                 )
             )
         elif su in ("tool_call_update",):
+            extra = _extract_tool_call_content(update)
             await self._event_sink(
                 ToolCallUpdated(
                     agent_id=self.agent_id,
@@ -195,6 +242,7 @@ class ACPSession:
                     title=getattr(update, "title", "") or "",
                     kind=getattr(update, "kind", "other") or "other",
                     status=getattr(update, "status", "in_progress") or "in_progress",
+                    **extra,
                 )
             )
         elif su == "agent_thought_chunk":

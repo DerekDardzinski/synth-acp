@@ -2,14 +2,43 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from acp.schema import PermissionOption
 from pydantic import BaseModel, Field
 
 from synth_acp.models.agent import AgentState
 from synth_acp.models.permissions import PermissionDecision
+
+
+@dataclass(frozen=True)
+class ToolCallDiff:
+    """A file edit diff extracted from an ACP tool call update.
+
+    Attributes:
+        path: File path the diff applies to.
+        old_text: Original text, or None for new files.
+        new_text: Replacement text.
+    """
+
+    path: str
+    old_text: str | None
+    new_text: str
+
+
+@dataclass(frozen=True)
+class ToolCallLocation:
+    """A file location referenced by a tool call.
+
+    Attributes:
+        path: File path.
+        line: Line number, or None if unspecified.
+    """
+
+    path: str
+    line: int | None = None
 
 
 def _now() -> datetime:
@@ -43,6 +72,10 @@ class ToolCallUpdated(BrokerEvent):
     title: str
     kind: str
     status: str
+    locations: list[ToolCallLocation] = Field(default_factory=list)
+    raw_input: Any = None
+    diffs: list[ToolCallDiff] = Field(default_factory=list)
+    text_content: str | None = None
 
 
 class BrokerError(BrokerEvent):

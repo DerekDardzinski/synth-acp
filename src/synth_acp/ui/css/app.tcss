@@ -164,14 +164,52 @@ ToolCallBlock.tool-permission {
     border-left: wide $warning;
 }
 
-/* ── Permission box ── */
-.permission-box {
+/* ── ToolCallBlock content ── */
+#tc-location { color: $text-muted; text-style: italic; padding-left: 2; }
+#tc-raw-input { color: $text-muted; background: $surface; padding: 0 1; margin: 0 0 0 2; }
+#tc-text { padding-left: 2; }
+
+/* ── Diff view ── */
+DiffView { height: auto; margin: 0 0 0 2; }
+DiffView Collapsible { background: $surface; border: none; padding: 0; }
+DiffView .diff-scroll { max-height: 20; }
+DiffView .diff-scroll Static { padding: 0 1; }
+
+/* ── Permission modal ── */
+/* ── Permission bar ── */
+#perm-bar {
     height: auto;
-    margin: 0 3;
-    background: $background;
-    border-left: wide $warning;
+    background: transparent;
+    border-top: tall $warning;
     padding: 0 1;
+    margin: 1 3;
+}
+#perm-bar:blur {
+    #index { opacity: 0.3; }
+    #caret { opacity: 0.3; }
+}
+#perm-title { margin-bottom: 1; color: $text-primary; }
+#perm-option-container { height: auto; }
+#perm-option-container.-blink _OptionRow.-active #caret { opacity: 0.2; }
+_OptionRow {
     color: $text-muted;
+    height: auto;
+    #caret { visibility: hidden; padding: 0 1; }
+    #index { padding-right: 1; }
+    #label { width: 1fr; }
+    &.-active {
+        color: $text-accent;
+        #caret { visibility: visible; }
+    }
+    &.-selected { opacity: 0.5; }
+    &.-active.-selected {
+        opacity: 1.0;
+        background: transparent;
+        color: $text-accent;
+        #label { text-style: underline; }
+        #caret { visibility: hidden; }
+    }
+    &:hover { background: $boost; }
 }
 
 /* ── Input bar ── */

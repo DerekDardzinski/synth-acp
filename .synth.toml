@@ -2,10 +2,10 @@ project = "test"
 
 [[agents]]
 id = "kiro"
-cmd = ["kiro-cli", "acp"]
+cmd = ["kiro-cli", "acp", "--agent", "coder"]
 cwd = "."
 
 [[agents]]
 id = "kiro-2"
-cmd = ["kiro-cli", "acp"]
+cmd = ["kiro-cli", "acp", "--agent", "coder"]
 cwd = "."
