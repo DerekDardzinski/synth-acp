@@ -65,7 +65,9 @@ class MessagePoller:
                     "body TEXT NOT NULL,"
                     "status TEXT NOT NULL DEFAULT 'pending',"
                     "created_at INTEGER NOT NULL,"
-                    "claimed_at INTEGER)"
+                    "kind TEXT NOT NULL DEFAULT 'chat',"
+                    "reply_to INTEGER REFERENCES messages(id),"
+                    "delivered_at INTEGER)"
                 )
                 await db.execute(
                     "CREATE TABLE IF NOT EXISTS agent_commands ("
@@ -103,7 +105,15 @@ class MessagePoller:
             log.exception("Poller connection error")
 
     async def _deliver_pending(self, db: aiosqlite.Connection) -> None:
-        """Query pending messages, group by recipient, deliver, mark delivered."""
+        """Query pending messages, group by recipient, mark delivered, then deliver.
+
+        Marks messages as delivered with a timestamp BEFORE calling the deliver
+        callback to prevent re-delivery if the poller fires again while the
+        agent is processing.  If the callback returns False (agent not idle),
+        reverts the status back to pending.
+        """
+        import time
+
         rows = await db.execute_fetchall(
             "SELECT id, from_agent, to_agent, body FROM messages "
             "WHERE status = 'pending' AND session_id = ? ORDER BY created_at",
@@ -113,14 +123,23 @@ class MessagePoller:
         for row in rows:
             by_agent.setdefault(row[2], []).append(row)  # type: ignore[arg-type]
         for agent_id, messages in by_agent.items():
+            ids = [m[0] for m in messages]
+            placeholders = ",".join("?" * len(ids))
+            now = int(time.time() * 1000)
+            # Mark delivered BEFORE calling callback
+            await db.execute(
+                f"UPDATE messages SET status = 'delivered', delivered_at = ? WHERE id IN ({placeholders})",
+                [now, *ids],
+            )
+            await db.commit()
+
             combined = "\n\n".join(f"[Message from {m[1]}]: {m[3]}" for m in messages)
             senders = list({m[1] for m in messages})
             success = await self._deliver(agent_id, combined, senders)
-            if success:
-                ids = [m[0] for m in messages]
-                placeholders = ",".join("?" * len(ids))
+            if not success:
+                # Revert to pending
                 await db.execute(
-                    f"UPDATE messages SET status = 'delivered' WHERE id IN ({placeholders})",
+                    f"UPDATE messages SET status = 'pending', delivered_at = NULL WHERE id IN ({placeholders})",
                     ids,
                 )
                 await db.commit()

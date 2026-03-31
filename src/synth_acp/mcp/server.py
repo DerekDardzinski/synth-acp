@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS messages (
     body        TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'pending',
     created_at  INTEGER NOT NULL,
-    claimed_at  INTEGER
+    kind        TEXT NOT NULL DEFAULT 'chat',
+    reply_to    INTEGER REFERENCES messages(id),
+    delivered_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS agent_commands (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,70 +68,49 @@ def _ensure_registered(conn: sqlite3.Connection) -> None:
 
 
 def _get_visible_agents(conn: sqlite3.Connection) -> list[str]:
-    """Return agent_ids visible to AGENT_ID based on COMMUNICATION_MODE.
+    """Return agent_ids visible to AGENT_ID based on COMMUNICATION_MODE."""
+    from synth_acp.models.visibility import get_visible_agents
 
-    MESH: all active agents except self.
-    LOCAL: parent, children, and siblings of self.
-
-    Args:
-        conn: Open SQLite connection.
-
-    Returns:
-        List of visible agent_ids.
-    """
-    if COMMUNICATION_MODE != "LOCAL":
-        rows = conn.execute(
-            "SELECT agent_id FROM agents WHERE session_id = ? AND status = 'active' AND agent_id != ?",
-            (SESSION_ID, AGENT_ID),
-        ).fetchall()
-        return [r[0] for r in rows]
-
-    # LOCAL mode
-    row = conn.execute(
-        "SELECT parent FROM agents WHERE agent_id = ? AND session_id = ?",
-        (AGENT_ID, SESSION_ID),
-    ).fetchone()
-    parent = row[0] if row else None
-
-    visible: set[str] = set()
-    if parent:
-        visible.add(parent)
-        # Siblings: same parent, excluding self
-        rows = conn.execute(
-            "SELECT agent_id FROM agents WHERE parent = ? AND status = 'active' AND agent_id != ? AND session_id = ?",
-            (parent, AGENT_ID, SESSION_ID),
-        ).fetchall()
-        visible.update(r[0] for r in rows)
-    # Children
-    rows = conn.execute(
-        "SELECT agent_id FROM agents WHERE parent = ? AND status = 'active' AND session_id = ?",
-        (AGENT_ID, SESSION_ID),
-    ).fetchall()
-    visible.update(r[0] for r in rows)
-    return list(visible)
+    return get_visible_agents(conn, AGENT_ID, SESSION_ID, COMMUNICATION_MODE)
 
 
 @mcp.tool()
-def send_message(to_agent: str, body: str) -> str:
+def send_message(to_agent: str, body: str, kind: str = "chat", reply_to: int | None = None) -> str:
     """Send a message to another agent, or '*' to broadcast to all active agents.
 
     Args:
         to_agent: Target agent ID, or '*' for broadcast.
         body: Message body text.
+        kind: Message kind: chat, system, request, or response.
+        reply_to: Optional message ID this is replying to.
 
     Returns:
         JSON with inserted message ID(s).
     """
+    valid_kinds = {"chat", "system", "request", "response"}
+    if kind not in valid_kinds:
+        return json.dumps({"error": f"Invalid kind: {kind}. Must be one of: {', '.join(sorted(valid_kinds))}"})
+
     conn = _get_db()
     _ensure_registered(conn)
+
+    if reply_to is not None:
+        row = conn.execute(
+            "SELECT id FROM messages WHERE id = ? AND session_id = ?",
+            (reply_to, SESSION_ID),
+        ).fetchone()
+        if not row:
+            conn.close()
+            return json.dumps({"error": f"reply_to message not found: {reply_to}"})
+
     now = int(time.time() * 1000)
     if to_agent == "*":
         visible = _get_visible_agents(conn)
         ids = []
         for aid in visible:
             cursor = conn.execute(
-                "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-                (SESSION_ID, AGENT_ID, aid, body, now),
+                "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at, kind, reply_to) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (SESSION_ID, AGENT_ID, aid, body, now, kind, reply_to),
             )
             ids.append(cursor.lastrowid)
         conn.commit()
@@ -141,8 +122,8 @@ def send_message(to_agent: str, body: str) -> str:
         conn.close()
         return json.dumps({"error": f"Agent not visible: {to_agent}"})
     cursor = conn.execute(
-        "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-        (SESSION_ID, AGENT_ID, to_agent, body, now),
+        "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at, kind, reply_to) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+        (SESSION_ID, AGENT_ID, to_agent, body, now, kind, reply_to),
     )
     msg_id = cursor.lastrowid
     conn.commit()

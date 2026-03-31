@@ -13,6 +13,7 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import aiosqlite
 from acp.schema import EnvVariable, McpServerStdio
 
 from synth_acp.acp.session import ACPSession
@@ -28,7 +29,7 @@ from synth_acp.models.commands import (
     SendPrompt,
     TerminateAgent,
 )
-from synth_acp.models.config import CommunicationMode, SessionConfig
+from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
     AgentStateChanged,
     BrokerError,
@@ -39,6 +40,7 @@ from synth_acp.models.events import (
     UsageUpdated,
 )
 from synth_acp.models.permissions import PermissionDecision, PermissionRule
+from synth_acp.models.visibility import get_visible_agents
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +70,7 @@ class ACPBroker:
         self._poller: MessagePoller | None = None
         self._pending_initial_prompts: dict[str, str] = {}
         self._agent_parents: dict[str, str | None] = {a.id: None for a in config.agents}
+        self._db: aiosqlite.Connection | None = None
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -253,14 +256,15 @@ class ACPBroker:
             return
         if session.state != AgentState.TERMINATED:
             await session.terminate()
-            # Cancel the run() task to kill the subprocess
-            task = self._tasks.get(agent_id)
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            # Cancel the run() task and prompt task to kill the subprocess
+            for key in (agent_id, f"prompt-{agent_id}"):
+                task = self._tasks.get(key)
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, ConnectionError, OSError, RuntimeError):
+                        pass
 
     async def _cancel(self, agent_id: str) -> None:
         """Cancel the active prompt on an agent."""
@@ -318,27 +322,42 @@ class ACPBroker:
     # Message poller
     # ------------------------------------------------------------------
 
+    async def _ensure_db(self) -> aiosqlite.Connection:
+        """Lazily open the shared aiosqlite connection."""
+        if self._db is None:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._db = await aiosqlite.connect(self._db_path)
+            await self._db.execute("PRAGMA journal_mode=WAL")
+        return self._db
+
     async def _start_poller(self) -> None:
         """Start the message poller if not already running."""
         if self._poller is None:
-            self._register_agents()
+            await self._register_agents()
             self._poller = MessagePoller(
                 self._db_path, self._deliver_message, self._session_id, self._process_commands
             )
             await self._poller.start()
 
-    def _register_agents(self) -> None:
+    async def _register_agents(self) -> None:
         """Pre-register all config agents in SQLite so list_agents works immediately."""
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
+        db = await self._ensure_db()
+        await db.execute(
             "CREATE TABLE IF NOT EXISTS agents ("
             "agent_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, "
             "status TEXT NOT NULL DEFAULT 'active', registered INTEGER NOT NULL, "
             "parent TEXT, task TEXT)"
         )
-        conn.execute(
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
+            "from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, "
+            "kind TEXT NOT NULL DEFAULT 'chat', "
+            "reply_to INTEGER REFERENCES messages(id), "
+            "delivered_at INTEGER)"
+        )
+        await db.execute(
             "CREATE TABLE IF NOT EXISTS agent_commands ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
             "from_agent TEXT NOT NULL, command TEXT NOT NULL, payload TEXT NOT NULL, "
@@ -347,13 +366,12 @@ class ACPBroker:
         )
         now = int(time.time() * 1000)
         for agent in self._config.agents:
-            conn.execute(
+            await db.execute(
                 "INSERT OR REPLACE INTO agents (agent_id, session_id, status, registered) "
                 "VALUES (?, ?, 'active', ?)",
                 (agent.id, self._session_id, now),
             )
-        conn.commit()
-        conn.close()
+        await db.commit()
 
     def _build_mcp_env(
         self, agent_id: str, extra_env: dict[str, str] | None = None
@@ -402,9 +420,9 @@ class ACPBroker:
                 elif command == "terminate":
                     await self._handle_terminate_command(cmd_id, from_agent, data)
                 else:
-                    self._update_command_status(cmd_id, "rejected", f"Unknown command: {command}")
+                    await self._update_command_status(cmd_id, "rejected", f"Unknown command: {command}")
             except Exception as exc:
-                self._update_command_status(cmd_id, "rejected", str(exc))
+                await self._update_command_status(cmd_id, "rejected", str(exc))
 
     async def _handle_launch_command(
         self, cmd_id: int, from_agent: str, data: dict[str, str]
@@ -425,7 +443,7 @@ class ACPBroker:
 
         # Validate agent_id format
         if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", agent_id):
-            self._update_command_status(
+            await self._update_command_status(
                 cmd_id,
                 "rejected",
                 "Invalid agent_id: must match [a-zA-Z0-9][a-zA-Z0-9_-]*",
@@ -434,7 +452,7 @@ class ACPBroker:
 
         # Check uniqueness
         if agent_id in self._sessions:
-            self._update_command_status(cmd_id, "rejected", f"Agent already exists: {agent_id}")
+            await self._update_command_status(cmd_id, "rejected", f"Agent already exists: {agent_id}")
             return
 
         # Check global agent limit
@@ -447,23 +465,21 @@ class ACPBroker:
         registry = load_harness_registry()
         entry = next((e for e in registry if e.short_name == harness), None)
         if not entry:
-            self._update_command_status(cmd_id, "rejected", f"Unknown harness: {harness}")
+            await self._update_command_status(cmd_id, "rejected", f"Unknown harness: {harness}")
             return
 
         cmd = entry.run_cmd_with_agent.format(agent=agent_name).split()
         agent_cfg = AgentConfig(id=agent_id, cmd=cmd, cwd=cwd)
 
         # Register in SQLite
-        conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
+        db = await self._ensure_db()
         now = int(time.time() * 1000)
-        conn.execute(
+        await db.execute(
             "INSERT OR REPLACE INTO agents (agent_id, session_id, status, registered, parent, task) "
             "VALUES (?, ?, 'active', ?, ?, ?)",
             (agent_id, self._session_id, now, from_agent, task),
         )
-        conn.commit()
-        conn.close()
+        await db.commit()
 
         # Track parentage
         self._agent_parents[agent_id] = from_agent
@@ -491,10 +507,10 @@ class ACPBroker:
         if message:
             self._pending_initial_prompts[agent_id] = message
 
-        self._update_command_status(cmd_id, "processed")
+        await self._update_command_status(cmd_id, "processed")
 
         # Join broadcast
-        self._send_join_broadcast(agent_id, task)
+        await self._send_join_broadcast(agent_id, task)
 
     async def _handle_terminate_command(
         self, cmd_id: int, from_agent: str, data: dict[str, str]
@@ -511,7 +527,7 @@ class ACPBroker:
         # Check parentage
         parent = self._agent_parents.get(agent_id)
         if parent != from_agent:
-            self._update_command_status(
+            await self._update_command_status(
                 cmd_id,
                 "rejected",
                 f"Not authorized: {from_agent} is not parent of {agent_id}",
@@ -521,26 +537,29 @@ class ACPBroker:
         await self._terminate(agent_id)
 
         # Mark agent as inactive in SQLite
-        conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
+        db = await self._ensure_db()
+        await db.execute(
             "UPDATE agents SET status = 'inactive' WHERE agent_id = ? AND session_id = ?",
             (agent_id, self._session_id),
         )
         # Orphan handling: set children's parent to NULL
-        conn.execute(
+        await db.execute(
             "UPDATE agents SET parent = NULL WHERE parent = ? AND session_id = ?",
             (agent_id, self._session_id),
         )
-        conn.commit()
-        conn.close()
+        # Expire undelivered messages
+        await db.execute(
+            "UPDATE messages SET status = 'expired' WHERE to_agent = ? AND session_id = ? AND status = 'pending'",
+            (agent_id, self._session_id),
+        )
+        await db.commit()
         for aid, p in self._agent_parents.items():
             if p == agent_id:
                 self._agent_parents[aid] = None
 
-        self._update_command_status(cmd_id, "processed")
+        await self._update_command_status(cmd_id, "processed")
 
-    def _update_command_status(self, cmd_id: int, status: str, error: str | None = None) -> None:
+    async def _update_command_status(self, cmd_id: int, status: str, error: str | None = None) -> None:
         """Update a command's status in SQLite.
 
         Args:
@@ -548,17 +567,15 @@ class ACPBroker:
             status: New status ('processed' or 'rejected').
             error: Error message if rejected.
         """
-        conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
+        db = await self._ensure_db()
+        await db.execute(
             "UPDATE agent_commands SET status = ?, error = ? WHERE id = ?",
             (status, error, cmd_id),
         )
-        conn.commit()
-        conn.close()
+        await db.commit()
 
-    def _get_visible_agents_for(self, agent_id: str) -> list[str]:
-        """Compute visible agents for a given agent using in-memory parentage.
+    async def _get_visible_agents_for(self, agent_id: str) -> list[str]:
+        """Compute visible agents for a given agent using SQLite.
 
         Args:
             agent_id: The agent to compute visibility for.
@@ -566,38 +583,29 @@ class ACPBroker:
         Returns:
             List of agent_ids visible to the given agent.
         """
-        active = {
-            aid
-            for aid, s in self._sessions.items()
-            if s.state != AgentState.TERMINATED and aid != agent_id
-        }
-        if self._config.settings.communication_mode == CommunicationMode.MESH:
-            return list(active)
+        def _query() -> list[str]:
+            conn = sqlite3.connect(str(self._db_path))
+            conn.execute("PRAGMA journal_mode=WAL")
+            try:
+                return get_visible_agents(
+                    conn,
+                    agent_id,
+                    self._session_id,
+                    self._config.settings.communication_mode.value,
+                )
+            finally:
+                conn.close()
 
-        # LOCAL mode: parent, children, siblings
-        parent = self._agent_parents.get(agent_id)
-        visible: set[str] = set()
-        if parent and parent in active:
-            visible.add(parent)
-        # Children
-        for aid, p in self._agent_parents.items():
-            if p == agent_id and aid in active:
-                visible.add(aid)
-        # Siblings (same parent, excluding self)
-        if parent:
-            for aid, p in self._agent_parents.items():
-                if p == parent and aid in active and aid != agent_id:
-                    visible.add(aid)
-        return list(visible)
+        return await asyncio.to_thread(_query)
 
-    def _send_join_broadcast(self, agent_id: str, task: str) -> None:
+    async def _send_join_broadcast(self, agent_id: str, task: str) -> None:
         """Insert system join messages for visible agents.
 
         Args:
             agent_id: The newly joined agent.
             task: The agent's task description.
         """
-        recipients = self._get_visible_agents_for(agent_id)
+        recipients = await self._get_visible_agents_for(agent_id)
         if not recipients:
             return
 
@@ -606,17 +614,15 @@ class ACPBroker:
         else:
             body = f'[System] Agent "{agent_id}" has joined.'
 
-        conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
+        db = await self._ensure_db()
         now = int(time.time() * 1000)
         for recipient in recipients:
-            conn.execute(
-                "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at) "
-                "VALUES (?, 'system', ?, ?, 'pending', ?)",
+            await db.execute(
+                "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at, kind) "
+                "VALUES (?, 'system', ?, ?, 'pending', ?, 'system')",
                 (self._session_id, recipient, body, now),
             )
-        conn.commit()
-        conn.close()
+        await db.commit()
 
     async def _deliver_message(self, agent_id: str, text: str, from_agents: list[str]) -> bool:
         """Deliver combined message text to an idle agent.
@@ -681,6 +687,11 @@ class ACPBroker:
         # 2. Stop poller (await current cycle)
         if self._poller:
             await self._poller.stop()
+
+        # 3. Close shared DB connection
+        if self._db is not None:
+            await self._db.close()
+            self._db = None
 
         # 3. Persist session IDs
         sessions_path = Path.home() / ".synth" / "sessions.json"

@@ -83,6 +83,15 @@ class SynthApp(App):
         self._mcp_panel: MessageQueue | None = None
         self._dynamic_agents: dict[str, DynamicAgentInfo] = {}
 
+    def _handle_exception(self, error: Exception) -> None:
+        """Log unhandled exceptions to file before Textual's default handling."""
+        import logging
+
+        logging.getLogger("synth_acp.ui.app").error(
+            "Textual unhandled exception", exc_info=error
+        )
+        super()._handle_exception(error)
+
     def compose(self) -> ComposeResult:
         """Build the top bar, main layout with sidebar, and footer."""
         with Horizontal(id="topbar"):

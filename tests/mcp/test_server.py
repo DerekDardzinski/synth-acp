@@ -39,7 +39,9 @@ def _register_agents(db_path: Path, *agent_ids: str) -> None:
         "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
         "from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL, "
         "status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, "
-        "claimed_at INTEGER);"
+        "kind TEXT NOT NULL DEFAULT 'chat', "
+        "reply_to INTEGER REFERENCES messages(id), "
+        "delivered_at INTEGER);"
     )
     for aid in agent_ids:
         conn.execute(
@@ -82,7 +84,9 @@ def _init_full_schema(db_path: Path) -> None:
         "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
         "from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL, "
         "status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, "
-        "claimed_at INTEGER);"
+        "kind TEXT NOT NULL DEFAULT 'chat', "
+        "reply_to INTEGER REFERENCES messages(id), "
+        "delivered_at INTEGER);"
         "CREATE TABLE IF NOT EXISTS agent_commands ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
         "from_agent TEXT NOT NULL, command TEXT NOT NULL, payload TEXT NOT NULL, "

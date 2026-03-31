@@ -476,8 +476,15 @@ def cli(
 ) -> None:
     """SYNTH — multi-agent ACP orchestrator."""
     if verbose:
-        logging.basicConfig(level=logging.DEBUG)
+        log_file = Path.home() / ".synth" / "synth.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(
+            level=logging.DEBUG,
+            filename=str(log_file),
+            format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        )
         logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+        logging.getLogger("markdown_it").setLevel(logging.WARNING)
 
     resolved = _resolve_config(harness, agent, config, headless)
 

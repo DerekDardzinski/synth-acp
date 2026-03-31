@@ -133,3 +133,6 @@ class McpMessageDelivered(BrokerEvent):
     from_agent: str
     to_agent: str
     preview: str = ""
+    message_id: int | None = None
+    kind: str = "chat"
+    reply_to: int | None = None
