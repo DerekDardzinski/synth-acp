@@ -170,10 +170,15 @@ ToolCallBlock.tool-permission {
 #tc-text { padding-left: 2; }
 
 /* ── Diff view ── */
-DiffView { height: auto; margin: 0 0 0 2; }
-DiffView Collapsible { background: $surface; border: none; padding: 0; }
-DiffView .diff-scroll { max-height: 20; }
-DiffView .diff-scroll Static { padding: 0 1; }
+DiffView { height: auto; max-height: 30; overflow-y: auto; margin: 0 0 0 2; width: 1fr; scrollbar-size-vertical: 1; }
+DiffView .diff-group { height: auto; background: $foreground 4%; }
+DiffView .diff-title { border-bottom: dashed $foreground 20%; }
+DiffView .ellipsis { text-align: center; width: 1fr; color: $text-primary; text-style: bold; offset-x: -1; }
+DiffView .annotations { width: 1; }
+DiffView.-with-annotations .annotations { width: auto; }
+DiffScrollContainer { overflow-x: hidden; height: auto; }
+LineAnnotations { width: auto; height: auto; }
+DiffCode { width: 1fr; height: auto; }
 
 /* ── Permission modal ── */
 /* ── Permission bar ── */

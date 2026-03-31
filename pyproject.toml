@@ -5,7 +5,7 @@ description = "SYNTH — Synchronized Network of Teamed Harnesses over ACP"
 requires-python = ">=3.12"
 dependencies = [
     "agent-client-protocol",
-    "textual",
+    "textual[syntax]>=8.2.1",
     "mcp>=1.0.0",
     "aiosqlite>=0.19.0",
     "typer>=0.9",

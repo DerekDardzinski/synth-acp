@@ -113,9 +113,8 @@ class ToolCallBlock(Vertical):
         """Build DiffView widgets for diffs."""
         if not diffs:
             return []
-        collapsed = self._status == "completed"
         return [
-            DiffView(d.path, d.old_text, d.new_text, collapsed=collapsed)
+            DiffView(d.path, d.path, d.old_text or "", d.new_text)
             for d in diffs
         ]
 
@@ -147,6 +146,9 @@ class ToolCallBlock(Vertical):
         widgets.extend(self._location_widgets(locations))
         widgets.extend(self._raw_input_widgets(raw_input))
         widgets.extend(self._text_widgets(text_content))
-        widgets.extend(self._diff_widgets(diffs))
+        diff_views = self._diff_widgets(diffs)
+        for dv in diff_views:
+            await dv.prepare()
+        widgets.extend(diff_views)
         for w in widgets:
             await self.mount(w)
