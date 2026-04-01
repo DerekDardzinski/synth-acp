@@ -54,11 +54,11 @@ def _register_agents(db_path: Path, *agent_ids: str) -> None:
 
 @pytest.mark.usefixtures("_env")
 class TestSendMessage:
-    def test_send_message_when_broadcast_expands_to_individual_rows(self, db_path: Path) -> None:
+    async def test_send_message_when_broadcast_expands_to_individual_rows(self, db_path: Path) -> None:
         _register_agents(db_path, "agent-a", "agent-b", "agent-c")
         from synth_acp.mcp.server import send_message
 
-        result = json.loads(send_message(to_agent="*", body="hello all"))
+        result = json.loads(await send_message(to_agent="*", body="hello all"))
         assert len(result["message_ids"]) == 2
 
         # Verify rows exist for agent-b and agent-c, not agent-a
@@ -118,12 +118,12 @@ def _register_agents_full(db_path: Path, agents: list[tuple[str, str | None, str
 
 @pytest.mark.usefixtures("_env")
 class TestLaunchAgent:
-    def test_launch_agent_when_called_inserts_pending_command(self, db_path: Path) -> None:
+    async def test_launch_agent_when_called_inserts_pending_command(self, db_path: Path) -> None:
         _init_full_schema(db_path)
         from synth_acp.mcp.server import launch_agent
 
         result = json.loads(
-            launch_agent(
+            await launch_agent(
                 agent_id="worker-1",
                 agent_name="implementor",
                 harness="kiro",
@@ -152,13 +152,13 @@ class TestLaunchAgent:
         assert payload["task"] == "Fix auth"
         assert payload["message"] == "Start working"
 
-    def test_launch_agent_when_at_capacity_returns_queued(self, db_path: Path) -> None:
+    async def test_launch_agent_when_at_capacity_returns_queued(self, db_path: Path) -> None:
         _register_agents_full(db_path, [("agent-a", None, None)])
         from synth_acp.mcp.server import launch_agent
 
         with patch.dict("os.environ", {"SYNTH_MAX_AGENTS": "1"}):
             result = json.loads(
-                launch_agent(
+                await launch_agent(
                     agent_id="worker-1",
                     agent_name="implementor",
                     harness="kiro",
@@ -177,7 +177,7 @@ class TestLaunchAgent:
 
 @pytest.mark.usefixtures("_env")
 class TestListAgents:
-    def test_list_agents_when_agents_have_parent_includes_parent_and_task(
+    async def test_list_agents_when_agents_have_parent_includes_parent_and_task(
         self, db_path: Path
     ) -> None:
         _register_agents_full(
@@ -190,7 +190,7 @@ class TestListAgents:
         )
         from synth_acp.mcp.server import list_agents
 
-        result = json.loads(list_agents())
+        result = json.loads(await list_agents())
         by_id = {a["agent_id"]: a for a in result}
         assert by_id["worker-1"]["parent"] == "orchestrator"
         assert by_id["worker-1"]["task"] == "Fix auth"
@@ -199,7 +199,7 @@ class TestListAgents:
 
 @pytest.mark.usefixtures("_env")
 class TestGetVisibleAgents:
-    def test_get_visible_agents_when_local_mode_returns_family_only(self, db_path: Path) -> None:
+    async def test_get_visible_agents_when_local_mode_returns_family_only(self, db_path: Path) -> None:
         # Agent tree: coordinator→{auth, db, api}, auth→{helper}
         _register_agents_full(
             db_path,
@@ -211,16 +211,14 @@ class TestGetVisibleAgents:
                 ("helper", "auth", "Help auth"),
             ],
         )
-        from synth_acp.mcp.server import _get_visible_agents
+        from synth_acp.mcp.server import _get_visible_agents_async
 
         # Test for "auth": should see coordinator (parent), db, api (siblings), helper (child)
         with (
             patch("synth_acp.mcp.server.AGENT_ID", "auth"),
             patch("synth_acp.mcp.server.COMMUNICATION_MODE", "LOCAL"),
         ):
-            conn = sqlite3.connect(str(db_path))
-            visible = set(_get_visible_agents(conn))
-            conn.close()
+            visible = set(await _get_visible_agents_async(str(db_path)))
         assert visible == {"coordinator", "db", "api", "helper"}
 
         # Test for "coordinator": should see auth, db, api (children only, no parent, no grandchildren)
@@ -228,15 +226,13 @@ class TestGetVisibleAgents:
             patch("synth_acp.mcp.server.AGENT_ID", "coordinator"),
             patch("synth_acp.mcp.server.COMMUNICATION_MODE", "LOCAL"),
         ):
-            conn = sqlite3.connect(str(db_path))
-            visible = set(_get_visible_agents(conn))
-            conn.close()
+            visible = set(await _get_visible_agents_async(str(db_path)))
         assert visible == {"auth", "db", "api"}
 
 
 @pytest.mark.usefixtures("_env")
 class TestSendMessageVisibility:
-    def test_send_message_when_local_mode_and_target_not_visible_returns_error(
+    async def test_send_message_when_local_mode_and_target_not_visible_returns_error(
         self, db_path: Path
     ) -> None:
         _register_agents_full(
@@ -249,7 +245,7 @@ class TestSendMessageVisibility:
         from synth_acp.mcp.server import send_message
 
         with patch("synth_acp.mcp.server.COMMUNICATION_MODE", "LOCAL"):
-            result = json.loads(send_message(to_agent="unrelated", body="hello"))
+            result = json.loads(await send_message(to_agent="unrelated", body="hello"))
 
         assert "error" in result
         assert "Agent not visible" in result["error"]

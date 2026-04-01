@@ -9,6 +9,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from synth_acp.db import ensure_schema_async
+
 log = logging.getLogger(__name__)
 
 DeliverFn = Callable[[str, str, list[str]], Awaitable[bool]]
@@ -56,30 +58,7 @@ class MessagePoller:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             async with aiosqlite.connect(self._db_path) as db:
-                await db.execute(
-                    "CREATE TABLE IF NOT EXISTS messages ("
-                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                    "session_id TEXT NOT NULL,"
-                    "from_agent TEXT NOT NULL,"
-                    "to_agent TEXT NOT NULL,"
-                    "body TEXT NOT NULL,"
-                    "status TEXT NOT NULL DEFAULT 'pending',"
-                    "created_at INTEGER NOT NULL,"
-                    "kind TEXT NOT NULL DEFAULT 'chat',"
-                    "reply_to INTEGER REFERENCES messages(id),"
-                    "delivered_at INTEGER)"
-                )
-                await db.execute(
-                    "CREATE TABLE IF NOT EXISTS agent_commands ("
-                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-                    "session_id TEXT NOT NULL,"
-                    "from_agent TEXT NOT NULL,"
-                    "command TEXT NOT NULL,"
-                    "payload TEXT NOT NULL,"
-                    "status TEXT NOT NULL DEFAULT 'pending',"
-                    "error TEXT,"
-                    "created_at INTEGER NOT NULL)"
-                )
+                await ensure_schema_async(db)
                 await db.commit()
 
                 # Initial sweep + baseline: deliver anything pending, then snapshot version

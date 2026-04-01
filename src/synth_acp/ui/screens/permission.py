@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import ClassVar
 
 from acp.schema import PermissionOption
@@ -13,6 +14,8 @@ from textual.content import Content
 from textual.message import Message
 from textual.reactive import reactive, var
 from textual.widgets import Label
+
+log = logging.getLogger(__name__)
 
 _KIND_KEYS: dict[str, str] = {
     "allow_once": "a",
@@ -138,7 +141,7 @@ class PermissionBar(VerticalGroup, can_focus=True):
         try:
             self.query_one("#perm-option-container", VerticalGroup).set_class(blink, "-blink")
         except Exception:
-            pass
+            log.debug("Permission blink toggle failed", exc_info=True)
 
     def watch_selection(self, old: int, new: int) -> None:
         """Toggle -active class on option rows."""

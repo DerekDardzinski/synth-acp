@@ -82,6 +82,8 @@ def _make_app():
     broker.handle = AsyncMock()
     broker.shutdown = AsyncMock()
     broker._pending_permissions = {}
+    broker.is_permission_pending = MagicMock(return_value=False)
+    broker.get_agent_parent = MagicMock(return_value=None)
 
     async def _events():
         return

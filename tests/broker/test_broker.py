@@ -11,7 +11,7 @@ from acp.schema import PermissionOption
 
 from synth_acp.broker.broker import ACPBroker
 from synth_acp.models.agent import AgentState
-from synth_acp.models.commands import RespondPermission, SendPrompt
+from synth_acp.models.commands import LaunchAgent, RespondPermission, SendPrompt
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import BrokerError, PermissionRequested, UsageUpdated
 from synth_acp.models.permissions import PermissionDecision
@@ -468,3 +468,35 @@ class TestProcessCommands:
         finally:
             if broker._db:
                 await broker._db.close()
+
+
+class TestRelaunchTerminatedAgent:
+    async def test_launch_when_agent_terminated_relaunches_without_error(self, tmp_path: Path) -> None:
+        """Re-launching a terminated agent should succeed without BrokerError."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+
+        from synth_acp.acp.session import ACPSession
+
+        # First session — mark as terminated
+        old_session = ACPSession(
+            agent_id="agent-1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=broker._sink,
+        )
+        old_session.state = AgentState.TERMINATED
+        broker._sessions["agent-1"] = old_session
+
+        # Re-launch should clean up old session and create a new one
+        mock_session = AsyncMock()
+        mock_session.state = AgentState.INITIALIZING
+        mock_session.run = AsyncMock()
+
+        with patch("synth_acp.broker.broker.ACPSession", return_value=mock_session):
+            await broker.handle(LaunchAgent(agent_id="agent-1"))
+
+        # New session replaced the old one
+        assert broker._sessions["agent-1"] is mock_session
+        # No BrokerError emitted
+        assert broker._event_queue.empty()

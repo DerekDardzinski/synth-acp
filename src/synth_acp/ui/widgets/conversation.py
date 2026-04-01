@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from textual.app import ComposeResult
 from textual.containers import ScrollableContainer, Vertical
 from textual.widgets import Static
 
@@ -14,6 +16,8 @@ from synth_acp.ui.widgets.input_bar import InputBar
 from synth_acp.ui.widgets.prompt_bubble import PromptBubble
 from synth_acp.ui.widgets.thought_block import ThoughtBlock
 from synth_acp.ui.widgets.tool_call import ToolCallBlock
+
+log = logging.getLogger(__name__)
 
 
 class ConversationFeed(Vertical):
@@ -33,7 +37,7 @@ class ConversationFeed(Vertical):
         self._scroll: ScrollableContainer | None = None
         self.input_bar: InputBar | None = None
 
-    def compose(self):
+    def compose(self) -> ComposeResult:
         """Yield the scrollable container and input bar."""
         with ScrollableContainer(classes="conv-scroll"):
             pass
@@ -52,7 +56,8 @@ class ConversationFeed(Vertical):
         """
         ts = datetime.now(UTC).strftime("%H:%M")
         bubble = PromptBubble(text, ts)
-        assert self._scroll is not None
+        if self._scroll is None:
+            return
         self._scroll.mount(bubble)
         self._scroll.scroll_end(animate=False)
 
@@ -64,10 +69,12 @@ class ConversationFeed(Vertical):
         """
         if self._current_message is None:
             self._current_message = AgentMessage(self._agent_id)
-            assert self._scroll is not None
+            if self._scroll is None:
+                return
             self._scroll.mount(self._current_message)
         await self._current_message.append_chunk(chunk)
-        assert self._scroll is not None
+        if self._scroll is None:
+            return
         self._scroll.scroll_end(animate=False)
 
     async def add_thought_chunk(self, chunk: str) -> None:
@@ -78,10 +85,12 @@ class ConversationFeed(Vertical):
         """
         if self._current_thought is None:
             self._current_thought = ThoughtBlock()
-            assert self._scroll is not None
+            if self._scroll is None:
+                return
             self._scroll.mount(self._current_thought)
         await self._current_thought.append_chunk(chunk)
-        assert self._scroll is not None
+        if self._scroll is None:
+            return
         self._scroll.scroll_end(animate=False)
 
     async def add_tool_call(
@@ -121,6 +130,7 @@ class ConversationFeed(Vertical):
                 text_content=text_content,
             )
         except Exception:
+            log.debug("Tool call query failed", exc_info=True)
             if self._current_message is not None:
                 await self._current_message.finalize()
                 self._current_message = None
@@ -134,7 +144,8 @@ class ConversationFeed(Vertical):
                 diffs=diffs,
                 text_content=text_content,
             )
-            assert self._scroll is not None
+            if self._scroll is None:
+                return
             await self._scroll.mount(block)
             self._scroll.scroll_end(animate=False)
 
@@ -161,6 +172,7 @@ class ConversationFeed(Vertical):
             f"[dim]◈ {from_agent} → {to_agent}  {ts}[/dim]\n  [dim]{snippet}[/dim]",
             classes="mcp-msg",
         )
-        assert self._scroll is not None
+        if self._scroll is None:
+            return
         self._scroll.mount(widget)
         self._scroll.scroll_end(animate=False)

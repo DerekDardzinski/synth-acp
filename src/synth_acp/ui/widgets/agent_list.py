@@ -99,7 +99,8 @@ class AgentTile(Vertical):
         from synth_acp.ui.app import SynthApp
 
         app = self.app
-        assert isinstance(app, SynthApp)
+        if not isinstance(app, SynthApp):
+                    return
         app.run_worker(app.select_agent(self._agent_id))
 
 
@@ -140,7 +141,8 @@ class MCPButton(Static):
         from synth_acp.ui.app import SynthApp
 
         app = self.app
-        assert isinstance(app, SynthApp)
+        if not isinstance(app, SynthApp):
+                    return
         app.run_worker(app.show_messages())
 
 

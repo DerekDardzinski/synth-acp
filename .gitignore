@@ -10,3 +10,4 @@ dist/
 .kiro/
 .serena/
 synth-debug.log
+*.bak

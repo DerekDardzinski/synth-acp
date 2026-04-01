@@ -346,7 +346,7 @@ async def _run(config: SessionConfig) -> None:
     idle_agents: set[str] = set()
     expected = {a.id for a in config.agents}
     async for event in broker.events():
-        _print_event(event, {})
+        _print_event(event, [])
         if isinstance(event, AgentStateChanged) and event.new_state == "idle":
             idle_agents.add(event.agent_id)
             if idle_agents >= expected:

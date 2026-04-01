@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import ClassVar, NamedTuple
 
 from textual import work
@@ -37,6 +38,8 @@ from synth_acp.ui.widgets.conversation import ConversationFeed
 from synth_acp.ui.widgets.message_queue import MessageQueue
 
 _DISABLED_STATES = {AgentState.BUSY, AgentState.AWAITING_PERMISSION}
+
+log = logging.getLogger(__name__)
 
 
 class DynamicAgentInfo(NamedTuple):
@@ -136,7 +139,7 @@ class SynthApp(App):
             try:
                 self.query_one("#mcp-btn", MCPButton).update_count(self._mcp_count)
             except Exception:
-                pass
+                log.debug("MCP button not found", exc_info=True)
             # Update MCP panel if visible
             if (
                 self._mcp_panel is not None
@@ -159,7 +162,7 @@ class SynthApp(App):
         if isinstance(event, AgentStateChanged):
             self._agent_states[event.agent_id] = event.new_state
             if event.agent_id not in self._dynamic_agents and event.agent_id not in {a.id for a in self.config.agents}:
-                parent = self.broker._agent_parents.get(event.agent_id)
+                parent = self.broker.get_agent_parent(event.agent_id)
                 self._dynamic_agents[event.agent_id] = DynamicAgentInfo(parent=parent, task="")
                 self._event_buffers[event.agent_id] = []
                 try:
@@ -174,7 +177,7 @@ class SynthApp(App):
                 else:
                     tile.update_state(event.new_state)
             except Exception:
-                pass
+                log.debug("Agent tile not found for %s", event.agent_id, exc_info=True)
 
         # Route to the agent's panel if it exists (regardless of selection)
         if event.agent_id in self._panels:
@@ -275,7 +278,7 @@ class SynthApp(App):
                 text_content=event.text_content,
             )
         elif isinstance(event, PermissionRequested):
-            if event.agent_id in self.broker._pending_permissions:
+            if self.broker.is_permission_pending(event.agent_id):
                 self._mount_permission_bar(feed, event)
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
@@ -319,7 +322,7 @@ class SynthApp(App):
                 f"[dim]{'  '.join(parts)}[/dim]" if parts else ""
             )
         except Exception:
-            pass
+            log.debug("Topbar usage update failed", exc_info=True)
 
     def on_worker_state_changed(self, event: SynthApp.WorkerStateChanged) -> None:
         """Handle worker state changes — notify and restart on error.
@@ -377,7 +380,7 @@ class SynthApp(App):
         try:
             self.query_one("#mcp-btn", MCPButton).remove_class("btn-active")
         except Exception:
-            pass
+            log.debug("MCP button deselect failed", exc_info=True)
         # Update topbar with agent display name
         display_name = agent_id
         for a in self.config.agents:
@@ -387,7 +390,7 @@ class SynthApp(App):
         try:
             self.query_one("#tb-session", Static).update(display_name)
         except Exception:
-            pass
+            log.debug("Topbar session label update failed", exc_info=True)
         self._update_input_bar_state(agent_id, self._agent_states.get(agent_id, AgentState.IDLE))
 
     async def show_messages(self) -> None:
@@ -397,7 +400,7 @@ class SynthApp(App):
         try:
             self.query_one("#mcp-btn", MCPButton).add_class("btn-active")
         except Exception:
-            pass
+            log.debug("MCP button select failed", exc_info=True)
 
         switcher = self.query_one("#right", ContentSwitcher)
 
@@ -451,4 +454,4 @@ class SynthApp(App):
         try:
             await self.broker.shutdown()
         except Exception:
-            pass
+            log.debug("Broker shutdown error", exc_info=True)

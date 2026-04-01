@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from textual.app import ComposeResult
@@ -9,6 +10,8 @@ from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Collapsible, Static
 
 from synth_acp.models.events import McpMessageDelivered
+
+log = logging.getLogger(__name__)
 
 
 class ThreadDetailHeader(Static):
@@ -104,12 +107,13 @@ class ThreadItem(Static):
         from synth_acp.ui.app import SynthApp
 
         app = self.app
-        assert isinstance(app, SynthApp)
+        if not isinstance(app, SynthApp):
+                    return
         try:
             panel = app.query_one("#messages", MessageQueue)
             panel.show_thread(self._thread_key)
         except Exception:
-            pass
+            log.debug("Thread panel query failed", exc_info=True)
 
 
 class MessageQueue(Vertical):
@@ -153,6 +157,7 @@ class MessageQueue(Vertical):
         try:
             thread_list = self.query_one("#thread-list", ScrollableContainer)
         except Exception:
+            log.debug("Thread list query failed", exc_info=True)
             return
         await thread_list.remove_children()
         for key, msgs in threads.items():
@@ -176,11 +181,11 @@ class MessageQueue(Vertical):
         try:
             self.query_one(f"#titem-{a}-{b}", ThreadItem).add_class("thread-active")
         except Exception:
-            pass
+            log.debug("Thread item highlight failed", exc_info=True)
         # Populate detail
         msgs = self._threads.get(thread_key, [])
         try:
             detail = self.query_one("#thread-detail", ThreadDetail)
             detail.show_thread(thread_key, msgs)
         except Exception:
-            pass
+            log.debug("Thread detail update failed", exc_info=True)

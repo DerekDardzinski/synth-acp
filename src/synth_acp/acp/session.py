@@ -121,7 +121,8 @@ async def _spawn_isolated_agent(
         cwd=cwd,
         process_group=0,
     )
-    assert process.stdout and process.stdin
+    if not process.stdout or not process.stdin:
+        raise RuntimeError("Failed to open stdin/stdout pipes for agent subprocess")
 
     conn = ClientSideConnection(client, process.stdin, process.stdout)
     try:

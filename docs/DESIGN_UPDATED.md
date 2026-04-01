@@ -2,8 +2,8 @@
 
 **SYNTH** — **SY**nchronized **N**etwork of **T**eamed **H**arnesses over ACP
 
-Version: 0.4
-Date: 2026-03-25
+Version: 0.5
+Date: 2026-04-01
 
 ---
 
@@ -142,11 +142,12 @@ class ACPSession:
 
 ```
 UNSTARTED → INITIALIZING → IDLE → BUSY → IDLE → ... → TERMINATED
-                                    ↑
-                              AWAITING_PERMISSION
+                 ↑                  ↑                       │
+                 │            AWAITING_PERMISSION            │
+                 └──────────────── (re-launch) ─────────────┘
 ```
 
-Transitions are enforced at runtime. State change notifications are `await`ed (not fire-and-forget) to prevent race conditions where the broker's view of agent state is stale when the first streaming chunk arrives.
+Transitions are enforced at runtime. `TERMINATED → INITIALIZING` enables re-launching crashed agents without restarting the session. The broker cleans up the old session before creating a new one.
 
 #### Session Update Handling
 
@@ -263,7 +264,7 @@ CommandFn = Callable[[list[tuple[int, str, str, str]]], Awaitable[None]]
 
 ### 3.5 MCP Server (`synth-mcp`)
 
-FastMCP server using `mcp.server.fastmcp.FastMCP` (from the `mcp` package, not a separate `fastmcp` package). Each agent spawns its own instance. All instances share the same SQLite database.
+FastMCP server using `mcp.server.fastmcp.FastMCP` (from the `mcp` package, not a separate `fastmcp` package). Each agent spawns its own instance. All instances share the same SQLite database. All tool handlers are `async def` using `aiosqlite` for non-blocking database access.
 
 Tools provided:
 
@@ -278,7 +279,7 @@ Tools provided:
 
 `pull_messages` was removed — the broker's poller handles all delivery. Agents receive messages between turns automatically via `session/prompt`.
 
-Auto-registers the agent on first tool call via `INSERT OR IGNORE`. WAL mode enabled.
+Auto-registers the agent on first tool call via `INSERT OR IGNORE`. WAL mode enabled. Visibility queries use `asyncio.to_thread` to run the synchronous `get_visible_agents()` function without blocking the event loop.
 
 #### Communication Modes
 
@@ -309,6 +310,8 @@ The broker is a mandatory parent process that owns every agent's stdio channel. 
 | Token usage | Broker memory (per-agent cumulative) | Ephemeral; displayed in TUI topbar |
 
 ### 4.3 SQLite Schema
+
+The canonical schema lives in `src/synth_acp/db.py` as a single `SCHEMA` string with `ensure_schema_sync()` and `ensure_schema_async()` helpers. All consumers (broker, poller, MCP server) call these helpers instead of defining schemas inline.
 
 ```sql
 CREATE TABLE agents (
@@ -474,10 +477,13 @@ class ACPBroker:
     async def events(self) -> AsyncIterator[BrokerEvent]: ...
     def get_agent_states(self) -> dict[str, AgentState]: ...
     def get_agent_configs(self) -> list[AgentConfig]: ...
+    def get_agent_parent(self, agent_id: str) -> str | None: ...
+    def is_permission_pending(self, agent_id: str) -> bool: ...
+    def get_usage(self, agent_id: str) -> UsageUpdated | None: ...
     async def shutdown(self) -> None: ...
 ```
 
-`events()` is an infinite async iterator backed by an unbounded `asyncio.Queue`. It terminates (`StopAsyncIteration`) when `shutdown()` is called. Single-consumer design — one frontend at a time.
+`events()` is an infinite async iterator backed by an unbounded `asyncio.Queue`. It terminates (`StopAsyncIteration`) when `shutdown()` is called. Single-consumer design — one frontend at a time. The UI layer accesses broker state exclusively through these public methods — no direct access to private attributes.
 
 ### 6.4 Textual Bridge
 
@@ -890,7 +896,7 @@ requires-python = ">=3.12"
 dependencies = [
     "agent-client-protocol",
     "textual",
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
     "aiosqlite>=0.19.0",
     "typer>=0.9",
 ]
@@ -913,6 +919,7 @@ synth-acp/
 ├── pyproject.toml
 ├── src/synth_acp/
 │   ├── __init__.py / __main__.py / cli.py
+│   ├── db.py                 # Shared SQLite schema and helpers
 │   ├── harnesses.py          # load_harness_registry()
 │   ├── models/
 │   │   ├── agent.py          # AgentConfig, AgentState, transitions
@@ -920,6 +927,7 @@ synth-acp/
 │   │   ├── events.py         # BrokerEvent subclasses
 │   │   ├── commands.py       # BrokerCommand subclasses
 │   │   └── permissions.py    # PermissionDecision, PermissionRule
+│   │   └── visibility.py    # get_visible_agents()
 │   ├── acp/
 │   │   └── session.py        # ACPSession
 │   ├── broker/
@@ -986,6 +994,17 @@ ACP-6, ACP-8, ACP-9, ACP-10, ACP-1d, ACP-1e, Textual-7, Textual-8, Textual-9, Te
 ---
 
 ## Changelog
+
+### v0.5 (2026-04-01)
+- **Schema consolidation:** Extracted duplicated SQLite schema from broker, poller, and MCP server into `src/synth_acp/db.py` with `ensure_schema_sync()` and `ensure_schema_async()` helpers.
+- **Async MCP server:** Rewrote `synth-mcp` tool handlers as `async def` using `aiosqlite`. Visibility queries run via `asyncio.to_thread` to avoid blocking.
+- **Broker encapsulation:** Added `get_agent_parent()` and `is_permission_pending()` public methods. UI layer no longer accesses private broker attributes.
+- **Production hardening:** Replaced all `assert` statements in production code with explicit checks (`RuntimeError` for pipe validation, early returns for widget guards). Replaced all bare `except Exception: pass` blocks in UI with `log.debug()` calls with `exc_info=True`.
+- **CLI bug fix:** Fixed `_print_event` in headless startup passing `{}` instead of `[]` for `pending_permissions`, which would crash on `PermissionRequested` events.
+- **Agent re-launch:** `TERMINATED → INITIALIZING` transition now allowed. Broker cleans up old session before creating a new one, enabling restart of crashed agents without restarting the session.
+- **Dependency bound:** Added `<2` upper bound to `mcp` dependency.
+- **Type annotations:** Added `-> ComposeResult` return types to `compose()` in `ConversationFeed` and `InputBar`.
+- **Cleanup:** Removed leftover `.bak` files, added `*.bak` to `.gitignore`.
 
 ### v0.4 (2026-03-25)
 - **Dynamic agent management:** `launch_agent`/`terminate_agent` MCP tools write to `agent_commands` SQLite table. Broker processes commands via `CommandFn` callback on `MessagePoller`. Harness resolution via shared `load_harness_registry()`. Parentage tracking (`parent`/`task` columns on `agents` table). Orphaned children get `parent=NULL`.

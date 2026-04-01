@@ -52,4 +52,4 @@ class TestStateTransitions:
         assert AgentState.INITIALIZING not in TRANSITIONS[AgentState.BUSY]
 
     def test_terminated_is_terminal(self):
-        assert TRANSITIONS[AgentState.TERMINATED] == set()
+        assert TRANSITIONS[AgentState.TERMINATED] == {AgentState.INITIALIZING}

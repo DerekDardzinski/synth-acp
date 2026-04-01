@@ -17,6 +17,7 @@ import aiosqlite
 from acp.schema import EnvVariable, McpServerStdio
 
 from synth_acp.acp.session import ACPSession
+from synth_acp.db import ensure_schema_async
 from synth_acp.broker.permissions import PermissionEngine
 from synth_acp.broker.poller import MessagePoller
 from synth_acp.harnesses import load_harness_registry
@@ -120,6 +121,14 @@ class ACPBroker:
         """
         return self._usage.get(agent_id)
 
+    def get_agent_parent(self, agent_id: str) -> str | None:
+        """Return the parent agent ID, or None if no parent."""
+        return self._agent_parents.get(agent_id)
+
+    def is_permission_pending(self, agent_id: str) -> bool:
+        """Return True if the agent has an unresolved permission request."""
+        return agent_id in self._pending_permissions
+
     def _accumulate_usage(self, event: UsageUpdated) -> None:
         """Store the latest usage snapshot for an agent.
 
@@ -218,6 +227,18 @@ class ACPBroker:
                 env=self._build_mcp_env(agent_id, agent_cfg.env),
             )
         ]
+
+        if agent_id in self._sessions:
+            old = self._sessions[agent_id]
+            if old.state != AgentState.TERMINATED:
+                await self._sink(
+                    BrokerError(agent_id=agent_id, message=f"Agent '{agent_id}' is still running")
+                )
+                return
+            del self._sessions[agent_id]
+            task = self._tasks.pop(agent_id, None)
+            if task and not task.done():
+                task.cancel()
 
         session = ACPSession(
             agent_id=agent_cfg.id,
@@ -342,28 +363,7 @@ class ACPBroker:
     async def _register_agents(self) -> None:
         """Pre-register all config agents in SQLite so list_agents works immediately."""
         db = await self._ensure_db()
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS agents ("
-            "agent_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, "
-            "status TEXT NOT NULL DEFAULT 'active', registered INTEGER NOT NULL, "
-            "parent TEXT, task TEXT)"
-        )
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS messages ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
-            "from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL, "
-            "status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, "
-            "kind TEXT NOT NULL DEFAULT 'chat', "
-            "reply_to INTEGER REFERENCES messages(id), "
-            "delivered_at INTEGER)"
-        )
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS agent_commands ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
-            "from_agent TEXT NOT NULL, command TEXT NOT NULL, payload TEXT NOT NULL, "
-            "status TEXT NOT NULL DEFAULT 'pending', error TEXT, "
-            "created_at INTEGER NOT NULL)"
-        )
+        await ensure_schema_async(db)
         now = int(time.time() * 1000)
         for agent in self._config.agents:
             await db.execute(

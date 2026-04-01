@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
 import time
 
+import aiosqlite
 from mcp.server.fastmcp import FastMCP
+
+from synth_acp.db import ensure_schema_async
 
 mcp = FastMCP("synth-mcp")
 
@@ -16,66 +20,41 @@ DB_PATH = os.environ.get("SYNTH_DB_PATH", "")
 AGENT_ID = os.environ.get("SYNTH_AGENT_ID", "")
 COMMUNICATION_MODE = os.environ.get("SYNTH_COMMUNICATION_MODE", "MESH")
 
-_SCHEMA = """\
-CREATE TABLE IF NOT EXISTS agents (
-    agent_id    TEXT PRIMARY KEY,
-    session_id  TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'active',
-    registered  INTEGER NOT NULL,
-    parent      TEXT,
-    task        TEXT
-);
-CREATE TABLE IF NOT EXISTS messages (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id  TEXT NOT NULL,
-    from_agent  TEXT NOT NULL,
-    to_agent    TEXT NOT NULL,
-    body        TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'pending',
-    created_at  INTEGER NOT NULL,
-    kind        TEXT NOT NULL DEFAULT 'chat',
-    reply_to    INTEGER REFERENCES messages(id),
-    delivered_at INTEGER
-);
-CREATE TABLE IF NOT EXISTS agent_commands (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id  TEXT NOT NULL,
-    from_agent  TEXT NOT NULL,
-    command     TEXT NOT NULL,
-    payload     TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'pending',
-    error       TEXT,
-    created_at  INTEGER NOT NULL
-);
-"""
 
-
-def _get_db() -> sqlite3.Connection:
-    """Open a WAL-mode connection and ensure schema exists."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(_SCHEMA)
+async def _get_db() -> aiosqlite.Connection:
+    """Open a WAL-mode async connection and ensure schema exists."""
+    conn = await aiosqlite.connect(DB_PATH)
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await ensure_schema_async(conn)
     return conn
 
 
-def _ensure_registered(conn: sqlite3.Connection) -> None:
+async def _ensure_registered(conn: aiosqlite.Connection) -> None:
     """Auto-register this agent if not already present."""
-    conn.execute(
+    await conn.execute(
         "INSERT OR IGNORE INTO agents (agent_id, session_id, status, registered) VALUES (?, ?, 'active', ?)",
         (AGENT_ID, SESSION_ID, int(time.time() * 1000)),
     )
-    conn.commit()
+    await conn.commit()
 
 
-def _get_visible_agents(conn: sqlite3.Connection) -> list[str]:
-    """Return agent_ids visible to AGENT_ID based on COMMUNICATION_MODE."""
+async def _get_visible_agents_async(db_path: str) -> list[str]:
+    """Return agent_ids visible to AGENT_ID using a sync connection in a thread."""
     from synth_acp.models.visibility import get_visible_agents
 
-    return get_visible_agents(conn, AGENT_ID, SESSION_ID, COMMUNICATION_MODE)
+    def _query() -> list[str]:
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            return get_visible_agents(conn, AGENT_ID, SESSION_ID, COMMUNICATION_MODE)
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_query)
 
 
 @mcp.tool()
-def send_message(to_agent: str, body: str, kind: str = "chat", reply_to: int | None = None) -> str:
+async def send_message(to_agent: str, body: str, kind: str = "chat", reply_to: int | None = None) -> str:
     """Send a message to another agent, or '*' to broadcast to all active agents.
 
     Args:
@@ -91,48 +70,49 @@ def send_message(to_agent: str, body: str, kind: str = "chat", reply_to: int | N
     if kind not in valid_kinds:
         return json.dumps({"error": f"Invalid kind: {kind}. Must be one of: {', '.join(sorted(valid_kinds))}"})
 
-    conn = _get_db()
-    _ensure_registered(conn)
+    conn = await _get_db()
+    await _ensure_registered(conn)
 
     if reply_to is not None:
-        row = conn.execute(
+        cursor = await conn.execute(
             "SELECT id FROM messages WHERE id = ? AND session_id = ?",
             (reply_to, SESSION_ID),
-        ).fetchone()
+        )
+        row = await cursor.fetchone()
         if not row:
-            conn.close()
+            await conn.close()
             return json.dumps({"error": f"reply_to message not found: {reply_to}"})
 
     now = int(time.time() * 1000)
     if to_agent == "*":
-        visible = _get_visible_agents(conn)
+        visible = await _get_visible_agents_async(DB_PATH)
         ids = []
         for aid in visible:
-            cursor = conn.execute(
+            cursor = await conn.execute(
                 "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at, kind, reply_to) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
                 (SESSION_ID, AGENT_ID, aid, body, now, kind, reply_to),
             )
             ids.append(cursor.lastrowid)
-        conn.commit()
-        conn.close()
+        await conn.commit()
+        await conn.close()
         return json.dumps({"message_ids": ids})
-    # Single target: validate visibility
-    visible = _get_visible_agents(conn)
+
+    visible = await _get_visible_agents_async(DB_PATH)
     if to_agent not in visible:
-        conn.close()
+        await conn.close()
         return json.dumps({"error": f"Agent not visible: {to_agent}"})
-    cursor = conn.execute(
+    cursor = await conn.execute(
         "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at, kind, reply_to) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
         (SESSION_ID, AGENT_ID, to_agent, body, now, kind, reply_to),
     )
     msg_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await conn.close()
     return json.dumps({"message_id": msg_id})
 
 
 @mcp.tool()
-def check_delivery(message_id: int) -> str:
+async def check_delivery(message_id: int) -> str:
     """Check the delivery status of a message.
 
     Args:
@@ -141,16 +121,17 @@ def check_delivery(message_id: int) -> str:
     Returns:
         JSON with the message status.
     """
-    conn = _get_db()
-    row = conn.execute("SELECT status FROM messages WHERE id = ?", (message_id,)).fetchone()
-    conn.close()
+    conn = await _get_db()
+    cursor = await conn.execute("SELECT status FROM messages WHERE id = ?", (message_id,))
+    row = await cursor.fetchone()
+    await conn.close()
     if row:
         return json.dumps({"message_id": message_id, "status": row[0]})
     return json.dumps({"message_id": message_id, "status": "not_found"})
 
 
 @mcp.tool()
-def launch_agent(
+async def launch_agent(
     agent_id: str,
     agent_name: str,
     harness: str,
@@ -171,8 +152,8 @@ def launch_agent(
     Returns:
         JSON with ok status and agent_id. Includes queued=true if at capacity.
     """
-    conn = _get_db()
-    _ensure_registered(conn)
+    conn = await _get_db()
+    await _ensure_registered(conn)
     now = int(time.time() * 1000)
     payload = json.dumps(
         {
@@ -184,19 +165,20 @@ def launch_agent(
             "message": message,
         }
     )
-    conn.execute(
+    await conn.execute(
         "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) VALUES (?, ?, 'launch', ?, 'pending', ?)",
         (SESSION_ID, AGENT_ID, payload, now),
     )
-    conn.commit()
+    await conn.commit()
 
     # Advisory pre-check: hint if at capacity
     max_agents = int(os.environ.get("SYNTH_MAX_AGENTS", "10"))
-    row = conn.execute(
+    cursor = await conn.execute(
         "SELECT COUNT(*) FROM agents WHERE session_id = ? AND status = 'active'",
         (SESSION_ID,),
-    ).fetchone()
-    conn.close()
+    )
+    row = await cursor.fetchone()
+    await conn.close()
     active = row[0] if row else 0
     if active >= max_agents:
         return json.dumps({"ok": True, "agent_id": agent_id, "queued": True})
@@ -204,7 +186,7 @@ def launch_agent(
 
 
 @mcp.tool()
-def terminate_agent(agent_id: str) -> str:
+async def terminate_agent(agent_id: str) -> str:
     """Request the broker to terminate an agent you launched.
 
     Args:
@@ -213,21 +195,21 @@ def terminate_agent(agent_id: str) -> str:
     Returns:
         JSON with ok status.
     """
-    conn = _get_db()
-    _ensure_registered(conn)
+    conn = await _get_db()
+    await _ensure_registered(conn)
     now = int(time.time() * 1000)
     payload = json.dumps({"agent_id": agent_id})
-    conn.execute(
+    await conn.execute(
         "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) VALUES (?, ?, 'terminate', ?, 'pending', ?)",
         (SESSION_ID, AGENT_ID, payload, now),
     )
-    conn.commit()
-    conn.close()
+    await conn.commit()
+    await conn.close()
     return json.dumps({"ok": True})
 
 
 @mcp.tool()
-def list_agents() -> str:
+async def list_agents() -> str:
     """List all agents in this session visible to you, plus yourself.
 
     Each entry includes is_self (true for your own entry), parent (who launched
@@ -236,18 +218,19 @@ def list_agents() -> str:
     Returns:
         JSON array of {agent_id, status, parent, task, is_self}.
     """
-    conn = _get_db()
-    _ensure_registered(conn)
-    visible = _get_visible_agents(conn)
+    conn = await _get_db()
+    await _ensure_registered(conn)
+    visible = await _get_visible_agents_async(DB_PATH)
     # Include self so the caller can see its own parent/task
     all_ids = [*visible, AGENT_ID]
-    rows = conn.execute(
+    cursor = await conn.execute(
         "SELECT agent_id, status, parent, task FROM agents WHERE session_id = ? AND agent_id IN ({})".format(
             ",".join("?" * len(all_ids))
         ),
         (SESSION_ID, *all_ids),
-    ).fetchall()
-    conn.close()
+    )
+    rows = await cursor.fetchall()
+    await conn.close()
     agents = [
         {
             "agent_id": r[0],
@@ -262,16 +245,16 @@ def list_agents() -> str:
 
 
 @mcp.tool()
-def deregister_agent() -> str:
+async def deregister_agent() -> str:
     """Mark this agent as inactive.
 
     Returns:
         Confirmation message.
     """
-    conn = _get_db()
-    conn.execute("UPDATE agents SET status = 'inactive' WHERE agent_id = ?", (AGENT_ID,))
-    conn.commit()
-    conn.close()
+    conn = await _get_db()
+    await conn.execute("UPDATE agents SET status = 'inactive' WHERE agent_id = ?", (AGENT_ID,))
+    await conn.commit()
+    await conn.close()
     return json.dumps({"status": "inactive", "agent_id": AGENT_ID})
 
 

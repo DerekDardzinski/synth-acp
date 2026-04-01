@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import re
 
 from rich.text import Text
 from textual import events, on
+from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.highlight import highlight
@@ -14,6 +16,8 @@ from textual.widgets import Button, Static, TextArea
 
 from synth_acp.models.commands import CancelTurn, SendPrompt
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
+
+log = logging.getLogger(__name__)
 
 # Matches @agent-id and @"agent id with spaces"
 RE_AGENT_MENTION = re.compile(r'(@\S+)|@"(.*?)"')
@@ -114,7 +118,7 @@ class InputBar(Vertical):
         self._agent_id = agent_id
         self._agent_name = agent_name
 
-    def compose(self):
+    def compose(self) -> ComposeResult:
         """Yield the text area and info bar."""
         yield PromptTextArea(id="prompt-input")
         with Horizontal(classes="info-bar"):
@@ -138,7 +142,8 @@ class InputBar(Vertical):
         from synth_acp.ui.app import SynthApp
 
         app = self.app
-        assert isinstance(app, SynthApp)
+        if not isinstance(app, SynthApp):
+                    return
         app.run_worker(app.broker.handle(CancelTurn(agent_id=self._agent_id)))
 
     def set_busy(self, busy: bool) -> None:
@@ -157,7 +162,8 @@ class InputBar(Vertical):
         from synth_acp.ui.app import SynthApp
 
         app = self.app
-        assert isinstance(app, SynthApp)
+        if not isinstance(app, SynthApp):
+                    return
 
         target = self._agent_id
         if text.startswith("@"):
@@ -190,4 +196,4 @@ class InputBar(Vertical):
             inp = self.query_one("#prompt-input", PromptTextArea)
             inp.disabled = disabled
         except Exception:
-            pass
+            log.debug("Input disable failed", exc_info=True)
