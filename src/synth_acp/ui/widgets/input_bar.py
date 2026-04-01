@@ -113,17 +113,20 @@ class InputBar(Vertical):
         color: Hex color for the agent prompt indicator.
     """
 
-    def __init__(self, agent_id: str, agent_name: str, **kwargs: object) -> None:
+    def __init__(self, agent_id: str, agent_name: str, project: str = "", **kwargs: object) -> None:
         super().__init__(classes="input-bar", **kwargs)
         self._agent_id = agent_id
         self._agent_name = agent_name
+        self._project = project
 
     def compose(self) -> ComposeResult:
         """Yield the text area and info bar."""
         yield PromptTextArea(id="prompt-input")
         with Horizontal(classes="info-bar"):
             yield Static(
-                f"[$primary]{self._agent_name}[/] · {self._agent_id}",
+                f"[dim]harness:[/] [$primary]{self._project}[/]"
+                f" · [dim]agent_name:[/] [$primary]{self._agent_name}[/]"
+                f" · [dim]agent_id:[/] {self._agent_id}",
                 classes="info-bar-left",
             )
             yield Button("Submit ⏎", id="submit-btn", classes="info-bar-right")

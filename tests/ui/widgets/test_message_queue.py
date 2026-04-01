@@ -72,23 +72,23 @@ class TestEventBufferDrain:
     async def test_event_buffer_when_panel_created_drains_and_clears(self) -> None:
         """First panel creation drains buffered events and clears the buffer."""
         broker = _make_broker()
-        config = _make_config("agent-1")
+        config = _make_config("agent-1", "agent-2")
         app = SynthApp(broker, config)
 
         async with app.run_test(headless=True, size=(120, 40)):
-            # Buffer events before panel exists
+            # Buffer events before panel exists (agent-2 has no panel yet)
             events = [
-                MessageChunkReceived(agent_id="agent-1", chunk="hello "),
-                MessageChunkReceived(agent_id="agent-1", chunk="world"),
-                TurnComplete(agent_id="agent-1", stop_reason="end_turn"),
+                MessageChunkReceived(agent_id="agent-2", chunk="hello "),
+                MessageChunkReceived(agent_id="agent-2", chunk="world"),
+                TurnComplete(agent_id="agent-2", stop_reason="end_turn"),
             ]
             for e in events:
-                app._event_buffers["agent-1"].append(e)
+                app._event_buffers["agent-2"].append(e)
 
-            await app.select_agent("agent-1")
+            await app.select_agent("agent-2")
 
-            assert app._event_buffers["agent-1"] == []
-            assert "agent-1" in app._panels
+            assert app._event_buffers["agent-2"] == []
+            assert "agent-2" in app._panels
 
     async def test_event_buffer_when_panel_exists_skips_buffer(self) -> None:
         """Events for agents with existing panels route directly, not buffered."""

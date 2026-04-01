@@ -100,21 +100,21 @@ class TestAgentStateChangedRouting:
             assert tile.has_class("tile-permission")
 
     async def test_on_broker_event_message_when_state_changed_buffers_event(self) -> None:
-        """AgentStateChanged events are buffered per agent."""
+        """AgentStateChanged events are buffered for agents without panels."""
         broker = _make_broker()
-        config = _make_config("agent-1")
+        config = _make_config("agent-1", "agent-2")
         app = SynthApp(broker, config)
 
         async with app.run_test(headless=True, size=(120, 40)):
             event = AgentStateChanged(
-                agent_id="agent-1",
+                agent_id="agent-2",
                 old_state=AgentState.IDLE,
                 new_state=AgentState.BUSY,
             )
             await app.on_broker_event_message(BrokerEventMessage(event))
 
-            assert len(app._event_buffers["agent-1"]) == 1
-            assert app._event_buffers["agent-1"][0] is event
+            assert len(app._event_buffers["agent-2"]) == 1
+            assert app._event_buffers["agent-2"][0] is event
 
 
 class TestAddAgentTile:

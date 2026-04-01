@@ -110,12 +110,14 @@ class SynthApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
-        """Launch all agents and start the broker event consumer."""
+        """Launch all agents, select the first, and start the broker event consumer."""
         self.theme = "catppuccin-mocha"
         for agent in self.config.agents:
             self._event_buffers[agent.id] = []
         for agent in self.config.agents:
             await self.broker.handle(LaunchAgent(agent_id=agent.id))
+        if self.config.agents:
+            await self.select_agent(self.config.agents[0].id)
         self.run_worker(self._consume_broker_events(), exit_on_error=False, name="broker-consumer")
 
     async def _consume_broker_events(self) -> None:
@@ -229,7 +231,7 @@ class SynthApp(App):
                 feed.input_bar.set_busy(True)
 
     def _mount_permission_bar(self, feed: ConversationFeed, event: PermissionRequested) -> None:
-        """Mount a PermissionBar above the InputBar in the feed.
+        """Mount a PermissionBar at the top of the InputBar.
 
         Args:
             feed: Target conversation feed.
@@ -237,7 +239,7 @@ class SynthApp(App):
         """
         bar = PermissionBar(event.agent_id, event.title, event.options)
         if feed.input_bar is not None:
-            feed.mount(bar, before=feed.input_bar)
+            feed.input_bar.mount(bar, before=0)
         else:
             feed.mount(bar)
 
@@ -352,7 +354,7 @@ class SynthApp(App):
         if agent_id not in self._panels:
             agent_cfg = next((a for a in self.config.agents if a.id == agent_id), None)
             agent_name = agent_cfg.display_name if agent_cfg else agent_id
-            feed = ConversationFeed(agent_id, agent_name, id=f"feed-{agent_id}")
+            feed = ConversationFeed(agent_id, agent_name, self.config.project, id=f"feed-{agent_id}")
             self._panels[agent_id] = feed
             await self.query_one("#right").mount(feed)
             for event in self._event_buffers.get(agent_id, []):
@@ -394,15 +396,22 @@ class SynthApp(App):
         self._update_input_bar_state(agent_id, self._agent_states.get(agent_id, AgentState.IDLE))
 
     async def show_messages(self) -> None:
-        """Switch the right panel to the MCP messages view."""
+        """Toggle the MCP messages view. Close it if already active."""
+        switcher = self.query_one("#right", ContentSwitcher)
+
+        if switcher.current == "messages":
+            # Close messages panel — return to selected agent
+            if self.selected_agent:
+                switcher.current = f"feed-{self.selected_agent}"
+                self.watch_selected_agent(self.selected_agent)
+            return
+
         for tile in self.query(AgentTile):
             tile.remove_class("tile-active")
         try:
             self.query_one("#mcp-btn", MCPButton).add_class("btn-active")
         except Exception:
             log.debug("MCP button select failed", exc_info=True)
-
-        switcher = self.query_one("#right", ContentSwitcher)
 
         if self._mcp_panel is None:
             panel = MessageQueue(self._mcp_threads, id="messages")

@@ -7,7 +7,7 @@ from typing import Any
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
-from textual.widgets import Collapsible, Static
+from textual.widgets import Static
 
 from synth_acp.models.events import McpMessageDelivered
 
@@ -53,28 +53,16 @@ class ThreadDetail(Vertical):
 
         scroll = self.query_one("#thread-detail-scroll", ScrollableContainer)
         scroll.remove_children()
-        prev_from: str | None = None
         for msg in messages:
             ts = msg.timestamp.strftime("%H:%M")
-            if msg.from_agent != prev_from:
-                scroll.mount(
-                    Static(
-                        f"[$primary bold]● {msg.from_agent}[/] [dim]→ {msg.to_agent}   {ts}[/dim]",
-                        classes="tmsg-from",
-                    )
+            escaped = msg.preview.replace("[", r"\[") if msg.preview else ""
+            body = escaped or "[dim]delivered[/dim]"
+            scroll.mount(
+                Static(
+                    f"{body}\n[dim]◈ {msg.from_agent} → {msg.to_agent}  {ts}[/dim]",
+                    classes="mcp-msg",
                 )
-            prev_from = msg.from_agent
-            preview = msg.preview[:80] + "…" if len(msg.preview) > 80 else msg.preview
-            if preview:
-                scroll.mount(
-                    Collapsible(
-                        Static(msg.preview, classes="tmsg-body"),
-                        title=preview,
-                        collapsed=True,
-                    )
-                )
-            else:
-                scroll.mount(Static("[dim]delivered[/dim]", classes="tmsg-body"))
+            )
 
 
 class ThreadItem(Static):

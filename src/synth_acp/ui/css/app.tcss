@@ -125,10 +125,20 @@ ConversationFeed {
     hatch: right $panel 60%;
 }
 
+/* ── Turn container ── */
+.turn-container {
+    height: auto;
+    width: 1fr;
+    margin: 1 3;
+    padding: 0 0 1 0;
+}
+.turn-container > * {
+    margin: 1 0 0 0;
+}
+
 /* ── Message widgets ── */
 PromptBubble {
     height: auto;
-    margin: 1 3;
     background: $background;
     border-left: wide $primary;
     padding: 0 1;
@@ -137,7 +147,6 @@ PromptBubble {
 
 AgentMessage {
     height: auto;
-    margin: 1 3;
     background: $background;
     border-left: wide $success;
     padding: 0 1;
@@ -146,7 +155,6 @@ AgentMessage {
 
 ThoughtBlock {
     height: auto;
-    margin: 1 3;
     border-left: wide $surface-lighten-2;
     padding: 0 1;
     color: $text-muted;
@@ -154,7 +162,6 @@ ThoughtBlock {
 
 ToolCallBlock {
     height: auto;
-    margin: 0 3;
     background: $background;
     border-left: wide $accent;
     padding: 0 1;
@@ -187,7 +194,7 @@ DiffCode { width: 1fr; height: auto; }
     background: transparent;
     border-top: tall $warning;
     padding: 0 1;
-    margin: 1 3;
+    margin: 0 3;
 }
 #perm-bar:blur {
     #index { opacity: 0.3; }
@@ -301,21 +308,31 @@ LaunchButton:hover {
     width: 34;
     border-right: tall $surface;
     overflow-y: auto;
+    padding: 0 1;
     scrollbar-size-vertical: 1;
     scrollbar-color: $scrollbar;
     scrollbar-background: transparent;
+    hatch: left $panel 60%;
 }
 .thread-item {
     height: auto;
-    padding: 0 1;
-    margin: 0 1;
-    border: round $surface-lighten-1;
+    padding: 0 1 1 1;
+    margin: 1 0 0 0;
+    background: $background-lighten-1;
+    border-top: tall $accent;
     transition: border 0.15s in_out_cubic;
+    transition: background 0.15s in_out_cubic;
 }
-.thread-item:hover { border: round $surface-lighten-3; }
-.thread-item.thread-active { border: round $border; background: $background; }
-.thread-item.thread-pending { border: round $warning; }
-.thread-item.thread-pending.thread-active { border: round $warning; }
+.thread-item:hover {
+    border-top: tall $accent-lighten-2;
+    background: $background-lighten-1;
+}
+.thread-item.thread-active {
+    background: $background-lighten-1;
+    border-top: tall $accent;
+}
+.thread-item.thread-pending { border-top: tall $warning; }
+.thread-item.thread-pending.thread-active { border-top: tall $warning; }
 
 /* ── Thread detail ── */
 ThreadDetailHeader {
@@ -342,14 +359,8 @@ ThreadDetail {
     scrollbar-background: transparent;
     hatch: right $panel 60%;
 }
-.tmsg-from { height: auto; color: $text-muted; }
-.tmsg-body {
-    height: auto;
-    padding: 0 1;
-    background: $background;
-    border: round $surface-lighten-1;
-    margin-bottom: 1;
-    color: $text-muted;
+#thread-detail-scroll .mcp-msg {
+    margin: 1 0 0 0;
 }
 
 Footer { background: $background; color: $text-muted; }
@@ -388,7 +399,6 @@ LaunchAgentScreen, HelpScreen {
 /* ── MCP message notification in conversation ── */
 .mcp-msg {
     height: auto;
-    margin: 1 3;
     background: $background;
     border-left: wide $warning;
     padding: 0 1;
