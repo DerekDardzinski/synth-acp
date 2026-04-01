@@ -166,13 +166,13 @@ class ConversationFeed(Vertical):
             to_agent: Recipient agent ID.
             preview: Message preview text.
         """
-        snippet = preview[:80] + "…" if len(preview) > 80 else preview
         ts = datetime.now(UTC).strftime("%H:%M")
+        escaped = preview.replace("[", r"\[")
         widget = Static(
-            f"[dim]◈ {from_agent} → {to_agent}  {ts}[/dim]\n  [dim]{snippet}[/dim]",
+            f"{escaped}\n[dim]◈ {from_agent} → {to_agent}  {ts}[/dim]",
             classes="mcp-msg",
         )
         if self._scroll is None:
             return
-        self._scroll.mount(widget)
+        self._scroll.mount(widget, before=self._current_message)
         self._scroll.scroll_end(animate=False)

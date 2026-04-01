@@ -639,7 +639,6 @@ class ACPBroker:
         if not session or session.state != AgentState.IDLE:
             return False
         try:
-            await session.prompt(text)
             for sender in from_agents:
                 await self._event_queue.put(
                     McpMessageDelivered(
@@ -649,6 +648,7 @@ class ACPBroker:
                         preview=text,
                     )
                 )
+            await session.prompt(text)
             return True
         except Exception:
             return False
