@@ -70,11 +70,12 @@ synth (single process: broker + TUI)
 │  SynthApp (Textual) ◄─────────────────────┘    │
 │    ├── AgentList (sidebar)                       │
 │    ├── ConversationFeed (per agent, lazy)        │
-│    │     ├── PromptBubble                        │
-│    │     ├── AgentMessage (MarkdownStream)       │
-│    │     ├── ThoughtBlock (Collapsible)          │
-│    │     ├── ToolCallBlock                       │
-│    │     └── PermissionRequest                   │
+│    │     ├── TurnContainer (groups one turn)     │
+│    │     │     ├── PromptBubble                  │
+│    │     │     ├── AgentMessage (MarkdownStream)  │
+│    │     │     ├── ThoughtBlock (Collapsible)     │
+│    │     │     └── ToolCallBlock                  │
+│    │     └── PermissionRequest (in InputBar)      │
 │    ├── MessageQueue                              │
 │    └── InputBar                                  │
 │                                                  │
@@ -680,15 +681,16 @@ Theme: `catppuccin-mocha`. All styles in external `ui/css/app.tcss`. Only Textua
 ### 9.3 Widget Hierarchy
 
 - `AgentList` — sidebar (32 chars). `AgentTile` per agent, `LaunchButton`, `MCPButton`. Each tile shows a colored status dot and state-specific text (initializing…, idle, working…, awaiting permission…, terminated). Dynamically launched agents get tiles added at runtime via `add_agent_tile()` with the next palette color. Tile preview shows `task` if available, or `via {parent}` for dynamic agents.
-- `ConversationFeed` — scrollable container, one per agent (lazy-created, stays alive):
+- `ConversationFeed` — scrollable container, one per agent (lazy-created, stays alive). First agent auto-selected on startup:
+  - `TurnContainer` — groups all widgets belonging to a single turn (prompt/MCP message → thoughts → messages → tool calls). Created on `add_prompt()` or `add_mcp_message()`, closed on `finalize_current_message()`. Lazily created for replay path.
   - `LoadingIndicator` — shown during `INITIALIZING`, removed on `IDLE`, re-mounted on re-launch
-  - `PromptBubble` — right-aligned, `$primary` border
-  - `ThoughtBlock` — `Collapsible` wrapping `MarkdownStream`, collapsed when finalized
-  - `AgentMessage` — extends `Markdown`, uses `MarkdownStream` for incremental rendering
-  - `ToolCallBlock` — kind icon + color, title, status badge
-  - `PermissionRequest` — yellow border, 4 `Button` widgets
-- `MessageQueue` — thread list + detail, grouped by sorted agent pairs
-- `InputBar` — `Input` widget, disabled when BUSY/AWAITING_PERMISSION, `@agent-id` routing
+  - `PromptBubble` — right-aligned, `$primary` border (inside TurnContainer)
+  - `ThoughtBlock` — `Collapsible` wrapping `MarkdownStream`, collapsed when finalized (inside TurnContainer)
+  - `AgentMessage` — extends `Markdown`, uses `MarkdownStream` for incremental rendering (inside TurnContainer)
+  - `ToolCallBlock` — kind icon + color, title, status badge (inside TurnContainer)
+  - `PermissionBar` — mounted inside `InputBar` (position 0) so it visually extends from the input area
+- `MessageQueue` — thread list + detail, grouped by sorted agent pairs. Thread list styled to match agent tiles (top border, hatching). Thread detail renders messages as `.mcp-msg` widgets matching conversation panel format. MCP Messages button toggles (close on second click).
+- `InputBar` — `Input` widget, disabled when BUSY/AWAITING_PERMISSION, `@agent-id` routing. Info bar shows `harness: {project} · agent_name: {display_name} · agent_id: {id}`.
 
 ### 9.4 Streaming Markdown
 
@@ -711,7 +713,8 @@ class AgentMessage(Markdown):
 Panels are created lazily on first selection with event buffering:
 
 - The app maintains `dict[str, list[BrokerEvent]]` per agent from broker start
-- On first selection: panel is created, drains buffer, renders backlog
+- The first configured agent is auto-selected on mount, creating its panel immediately
+- On first selection of other agents: panel is created, drains buffer, renders backlog
 - Once created: panel stays in DOM, switching via `ContentSwitcher(id="right")` — `switcher.current = f"feed-{agent_id}"` or `"messages"`
 - After creation: events flow directly to the mounted panel
 
@@ -994,6 +997,14 @@ ACP-6, ACP-8, ACP-9, ACP-10, ACP-1d, ACP-1e, Textual-7, Textual-8, Textual-9, Te
 ---
 
 ## Changelog
+
+### v0.5.1 (2026-04-01)
+- **TurnContainer:** New `TurnContainer(Vertical)` groups all widgets in a single conversational turn (prompt → thoughts → messages → tool calls). MCP messages also start new turn containers since they trigger full agent turns via `session.prompt`.
+- **PermissionBar in InputBar:** `PermissionBar` now mounts inside `InputBar` at position 0, visually extending from the input area instead of floating between scroll and input.
+- **MCP panel styling:** Thread list matches agent tiles (top border, hatching). Thread detail renders messages as `.mcp-msg` widgets matching conversation panel format. Removed `Collapsible`-based rendering and `tmsg-from`/`tmsg-body` CSS classes.
+- **MCP Messages toggle:** Button now toggles — clicking when messages panel is active returns to the previously selected agent.
+- **Auto-select first agent:** First configured agent is selected on startup, creating its panel immediately.
+- **InputBar info line:** Shows `harness: {project} · agent_name: {display_name} · agent_id: {id}`.
 
 ### v0.5 (2026-04-01)
 - **Schema consolidation:** Extracted duplicated SQLite schema from broker, poller, and MCP server into `src/synth_acp/db.py` with `ensure_schema_sync()` and `ensure_schema_async()` helpers.
