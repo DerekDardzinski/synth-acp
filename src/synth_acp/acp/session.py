@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import asyncio.subprocess as aio_subprocess
 import contextlib
 import logging
 import os
 import signal
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
+from acp.client.connection import ClientSideConnection
 from acp.schema import (
     AllowedOutcome,
     ClientCapabilities,
@@ -21,8 +24,9 @@ from acp.schema import (
     RequestPermissionResponse,
     ToolCallUpdate,
 )
+from acp.transports import default_environment
 
-from acp import spawn_agent_process, text_block
+from acp import text_block
 from synth_acp.models.agent import TRANSITIONS, AgentState, InvalidTransitionError
 from synth_acp.models.events import (
     AgentStateChanged,
@@ -85,6 +89,61 @@ def _extract_tool_call_content(update: Any) -> dict[str, Any]:
     }
 
 
+_SHUTDOWN_TIMEOUT = 2.0
+
+
+@asynccontextmanager
+async def _spawn_isolated_agent(
+    client: Any,
+    command: str,
+    *args: str,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> AsyncIterator[tuple[ClientSideConnection, aio_subprocess.Process]]:
+    """Spawn an ACP agent in its own process group.
+
+    Uses ``process_group=0`` so the child calls ``setpgid(0, 0)`` before
+    exec — no race with the parent.  This lets ``os.killpg`` safely
+    terminate the agent and all its children (e.g. synth-mcp) without
+    hitting the synth parent process.
+    """
+    merged_env = dict(default_environment())
+    if env:
+        merged_env.update(env)
+
+    process = await asyncio.create_subprocess_exec(
+        command,
+        *args,
+        stdin=aio_subprocess.PIPE,
+        stdout=aio_subprocess.PIPE,
+        stderr=aio_subprocess.PIPE,
+        env=merged_env,
+        cwd=cwd,
+        process_group=0,
+    )
+    assert process.stdout and process.stdin
+
+    conn = ClientSideConnection(client, process.stdin, process.stdout)
+    try:
+        yield conn, process
+    finally:
+        await conn.close()
+        # Graceful stdin close, then escalate.
+        if process.stdin and not process.stdin.is_closing():
+            process.stdin.close()
+            with contextlib.suppress(Exception):
+                await process.stdin.wait_closed()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
+        except TimeoutError:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+
+
 class ACPSession:
     """Wraps one ACP agent subprocess.
 
@@ -128,19 +187,11 @@ class ACPSession:
         """Main lifecycle — spawns agent, handshakes, waits for exit."""
         try:
             await self._set_state(AgentState.INITIALIZING)
-            async with spawn_agent_process(self, self._binary, *self._args, cwd=self._cwd) as (
-                conn,
-                proc,
-            ):
+            async with _spawn_isolated_agent(
+                self, self._binary, *self._args, cwd=self._cwd
+            ) as (conn, proc):
                 self._conn = conn
                 self._proc = proc
-
-                # Put agent in its own process group so grandchildren (synth-mcp)
-                # inherit the group and can be killed together.
-                try:
-                    os.setpgid(proc.pid, proc.pid)
-                except OSError:
-                    pass
 
                 init_response = await conn.initialize(
                     protocol_version=1,
@@ -157,6 +208,7 @@ class ACPSession:
                 await proc.wait()
         except Exception as e:
             await self._event_sink(BrokerError(agent_id=self.agent_id, message=f"Agent error: {e}"))
+
         finally:
             if self._permission_future and not self._permission_future.done():
                 self._permission_future.cancel()
@@ -190,23 +242,25 @@ class ACPSession:
     async def terminate(self) -> None:
         """Terminate the agent and all its children via process group kill.
 
-        Sends SIGTERM to the entire process group, waits up to 2 seconds,
-        then escalates to SIGKILL if processes remain.
+        Sends SIGTERM to the agent's process group, waits up to 2 seconds,
+        then escalates to SIGKILL.  Safe because _spawn_isolated_agent
+        creates each agent in its own process group (process_group=0).
         """
         if self._permission_future and not self._permission_future.done():
             self._permission_future.cancel()
-        if self._proc is not None:
+        if self._proc is None:
+            return
+        try:
+            pgid = os.getpgid(self._proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
             try:
-                pgid = os.getpgid(self._proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-                try:
-                    await asyncio.wait_for(self._proc.wait(), timeout=2.0)
-                except TimeoutError:
-                    with contextlib.suppress(OSError):
-                        os.killpg(pgid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
+                await asyncio.wait_for(self._proc.wait(), timeout=_SHUTDOWN_TIMEOUT)
+            except TimeoutError:
                 with contextlib.suppress(OSError):
-                    self._proc.terminate()
+                    os.killpg(pgid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            with contextlib.suppress(OSError):
+                self._proc.terminate()
 
     # --- ACP Client callbacks (called by SDK) ---
     # ARG002 suppressed: these signatures are required by the acp.interfaces.Client protocol.
