@@ -12,9 +12,11 @@ from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.highlight import highlight
 from textual.message import Message
-from textual.widgets import Button, Static, TextArea
+from textual.widgets import Button, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 
-from synth_acp.models.commands import CancelTurn, SendPrompt
+from synth_acp.models.agent import AgentMode, AgentModel
+from synth_acp.models.commands import CancelTurn, SendPrompt, SetAgentMode, SetAgentModel
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
 
 log = logging.getLogger(__name__)
@@ -104,34 +106,176 @@ class PromptTextArea(TextArea):
             super().__init__()
 
 
+class _PickerPopup(OptionList):
+    """OptionList popup that notifies its owning InputBar on selection."""
+
+    def __init__(self, picker_id: str, input_bar: InputBar, *options: Option, **kwargs: object) -> None:
+        super().__init__(*options, **kwargs)
+        self._picker_id = picker_id
+        self._input_bar = input_bar
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.remove()
+        if event.option_id:
+            self._input_bar._on_picker_selected(self._picker_id, event.option_id)
+
+    def on_blur(self) -> None:
+        """Dismiss when focus leaves the popup."""
+        self.remove()
+
+
+class _PickerLabel(Static):
+    """Clickable label that opens an OptionList popup for selection."""
+
+    def __init__(self, prefix: str, **kwargs: object) -> None:
+        super().__init__("", **kwargs)
+        self._prefix = prefix
+        self._items: list[tuple[str, str]] = []  # (id, display_name)
+        self._current_id: str | None = None
+
+    def set_items(self, items: list[tuple[str, str]], current_id: str | None) -> None:
+        """Replace the option list and set the active item."""
+        self._items = items
+        self._current_id = current_id
+        self._refresh_label()
+
+    def set_current(self, current_id: str) -> None:
+        """Update the active item without replacing the list."""
+        self._current_id = current_id
+        self._refresh_label()
+
+    def _refresh_label(self) -> None:
+        if not self._items or self._current_id is None:
+            self.display = False
+            return
+        self.display = True
+        name = next((n for vid, n in self._items if vid == self._current_id), self._current_id)
+        self.update(f"[dim]{self._prefix}:[/] [$accent]{name}[/] [dim]▾[/]")
+
+    def on_click(self) -> None:
+        """Toggle the popup OptionList on the screen."""
+        popup_id = f"{self.id}-popup"
+        try:
+            existing = self.screen.query_one(f"#{popup_id}")
+            existing.remove()
+            return
+        except Exception:
+            pass
+
+        if len(self._items) < 2:
+            return
+
+        # Walk up to find the InputBar
+        input_bar: InputBar | None = None
+        for ancestor in self.ancestors_with_self:
+            if isinstance(ancestor, InputBar):
+                input_bar = ancestor
+                break
+        if not input_bar:
+            return
+
+        options = [Option(name, id=vid) for vid, name in self._items]
+        popup = _PickerPopup(self.id, input_bar, *options, id=popup_id)
+        self.screen.mount(popup)
+        popup.focus()
+
+
 class InputBar(Vertical):
     """Bottom input bar for sending prompts to agents.
 
     Args:
         agent_id: Default target agent.
         agent_name: Display name for the agent.
-        color: Hex color for the agent prompt indicator.
+        harness: Harness name for display.
     """
 
-    def __init__(self, agent_id: str, agent_name: str, project: str = "", **kwargs: object) -> None:
+    def __init__(self, agent_id: str, agent_name: str, harness: str = "", **kwargs: object) -> None:
         super().__init__(classes="input-bar", **kwargs)
         self._agent_id = agent_id
         self._agent_name = agent_name
-        self._project = project
+        self._harness = harness
 
     def compose(self) -> ComposeResult:
         """Yield the text area and info bar."""
         yield PromptTextArea(id="prompt-input")
         with Horizontal(classes="info-bar"):
             yield Static(
-                f"[dim]harness:[/] [$primary]{self._project}[/]"
-                f" · [dim]agent_name:[/] [$primary]{self._agent_name}[/]"
-                f" · [dim]agent_id:[/] {self._agent_id}",
+                self._build_info_label(),
+                id="info-label",
                 classes="info-bar-left",
             )
+            yield _PickerLabel("mode", id="mode-picker", classes="info-bar-picker")
+            yield _PickerLabel("model", id="model-picker", classes="info-bar-picker")
             yield Button("Submit ⏎", id="submit-btn", classes="info-bar-right")
             yield Button("Cancel ■", id="cancel-btn", classes="info-bar-right cancel-btn")
         yield ActivityBar(classes="input-activity")
+
+    def _build_info_label(self) -> str:
+        """Build the static info label text."""
+        return (
+            f"[dim]agent:[/] [$primary]{self._agent_id}[/]"
+            f" · [dim]harness:[/] {self._harness}"
+        )
+
+    # --- Mode / model updates ---
+
+    def update_mode_info(self, modes: list[AgentMode], current_id: str | None) -> None:
+        """Push available modes and current selection to the picker."""
+        try:
+            picker = self.query_one("#mode-picker", _PickerLabel)
+            picker.set_items([(m.id, m.name) for m in modes], current_id)
+        except Exception:
+            log.debug("Mode picker update failed", exc_info=True)
+
+    def update_model_info(self, models: list[AgentModel], current_id: str | None) -> None:
+        """Push available models and current selection to the picker."""
+        try:
+            picker = self.query_one("#model-picker", _PickerLabel)
+            picker.set_items([(m.id, m.name) for m in models], current_id)
+        except Exception:
+            log.debug("Model picker update failed", exc_info=True)
+
+    def update_current_mode(self, mode_id: str) -> None:
+        """Update just the active mode without replacing the list."""
+        try:
+            self.query_one("#mode-picker", _PickerLabel).set_current(mode_id)
+        except Exception:
+            log.debug("Mode picker current update failed", exc_info=True)
+
+    def update_current_model(self, model_id: str) -> None:
+        """Update just the active model without replacing the list."""
+        try:
+            self.query_one("#model-picker", _PickerLabel).set_current(model_id)
+        except Exception:
+            log.debug("Model picker current update failed", exc_info=True)
+
+    # --- Picker selection handler ---
+
+    def _on_picker_selected(self, picker_id: str, option_id: str) -> None:
+        """Called by _PickerPopup when the user selects an option."""
+        # Update the label
+        try:
+            picker = self.query_one(f"#{picker_id}", _PickerLabel)
+            picker.set_current(option_id)
+        except Exception:
+            pass
+        # Forward to broker
+        from synth_acp.ui.app import SynthApp
+
+        app = self.app
+        if not isinstance(app, SynthApp):
+            return
+        if picker_id == "mode-picker":
+            app.run_worker(
+                app.broker.handle(SetAgentMode(agent_id=self._agent_id, mode_id=option_id))
+            )
+        elif picker_id == "model-picker":
+            app.run_worker(
+                app.broker.handle(SetAgentModel(agent_id=self._agent_id, model_id=option_id))
+            )
+
+    # --- Existing functionality ---
 
     @on(Button.Pressed, "#submit-btn")
     def _on_submit_click(self, event: Button.Pressed) -> None:

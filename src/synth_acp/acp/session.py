@@ -17,7 +17,7 @@ from acp.schema import (
     AllowedOutcome,
     ClientCapabilities,
     DeniedOutcome,
-    FileSystemCapability,
+    FileSystemCapabilities,
     Implementation,
     McpServerStdio,
     PermissionOption,
@@ -189,6 +189,8 @@ class ACPSession:
         self._current_mode_id: str | None = None
         self._available_models: list[AgentModel] = []
         self._current_model_id: str | None = None
+        self._model_probe_task: asyncio.Task[None] | None = None
+        self._mode_model_cache: dict[str, str] = {}
 
     async def _set_state(self, new_state: AgentState) -> None:
         """Transition state and notify broker. Awaited to prevent races."""
@@ -213,7 +215,7 @@ class ACPSession:
                 init_response = await conn.initialize(
                     protocol_version=1,
                     client_capabilities=ClientCapabilities(
-                        fs=FileSystemCapability(read_text_file=False, write_text_file=False),
+                        fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
                         terminal=False,
                     ),
                     client_info=Implementation(name="synth", version="0.1.0"),
@@ -264,7 +266,35 @@ class ACPSession:
                 if self._agent_mode is not None:
                     mode_ids = {m.id for m in self._available_modes}
                     if self._agent_mode in mode_ids:
-                        await self.set_mode(self._agent_mode)
+                        await conn.set_session_mode(
+                            mode_id=self._agent_mode, session_id=self._session_id
+                        )
+                        self._current_mode_id = self._agent_mode
+                        await self._event_sink(
+                            AgentModeChanged(
+                                agent_id=self.agent_id, mode_id=self._agent_mode
+                            )
+                        )
+                        # Re-read model state — mode switch may change the model.
+                        # Safe to load_session here because no conversation history
+                        # exists yet.
+                        try:
+                            loaded = await conn.load_session(
+                                session_id=self._session_id, cwd=self._cwd
+                            )
+                            if loaded.models is not None:
+                                new_model = loaded.models.current_model_id
+                                if new_model:
+                                    self._mode_model_cache[self._agent_mode] = new_model
+                                    if new_model != self._current_model_id:
+                                        self._current_model_id = new_model
+                                        await self._event_sink(
+                                            AgentModelChanged(
+                                                agent_id=self.agent_id, model_id=new_model
+                                            )
+                                        )
+                        except Exception:
+                            log.debug("Model re-read after initial mode switch failed", exc_info=True)
                     else:
                         log.warning(
                             "agent_mode '%s' not in available_modes for %s — skipping",
@@ -306,12 +336,57 @@ class ACPSession:
         """Switch the agent's mode."""
         if self._conn and self._session_id and self.state == AgentState.IDLE:
             await self._conn.set_session_mode(mode_id=mode_id, session_id=self._session_id)
+            self._current_mode_id = mode_id
+            await self._event_sink(
+                AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id)
+            )
+            # Probe for model change in background
+            self._model_probe_task = asyncio.create_task(
+                self._probe_model_after_mode_switch(mode_id)
+            )
+
+    async def _probe_model_after_mode_switch(self, mode_id: str) -> None:
+        """Discover the default model for a mode and emit AgentModelChanged.
+
+        Uses a per-session cache so each mode is only probed once.  On
+        cache hit the update is instant; on miss a throwaway session is
+        created (~3-4 s) in the background.
+        """
+        # Fast path: already probed this mode
+        cached = self._mode_model_cache.get(mode_id)
+        if cached is not None:
+            if cached != self._current_model_id:
+                self._current_model_id = cached
+                await self._event_sink(
+                    AgentModelChanged(agent_id=self.agent_id, model_id=cached)
+                )
+            return
+
+        # Slow path: throwaway session probe
+        try:
+            probe = await self._conn.new_session(cwd=self._cwd)
+            await self._conn.set_session_mode(mode_id=mode_id, session_id=probe.session_id)
+            loaded = await self._conn.load_session(session_id=probe.session_id, cwd=self._cwd)
+            if loaded.models is not None:
+                new_model_id = loaded.models.current_model_id
+                if new_model_id:
+                    self._mode_model_cache[mode_id] = new_model_id
+                    if new_model_id != self._current_model_id:
+                        self._current_model_id = new_model_id
+                        await self._event_sink(
+                            AgentModelChanged(agent_id=self.agent_id, model_id=new_model_id)
+                        )
+        except Exception:
+            log.debug("Model probe after mode switch failed for %s", self.agent_id, exc_info=True)
 
     async def set_model(self, model_id: str) -> None:
         """Switch the agent's model."""
         if self._conn and self._session_id and self.state == AgentState.IDLE:
             await self._conn.set_session_model(model_id=model_id, session_id=self._session_id)
             self._current_model_id = model_id
+            # Invalidate cache — user override takes precedence over mode default
+            if self._current_mode_id:
+                self._mode_model_cache[self._current_mode_id] = model_id
             await self._event_sink(
                 AgentModelChanged(agent_id=self.agent_id, model_id=model_id)
             )

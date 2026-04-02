@@ -39,6 +39,7 @@ from synth_acp.ui.screens.launch import LaunchAgentScreen
 from synth_acp.ui.screens.permission import PermissionBar
 from synth_acp.ui.widgets.agent_list import AgentList, AgentTile, MCPButton
 from synth_acp.ui.widgets.conversation import ConversationFeed
+from synth_acp.ui.widgets.input_bar import InputBar
 from synth_acp.ui.widgets.message_queue import MessageQueue
 
 _DISABLED_STATES = {AgentState.BUSY, AgentState.AWAITING_PERMISSION}
@@ -197,17 +198,21 @@ class SynthApp(App):
             self._agent_modes[event.agent_id] = event.available_modes
             self._agent_current_mode[event.agent_id] = event.current_mode_id
             self._update_tile_mode(event.agent_id)
+            self._update_input_bar_modes(event.agent_id)
 
         if isinstance(event, AgentModeChanged):
             self._agent_current_mode[event.agent_id] = event.mode_id
             self._update_tile_mode(event.agent_id)
+            self._update_input_bar_current_mode(event.agent_id)
 
         if isinstance(event, AgentModelsReceived):
             self._agent_models[event.agent_id] = event.available_models
             self._agent_current_model[event.agent_id] = event.current_model_id
+            self._update_input_bar_models(event.agent_id)
 
         if isinstance(event, AgentModelChanged):
             self._agent_current_model[event.agent_id] = event.model_id
+            self._update_input_bar_current_model(event.agent_id)
 
         # Route to the agent's panel if it exists (regardless of selection)
         if event.agent_id in self._panels:
@@ -345,6 +350,43 @@ class SynthApp(App):
         except Exception:
             log.debug("Agent tile not found for mode update: %s", agent_id, exc_info=True)
 
+    def _get_input_bar(self, agent_id: str) -> InputBar | None:
+        """Return the InputBar for an agent, or None."""
+        feed = self._panels.get(agent_id)
+        return feed.input_bar if feed else None
+
+    def _update_input_bar_modes(self, agent_id: str) -> None:
+        """Push full mode list to the agent's input bar."""
+        bar = self._get_input_bar(agent_id)
+        if bar:
+            bar.update_mode_info(
+                self._agent_modes.get(agent_id, []),
+                self._agent_current_mode.get(agent_id),
+            )
+
+    def _update_input_bar_current_mode(self, agent_id: str) -> None:
+        """Push just the current mode id to the agent's input bar."""
+        bar = self._get_input_bar(agent_id)
+        mid = self._agent_current_mode.get(agent_id)
+        if bar and mid:
+            bar.update_current_mode(mid)
+
+    def _update_input_bar_models(self, agent_id: str) -> None:
+        """Push full model list to the agent's input bar."""
+        bar = self._get_input_bar(agent_id)
+        if bar:
+            bar.update_model_info(
+                self._agent_models.get(agent_id, []),
+                self._agent_current_model.get(agent_id),
+            )
+
+    def _update_input_bar_current_model(self, agent_id: str) -> None:
+        """Push just the current model id to the agent's input bar."""
+        bar = self._get_input_bar(agent_id)
+        mid = self._agent_current_model.get(agent_id)
+        if bar and mid:
+            bar.update_current_model(mid)
+
     def _update_usage_display(self, event: UsageUpdated) -> None:
         """Update the topbar usage display for the selected agent.
 
@@ -393,7 +435,8 @@ class SynthApp(App):
         if agent_id not in self._panels:
             agent_cfg = next((a for a in self.config.agents if a.agent_id == agent_id), None)
             agent_name = agent_cfg.display_name if agent_cfg else agent_id
-            feed = ConversationFeed(agent_id, agent_name, self.config.project, id=f"feed-{agent_id}")
+            harness = agent_cfg.harness if agent_cfg else ""
+            feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, id=f"feed-{agent_id}")
             self._panels[agent_id] = feed
             await self.query_one("#right").mount(feed)
             for event in self._event_buffers.get(agent_id, []):
@@ -404,6 +447,9 @@ class SynthApp(App):
             if state not in {AgentState.INITIALIZING, AgentState.BUSY}:
                 if feed.input_bar is not None:
                     feed.input_bar.set_busy(False)
+            # Push any mode/model data that arrived before the panel existed
+            self._update_input_bar_modes(agent_id)
+            self._update_input_bar_models(agent_id)
 
         self.selected_agent = agent_id
 

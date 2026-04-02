@@ -265,6 +265,28 @@ PromptTextArea {
     width: 1fr;
     content-align: left middle;
 }
+.info-bar-picker {
+    width: auto;
+    padding: 0 1;
+    color: $text-muted;
+    content-align: left middle;
+}
+.info-bar-picker:hover {
+    color: $foreground;
+}
+#mode-picker-popup, #model-picker-popup {
+    dock: bottom;
+    width: 40;
+    max-height: 16;
+    margin: 0 0 6 0;
+    background: $surface;
+    border: round $accent;
+    padding: 0;
+    layer: overlay;
+}
+#mode-picker-popup:focus, #model-picker-popup:focus {
+    border: round $primary;
+}
 .info-bar-right {
     width: auto;
     min-width: 0;
