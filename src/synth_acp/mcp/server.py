@@ -55,16 +55,22 @@ async def _get_visible_agents_async(db_path: str) -> list[str]:
 
 @mcp.tool()
 async def send_message(to_agent: str, body: str, kind: str = "chat", reply_to: int | None = None) -> str:
-    """Send a message to another agent, or '*' to broadcast to all active agents.
+    """Send a message to another agent. Call list_agents first to discover valid agent IDs.
+
+    Use '*' as to_agent to broadcast to all visible agents. Messages are
+    asynchronous — the recipient processes them on their next poll cycle.
+    Use check_delivery to confirm receipt.
 
     Args:
-        to_agent: Target agent ID, or '*' for broadcast.
-        body: Message body text.
-        kind: Message kind: chat, system, request, or response.
-        reply_to: Optional message ID this is replying to.
+        to_agent: Agent ID from list_agents, or '*' to broadcast.
+        body: Message content. Be specific — the recipient has no shared context with you.
+        kind: 'chat' for conversation (default), 'request' to ask for work,
+            'response' to answer a request, 'system' for coordination signals.
+        reply_to: Message ID from a previous send_message result to create a thread.
 
     Returns:
-        JSON with inserted message ID(s).
+        {"message_id": int} for single sends, {"message_ids": [int, ...]} for broadcasts.
+        {"error": str} if the target agent is not visible or reply_to is invalid.
     """
     valid_kinds = {"chat", "system", "request", "response"}
     if kind not in valid_kinds:
@@ -113,13 +119,16 @@ async def send_message(to_agent: str, body: str, kind: str = "chat", reply_to: i
 
 @mcp.tool()
 async def check_delivery(message_id: int) -> str:
-    """Check the delivery status of a message.
+    """Poll whether a previously sent message has been delivered.
+
+    Use after send_message when you need confirmation before proceeding.
+    Status transitions: pending → delivered. Poll periodically if still pending.
 
     Args:
-        message_id: The message ID to check.
+        message_id: ID returned by send_message.
 
     Returns:
-        JSON with the message status.
+        {"message_id": int, "status": "pending"|"delivered"|"not_found"}.
     """
     conn = await _get_db()
     cursor = await conn.execute("SELECT status FROM messages WHERE id = ?", (message_id,))
@@ -139,18 +148,26 @@ async def launch_agent(
     task: str = "",
     message: str = "",
 ) -> str:
-    """Request the broker to launch a new agent. You become its parent.
+    """Launch a new child agent. You become its parent and can terminate it later.
+
+    The agent starts asynchronously — this returns immediately. Use list_agents
+    to check when the new agent appears as 'active'. The child inherits your
+    session and can message any agent visible to it.
 
     Args:
-        agent_id: Unique identifier for the new agent.
-        harness: Harness to use (e.g. 'kiro', 'claude', 'opencode').
-        cwd: Working directory for the agent.
-        agent_mode: ACP mode id to apply after session creation (optional).
-        task: Description of the task for the agent.
-        message: Initial message to send after the agent is idle.
+        agent_id: Unique name for the new agent (e.g. 'researcher', 'test-runner').
+            Must not collide with existing agent IDs in the session.
+        harness: Runtime to use: 'kiro', 'claude', 'opencode', etc.
+        cwd: Working directory. Defaults to current directory.
+        agent_mode: Optional ACP mode ID applied after session creation.
+        task: Short description of what this agent should do. Shown in list_agents
+            so other agents understand its purpose.
+        message: Initial message sent to the agent once it becomes idle.
+            Use this to give it its first instruction.
 
     Returns:
-        JSON with ok status and agent_id. Includes queued=true if at capacity.
+        {"ok": true, "agent_id": str}. Includes "queued": true if the session
+        is at max capacity — the agent will launch when a slot opens.
     """
     conn = await _get_db()
     await _ensure_registered(conn)
@@ -187,13 +204,15 @@ async def launch_agent(
 
 @mcp.tool()
 async def terminate_agent(agent_id: str) -> str:
-    """Request the broker to terminate an agent you launched.
+    """Terminate a child agent you previously launched. Only works on agents you are the parent of.
+
+    The agent is stopped asynchronously. Use list_agents to confirm it becomes inactive.
 
     Args:
-        agent_id: The agent to terminate.
+        agent_id: ID of the child agent to terminate (from list_agents).
 
     Returns:
-        JSON with ok status.
+        {"ok": true}.
     """
     conn = await _get_db()
     await _ensure_registered(conn)
@@ -210,13 +229,16 @@ async def terminate_agent(agent_id: str) -> str:
 
 @mcp.tool()
 async def list_agents() -> str:
-    """List all agents in this session visible to you, plus yourself.
+    """List all agents visible to you in this session. Call this before send_message
+    to discover valid agent IDs, or to check the status of agents you launched.
 
-    Each entry includes is_self (true for your own entry), parent (who launched
-    the agent), and task. In LOCAL mode only your family is visible.
+    Visibility depends on communication mode: in MESH mode all session agents are
+    visible; in LOCAL mode only your parent, children, and siblings are visible.
+    Your own entry is always included (is_self: true).
 
     Returns:
-        JSON array of {agent_id, status, parent, task, is_self}.
+        JSON array of {"agent_id": str, "status": "active"|"inactive",
+        "parent": str|null, "task": str|null, "is_self": bool}.
     """
     conn = await _get_db()
     await _ensure_registered(conn)
@@ -246,10 +268,12 @@ async def list_agents() -> str:
 
 @mcp.tool()
 async def deregister_agent() -> str:
-    """Mark this agent as inactive.
+    """Permanently mark yourself as inactive and leave the session. This is irreversible —
+    call only when your task is fully complete and you have no more work to do.
+    Other agents will no longer see you in list_agents.
 
     Returns:
-        Confirmation message.
+        {"status": "inactive", "agent_id": str}.
     """
     conn = await _get_db()
     await conn.execute("UPDATE agents SET status = 'inactive' WHERE agent_id = ?", (AGENT_ID,))
