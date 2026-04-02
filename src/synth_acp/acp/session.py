@@ -235,6 +235,16 @@ class ACPSession:
             if self.state == AgentState.BUSY:
                 await self._set_state(AgentState.IDLE)
 
+    async def set_mode(self, mode_id: str) -> None:
+        """Switch the agent's mode."""
+        if self._conn and self._session_id and self.state == AgentState.IDLE:
+            await self._conn.set_session_mode(mode_id=mode_id, session_id=self._session_id)
+
+    async def set_model(self, model_id: str) -> None:
+        """Switch the agent's model."""
+        if self._conn and self._session_id and self.state == AgentState.IDLE:
+            await self._conn.set_session_model(model_id=model_id, session_id=self._session_id)
+
     async def cancel(self) -> None:
         """Cancel the active prompt turn."""
         if self._conn and self._session_id and self.state == AgentState.BUSY:
