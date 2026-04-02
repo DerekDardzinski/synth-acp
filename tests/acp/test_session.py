@@ -63,13 +63,15 @@ class TestSessionUpdate:
         async def sink(event: BrokerEvent) -> None:
             events.append(event)
 
-        return ACPSession(
+        s = ACPSession(
             agent_id="test",
             binary="echo",
             args=[],
             cwd=".",
             event_sink=sink,
         )
+        s._session_id = "sess-1"
+        return s
 
     async def test_session_update_when_thought_chunk_emits_event(
         self, session: ACPSession, events: list[BrokerEvent]
@@ -186,6 +188,29 @@ class TestSessionUpdate:
         assert len(evt.locations) == 1
         assert evt.locations[0] == ToolCallLocation(path="/abs/path.py", line=42)
 
+    async def test_session_update_from_wrong_session_emits_nothing(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Updates from a different session must be silently dropped.
+        Guards against probe/throwaway session bleed-through on shared connections."""
+        update = SimpleNamespace(
+            session_update="agent_message_chunk",
+            content=SimpleNamespace(text="should not appear"),
+        )
+        await session.session_update("other-session-id", update)
+        assert len(events) == 0
+
+    async def test_session_update_from_correct_session_is_processed(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Updates from the session's own ID must still be processed normally."""
+        update = SimpleNamespace(
+            session_update="agent_message_chunk",
+            content=SimpleNamespace(text="hello"),
+        )
+        await session.session_update("sess-1", update)
+        assert len(events) == 1
+
 
 class TestSessionModes:
     @pytest.fixture()
@@ -197,13 +222,15 @@ class TestSessionModes:
         async def sink(event: BrokerEvent) -> None:
             events.append(event)
 
-        return ACPSession(
+        s = ACPSession(
             agent_id="test",
             binary="echo",
             args=[],
             cwd=".",
             event_sink=sink,
         )
+        s._session_id = "sess-1"
+        return s
 
     async def test_current_mode_update_emits_agent_mode_changed(
         self, session: ACPSession, events: list[BrokerEvent]
@@ -249,3 +276,15 @@ class TestSessionModes:
 
     async def test_current_model_id_none_before_session(self, session: ACPSession) -> None:
         assert session.current_model_id is None
+
+    async def test_current_mode_update_from_wrong_session_emits_nothing(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Mode updates from a different session must be dropped.
+        Prevents probe sessions overwriting the main session's tracked mode."""
+        update = SimpleNamespace(
+            session_update="current_mode_update", current_mode_id="code"
+        )
+        await session.session_update("other-session-id", update)
+        assert len(events) == 0
+        assert session.current_mode_id is None
