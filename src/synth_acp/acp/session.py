@@ -189,7 +189,7 @@ class ACPSession:
         self._current_mode_id: str | None = None
         self._available_models: list[AgentModel] = []
         self._current_model_id: str | None = None
-
+        self._suppress_history_replay: bool = False
 
     async def _set_state(self, new_state: AgentState) -> None:
         """Transition state and notify broker. Awaited to prevent races."""
@@ -346,10 +346,46 @@ class ACPSession:
                 await self._conn.set_session_model(
                     model_id=self._current_model_id, session_id=self._session_id
                 )
+            await self._restore_mcp_servers()
             self._current_mode_id = mode_id
             await self._event_sink(
                 AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id)
             )
+
+    async def _restore_mcp_servers(self) -> None:
+        """Re-establish MCP server connections after a mode switch.
+
+        Kiro drops all MCP server connections when session/set_mode is called.
+        Calling session/load with mcp_servers causes Kiro to reconnect them.
+
+        session/load requires Kiro to stream the full conversation history back
+        to the client as session/update notifications. The _suppress_history_replay
+        flag causes session_update to drop all notifications during this call —
+        we only need the MCP reconnection side effect, not the replay.
+
+        session/resume (which would avoid the replay entirely) is not supported
+        by Kiro — it returns Method not found.
+
+        The flag is always cleared in a finally block so a failed load_session
+        cannot leave session_update permanently suppressed.
+        """
+        if not self._mcp_servers or not self._conn or not self._session_id:
+            return
+        self._suppress_history_replay = True
+        try:
+            await self._conn.load_session(
+                session_id=self._session_id,
+                cwd=self._cwd,
+                mcp_servers=self._mcp_servers,
+            )
+        except Exception:
+            log.debug(
+                "MCP server restore via load_session failed for %s",
+                self.agent_id,
+                exc_info=True,
+            )
+        finally:
+            self._suppress_history_replay = False
 
     async def set_model(self, model_id: str) -> None:
         """Switch the agent's model."""
@@ -414,6 +450,8 @@ class ACPSession:
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         """Called by ACP SDK when agent streams a response."""
         if session_id != self._session_id:
+            return
+        if self._suppress_history_replay:
             return
         su = getattr(update, "session_update", None) or getattr(update, "sessionUpdate", None)
         log.debug("session_update type=%s agent=%s", su, self.agent_id)

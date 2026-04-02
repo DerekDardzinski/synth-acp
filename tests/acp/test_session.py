@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -288,3 +289,105 @@ class TestSessionModes:
         await session.session_update("other-session-id", update)
         assert len(events) == 0
         assert session.current_mode_id is None
+
+
+class TestMcpRestore:
+    """Tests for _suppress_history_replay and _restore_mcp_servers behaviour."""
+
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def session(self, events: list[BrokerEvent]) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        s = ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+        )
+        s._session_id = "sess-1"
+        return s
+
+    async def test_suppress_flag_drops_updates(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """session_update must emit nothing while _suppress_history_replay is True.
+        This is what prevents load_session history replay from corrupting the UI."""
+        session._suppress_history_replay = True
+        update = SimpleNamespace(
+            session_update="agent_message_chunk",
+            content=SimpleNamespace(text="replayed history"),
+        )
+        await session.session_update("sess-1", update)
+        assert len(events) == 0
+
+    async def test_suppress_flag_cleared_restores_updates(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """session_update must resume normal emission once flag is cleared.
+        Guards against the flag being left True after a failed load_session."""
+        session._suppress_history_replay = True
+        session._suppress_history_replay = False
+        update = SimpleNamespace(
+            session_update="agent_message_chunk",
+            content=SimpleNamespace(text="live message"),
+        )
+        await session.session_update("sess-1", update)
+        assert len(events) == 1
+
+    async def test_suppress_does_not_affect_wrong_session(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """The session ID guard must still fire before the suppress check.
+        A suppressed session must not accidentally process updates from other sessions
+        when the flag is later cleared."""
+        session._suppress_history_replay = False
+        update = SimpleNamespace(
+            session_update="agent_message_chunk",
+            content=SimpleNamespace(text="from other session"),
+        )
+        await session.session_update("other-session-id", update)
+        assert len(events) == 0
+
+    async def test_restore_mcp_servers_skips_when_no_mcp_servers(
+        self, session: ACPSession
+    ) -> None:
+        """_restore_mcp_servers must be a no-op when _mcp_servers is empty.
+        Prevents a spurious load_session call for agents launched without MCP servers."""
+        session._mcp_servers = []
+        # No conn set — would raise AttributeError if it tried to call load_session
+        await session._restore_mcp_servers()
+        # Reaching here without error confirms early return fired
+
+    async def test_restore_mcp_servers_clears_flag_on_exception(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """_suppress_history_replay must be False after _restore_mcp_servers even if
+        load_session raises. Guards against the flag being permanently stuck True."""
+        from acp.schema import McpServerStdio
+
+        session._mcp_servers = [
+            McpServerStdio(name="test-mcp", command="true", args=[], env=[])
+        ]
+
+        class FailingConn:
+            async def load_session(self, **kwargs: Any) -> None:
+                raise RuntimeError("load_session failed")
+
+        session._conn = FailingConn()
+        assert session._suppress_history_replay is False
+        await session._restore_mcp_servers()
+        assert session._suppress_history_replay is False
+
+        # session_update must still work normally after the failed restore
+        update = SimpleNamespace(
+            session_update="agent_message_chunk",
+            content=SimpleNamespace(text="still works"),
+        )
+        await session.session_update("sess-1", update)
+        assert len(events) == 1
