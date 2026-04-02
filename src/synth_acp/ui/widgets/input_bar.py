@@ -172,7 +172,7 @@ class InputBar(Vertical):
         if text.startswith("@"):
             parts = text.split(" ", 1)
             candidate = parts[0][1:]
-            known_ids = [a.id for a in app.config.agents]
+            known_ids = [a.agent_id for a in app.config.agents]
             if candidate in known_ids:
                 target = candidate
                 text = parts[1] if len(parts) > 1 else ""

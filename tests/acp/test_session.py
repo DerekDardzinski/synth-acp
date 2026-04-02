@@ -9,6 +9,7 @@ import pytest
 from synth_acp.acp.session import ACPSession
 from synth_acp.models.agent import AgentState, InvalidTransitionError
 from synth_acp.models.events import (
+    AgentModeChanged,
     AgentStateChanged,
     AgentThoughtReceived,
     BrokerEvent,
@@ -184,3 +185,67 @@ class TestSessionUpdate:
         assert isinstance(evt, ToolCallUpdated)
         assert len(evt.locations) == 1
         assert evt.locations[0] == ToolCallLocation(path="/abs/path.py", line=42)
+
+
+class TestSessionModes:
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def session(self, events: list[BrokerEvent]) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        return ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+        )
+
+    async def test_current_mode_update_emits_agent_mode_changed(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """current_mode_update must emit AgentModeChanged — otherwise mode switches are invisible."""
+        update = SimpleNamespace(
+            session_update="current_mode_update", current_mode_id="architect"
+        )
+        await session.session_update("sess-1", update)
+        assert len(events) == 1
+        assert isinstance(events[0], AgentModeChanged)
+        assert events[0].mode_id == "architect"
+        assert events[0].agent_id == "test"
+
+    async def test_current_mode_update_updates_internal_state(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """_current_mode_id must be updated — otherwise current_mode_id property is stale."""
+        update = SimpleNamespace(
+            session_update="current_mode_update", current_mode_id="code"
+        )
+        await session.session_update("sess-1", update)
+        assert session.current_mode_id == "code"
+
+    async def test_current_mode_update_with_no_mode_id_emits_nothing(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Missing mode id must not emit — guards against malformed agent payloads."""
+        update = SimpleNamespace(
+            session_update="current_mode_update", current_mode_id=None
+        )
+        await session.session_update("sess-1", update)
+        assert len(events) == 0
+
+    async def test_available_modes_empty_before_session(self, session: ACPSession) -> None:
+        assert session.available_modes == []
+
+    async def test_current_mode_id_none_before_session(self, session: ACPSession) -> None:
+        assert session.current_mode_id is None
+
+    async def test_available_models_empty_before_session(self, session: ACPSession) -> None:
+        assert session.available_models == []
+
+    async def test_current_model_id_none_before_session(self, session: ACPSession) -> None:
+        assert session.current_model_id is None

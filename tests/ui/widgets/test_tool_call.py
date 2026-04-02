@@ -16,7 +16,7 @@ from synth_acp.ui.widgets.tool_call import ToolCallBlock
 def _make_config() -> SessionConfig:
     return SessionConfig(
         project="test",
-        agents=[{"id": "a1", "cmd": ["echo"]}],
+        agents=[{"agent_id": "a1", "harness": "kiro"}],
     )
 
 

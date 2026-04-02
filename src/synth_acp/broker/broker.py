@@ -17,17 +17,19 @@ import aiosqlite
 from acp.schema import EnvVariable, McpServerStdio
 
 from synth_acp.acp.session import ACPSession
-from synth_acp.db import ensure_schema_async
 from synth_acp.broker.permissions import PermissionEngine
 from synth_acp.broker.poller import MessagePoller
+from synth_acp.db import ensure_schema_async
 from synth_acp.harnesses import load_harness_registry
-from synth_acp.models.agent import AgentConfig, AgentState
+from synth_acp.models.agent import AgentConfig, AgentMode, AgentModel, AgentState
 from synth_acp.models.commands import (
     BrokerCommand,
     CancelTurn,
     LaunchAgent,
     RespondPermission,
     SendPrompt,
+    SetAgentMode,
+    SetAgentModel,
     TerminateAgent,
 )
 from synth_acp.models.config import SessionConfig
@@ -70,8 +72,9 @@ class ACPBroker:
         self._usage: dict[str, UsageUpdated] = {}
         self._poller: MessagePoller | None = None
         self._pending_initial_prompts: dict[str, str] = {}
-        self._agent_parents: dict[str, str | None] = {a.id: None for a in config.agents}
+        self._agent_parents: dict[str, str | None] = {a.agent_id: None for a in config.agents}
         self._db: aiosqlite.Connection | None = None
+        self._harness_registry: list = load_harness_registry()
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -94,6 +97,10 @@ class ACPBroker:
                 self._resolve_permission(aid, oid)
             case CancelTurn(agent_id=aid):
                 await self._cancel(aid)
+            case SetAgentMode(agent_id=aid, mode_id=mid):
+                await self._set_mode(aid, mid)
+            case SetAgentModel(agent_id=aid, model_id=mid):
+                await self._set_model(aid, mid)
 
     # ------------------------------------------------------------------
     # State queries
@@ -124,6 +131,30 @@ class ACPBroker:
     def get_agent_parent(self, agent_id: str) -> str | None:
         """Return the parent agent ID, or None if no parent."""
         return self._agent_parents.get(agent_id)
+
+    def get_agent_modes(self, agent_id: str) -> list[AgentMode]:
+        """Return available modes for an agent, or [] if not yet received."""
+        session = self._sessions.get(agent_id)
+        return session.available_modes if session else []
+
+    def get_current_mode(self, agent_id: str) -> str | None:
+        """Return the current mode id for an agent, or None."""
+        session = self._sessions.get(agent_id)
+        return session.current_mode_id if session else None
+
+    def get_agent_models(self, agent_id: str) -> list[AgentModel]:
+        """Return available models for an agent, or [] if not yet received.
+
+        May always return [] for agents that do not support the UNSTABLE
+        models capability.
+        """
+        session = self._sessions.get(agent_id)
+        return session.available_models if session else []
+
+    def get_current_model(self, agent_id: str) -> str | None:
+        """Return the current model id for an agent, or None."""
+        session = self._sessions.get(agent_id)
+        return session.current_model_id if session else None
 
     def is_permission_pending(self, agent_id: str) -> bool:
         """Return True if the agent has an unresolved permission request."""
@@ -212,13 +243,27 @@ class ACPBroker:
 
     async def _launch(self, agent_id: str) -> None:
         """Launch an agent by ID from the config."""
-        agent_cfg = next((a for a in self._config.agents if a.id == agent_id), None)
+        agent_cfg = next((a for a in self._config.agents if a.agent_id == agent_id), None)
         if not agent_cfg:
             await self._sink(
                 BrokerError(agent_id=agent_id, message=f"No config for agent '{agent_id}'")
             )
             return
 
+        entry = next(
+            (e for e in self._harness_registry if e.short_name == agent_cfg.harness), None
+        )
+        if not entry:
+            await self._sink(
+                BrokerError(
+                    agent_id=agent_id,
+                    message=f"Unknown harness '{agent_cfg.harness}'. "
+                    f"Known: {', '.join(sorted(e.short_name for e in self._harness_registry))}",
+                )
+            )
+            return
+
+        cmd = entry.run_cmd.split()
         mcp_servers = [
             McpServerStdio(
                 name="synth-mcp",
@@ -241,12 +286,13 @@ class ACPBroker:
                 task.cancel()
 
         session = ACPSession(
-            agent_id=agent_cfg.id,
-            binary=agent_cfg.binary,
-            args=agent_cfg.args,
+            agent_id=agent_cfg.agent_id,
+            binary=cmd[0],
+            args=cmd[1:],
             cwd=agent_cfg.cwd,
             event_sink=self._sink,
             mcp_servers=mcp_servers,
+            agent_mode=agent_cfg.agent_mode,
         )
         self._sessions[agent_id] = session
         self._tasks[agent_id] = asyncio.create_task(session.run())
@@ -294,6 +340,44 @@ class ACPBroker:
             await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
             return
         await session.cancel()
+
+    async def _set_mode(self, agent_id: str, mode_id: str) -> None:
+        """Forward a mode-switch request to the agent session."""
+        session = self._sessions.get(agent_id)
+        if not session:
+            await self._sink(
+                BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'")
+            )
+            return
+        if session.state != AgentState.IDLE:
+            await self._sink(
+                BrokerError(
+                    agent_id=agent_id,
+                    message=f"Agent '{agent_id}' is {session.state}, cannot switch mode",
+                    severity="warning",
+                )
+            )
+            return
+        await session.set_mode(mode_id)
+
+    async def _set_model(self, agent_id: str, model_id: str) -> None:
+        """Forward a model-switch request to the agent session."""
+        session = self._sessions.get(agent_id)
+        if not session:
+            await self._sink(
+                BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'")
+            )
+            return
+        if session.state != AgentState.IDLE:
+            await self._sink(
+                BrokerError(
+                    agent_id=agent_id,
+                    message=f"Agent '{agent_id}' is {session.state}, cannot switch model",
+                    severity="warning",
+                )
+            )
+            return
+        await session.set_model(model_id)
 
     def _resolve_permission(self, agent_id: str, option_id: str) -> None:
         """Resolve a pending permission Future on a session.
@@ -369,7 +453,7 @@ class ACPBroker:
             await db.execute(
                 "INSERT OR REPLACE INTO agents (agent_id, session_id, status, registered) "
                 "VALUES (?, ?, 'active', ?)",
-                (agent.id, self._session_id, now),
+                (agent.agent_id, self._session_id, now),
             )
         await db.commit()
 
@@ -432,11 +516,11 @@ class ACPBroker:
         Args:
             cmd_id: The command row ID.
             from_agent: The agent requesting the launch.
-            data: Parsed JSON payload with agent_id, agent_name, harness, cwd, task, message.
+            data: Parsed JSON payload with agent_id, harness, agent_mode, cwd, task, message.
         """
         agent_id = data["agent_id"]
-        agent_name = data["agent_name"]
         harness = data["harness"]
+        agent_mode = data.get("agent_mode") or None
         cwd = data.get("cwd", ".")
         task = data.get("task", "")
         message = data.get("message", "")
@@ -462,14 +546,13 @@ class ACPBroker:
             return  # Leave as pending
 
         # Resolve harness
-        registry = load_harness_registry()
-        entry = next((e for e in registry if e.short_name == harness), None)
+        entry = next((e for e in self._harness_registry if e.short_name == harness), None)
         if not entry:
             await self._update_command_status(cmd_id, "rejected", f"Unknown harness: {harness}")
             return
 
-        cmd = entry.run_cmd_with_agent.format(agent=agent_name).split()
-        agent_cfg = AgentConfig(id=agent_id, cmd=cmd, cwd=cwd)
+        cmd = entry.run_cmd.split()
+        agent_cfg = AgentConfig(agent_id=agent_id, harness=harness, agent_mode=agent_mode, cwd=cwd)
 
         # Register in SQLite
         db = await self._ensure_db()
@@ -494,12 +577,13 @@ class ACPBroker:
             )
         ]
         session = ACPSession(
-            agent_id=agent_cfg.id,
-            binary=agent_cfg.binary,
-            args=agent_cfg.args,
+            agent_id=agent_cfg.agent_id,
+            binary=cmd[0],
+            args=cmd[1:],
             cwd=agent_cfg.cwd,
             event_sink=self._sink,
             mcp_servers=mcp_servers,
+            agent_mode=agent_cfg.agent_mode,
         )
         self._sessions[agent_id] = session
         self._tasks[agent_id] = asyncio.create_task(session.run())
@@ -508,8 +592,6 @@ class ACPBroker:
             self._pending_initial_prompts[agent_id] = message
 
         await self._update_command_status(cmd_id, "processed")
-
-        # Join broadcast
         await self._send_join_broadcast(agent_id, task)
 
     async def _handle_terminate_command(

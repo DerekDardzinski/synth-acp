@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
@@ -38,40 +39,74 @@ class InvalidTransitionError(Exception):
     """Raised when a state transition is not allowed."""
 
 
-class AgentConfig(BaseModel, frozen=True):
-    """Configuration for a single agent.
+@dataclass(frozen=True)
+class AgentMode:
+    """A single mode advertised by an ACP agent after session creation."""
 
-    Supports both the new ``cmd`` format and legacy ``binary``/``args``.
-    Legacy fields are coerced to ``cmd`` via a model validator.
+    id: str
+    name: str
+    description: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentModel:
+    """A model advertised by an ACP agent after session creation.
+
+    Populated from the UNSTABLE ``models`` field in NewSessionResponse.
+    May be absent even on agents that support modes.
     """
 
     id: str
-    cmd: list[str]
-    label: str | None = None
-    profile: str | None = None
+    name: str
+    description: str | None = None
+
+
+class AgentConfig(BaseModel, frozen=True):
+    """Configuration for a single agent.
+
+    Aligned with the ``launch_agent`` MCP tool parameters:
+
+    - ``agent_id``: unique identifier and display name shown to other agents.
+    - ``harness``: short name resolved via the harness registry (e.g. ``kiro``,
+      ``claude``, ``opencode``).
+    - ``agent_mode``: ACP mode id applied via ``set_session_mode()`` after the
+      session is created. Optional — when omitted the agent starts in its default
+      mode.
+    """
+
+    agent_id: str
+    harness: str
+    agent_mode: str | None = None
     cwd: str = "."
     env: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
     def _coerce_legacy(cls, data: Any) -> Any:
-        """Coerce legacy ``binary``/``args`` to ``cmd`` and drop ``autostart``."""
+        """Coerce legacy fields to the new schema.
+
+        - ``id`` → ``agent_id``
+        - ``profile`` → ``agent_mode`` (only when ``agent_mode`` absent)
+        - ``cmd``, ``binary``, ``args``, ``label``, ``autostart`` are dropped.
+        """
         if isinstance(data, dict):
             data = dict(data)
-            if "binary" in data and "cmd" not in data:
-                binary = data.pop("binary")
-                args = data.pop("args", [])
-                data["cmd"] = [binary, *args]
+            if "id" in data and "agent_id" not in data:
+                data["agent_id"] = data.pop("id")
             else:
-                data.pop("binary", None)
-                data.pop("args", None)
-            data.pop("autostart", None)
+                data.pop("id", None)
+            if "profile" in data and "agent_mode" not in data:
+                data["agent_mode"] = data.pop("profile")
+            else:
+                data.pop("profile", None)
+            for key in ("cmd", "binary", "args", "label", "autostart"):
+                data.pop(key, None)
         return data
 
-    @field_validator("id")
+    @field_validator("agent_id")
     @classmethod
     def validate_agent_id(cls, v: str) -> str:
-        """Validate agent ID matches allowed pattern."""
+        """Validate agent_id matches the allowed identifier pattern."""
         if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", v):
             raise ValueError(
                 f"Agent ID '{v}' must start with alphanumeric and contain only "
@@ -79,25 +114,15 @@ class AgentConfig(BaseModel, frozen=True):
             )
         return v
 
-    @field_validator("cmd")
+    @field_validator("harness")
     @classmethod
-    def validate_cmd(cls, v: list[str]) -> list[str]:
-        """Validate cmd is a non-empty list."""
-        if len(v) == 0:
-            raise ValueError("cmd must not be empty")
+    def validate_harness(cls, v: str) -> str:
+        """Validate harness is a non-empty string."""
+        if not v.strip():
+            raise ValueError("harness must not be empty")
         return v
 
     @property
-    def binary(self) -> str:
-        """Return the executable name (first element of ``cmd``)."""
-        return self.cmd[0]
-
-    @property
-    def args(self) -> list[str]:
-        """Return command arguments (all elements after the first)."""
-        return self.cmd[1:]
-
-    @property
     def display_name(self) -> str:
-        """Return the human-readable display name."""
-        return self.label or self.id
+        """Human-readable display name shown to other agents."""
+        return self.agent_id

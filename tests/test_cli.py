@@ -50,4 +50,3 @@ class TestHarnessRegistry:
             assert entry.short_name
             assert entry.binary_names
             assert entry.run_cmd
-            assert entry.run_cmd_with_agent

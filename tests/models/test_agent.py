@@ -1,50 +1,92 @@
-"""Tests for AgentConfig validation and state machine transitions."""
+"""Tests for AgentConfig, AgentMode, AgentModel, and state machine transitions."""
 
 from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
 
-from synth_acp.models.agent import TRANSITIONS, AgentConfig, AgentState
+from synth_acp.models.agent import (
+    TRANSITIONS,
+    AgentConfig,
+    AgentMode,
+    AgentModel,
+    AgentState,
+)
 
 
-class TestAgentConfigIdValidation:
-    def test_rejects_dots_in_id(self):
+class TestAgentConfigValidation:
+    def test_rejects_dots_in_agent_id(self):
         with pytest.raises(ValidationError, match="must start with alphanumeric"):
-            AgentConfig(id="my.agent", cmd=["kiro-cli"])
+            AgentConfig(agent_id="my.agent", harness="kiro")
 
     def test_rejects_leading_hyphen(self):
         with pytest.raises(ValidationError, match="must start with alphanumeric"):
-            AgentConfig(id="-bad", cmd=["kiro-cli"])
+            AgentConfig(agent_id="-bad", harness="kiro")
 
-    def test_accepts_valid_id(self):
-        cfg = AgentConfig(id="kiro-auth_1", cmd=["kiro-cli"])
-        assert cfg.id == "kiro-auth_1"
+    def test_rejects_empty_harness(self):
+        with pytest.raises(ValidationError, match="harness must not be empty"):
+            AgentConfig(agent_id="alice", harness="")
+
+    def test_accepts_valid_config(self):
+        cfg = AgentConfig(agent_id="kiro-auth_1", harness="kiro")
+        assert cfg.agent_id == "kiro-auth_1"
+        assert cfg.harness == "kiro"
+        assert cfg.agent_mode is None
+
+    def test_accepts_agent_mode(self):
+        cfg = AgentConfig(agent_id="alice", harness="kiro", agent_mode="kiro_planner")
+        assert cfg.agent_mode == "kiro_planner"
+
+    def test_display_name_returns_agent_id(self):
+        cfg = AgentConfig(agent_id="alice", harness="kiro")
+        assert cfg.display_name == "alice"
 
 
 class TestAgentConfigLegacyCoercion:
-    def test_agent_config_when_binary_args_provided_coerces_to_cmd(self):
-        cfg = AgentConfig(id="a", binary="bin", args=["arg"])
-        assert cfg.cmd == ["bin", "arg"]
-        assert cfg.binary == "bin"
-        assert cfg.args == ["arg"]
+    def test_id_coerced_to_agent_id(self):
+        cfg = AgentConfig(id="alice", harness="kiro")
+        assert cfg.agent_id == "alice"
 
-    def test_agent_config_when_cmd_empty_raises(self):
-        with pytest.raises(ValidationError, match="cmd must not be empty"):
-            AgentConfig(id="a", cmd=[])
+    def test_profile_coerced_to_agent_mode(self):
+        cfg = AgentConfig(agent_id="alice", harness="kiro", profile="planner")
+        assert cfg.agent_mode == "planner"
 
-    def test_agent_config_when_autostart_present_drops_it(self):
-        cfg = AgentConfig(id="a", binary="bin", autostart=True)
-        assert cfg.cmd == ["bin"]
-        assert not hasattr(cfg, "autostart") or "autostart" not in cfg.model_fields
+    def test_cmd_dropped_silently(self):
+        cfg = AgentConfig(agent_id="alice", harness="kiro", cmd=["kiro-cli", "acp"])
+        assert cfg.harness == "kiro"
+        assert not hasattr(cfg, "cmd")
 
-    def test_display_name_when_label_set_returns_label(self):
-        cfg = AgentConfig(id="a", cmd=["bin"], label="My Agent")
-        assert cfg.display_name == "My Agent"
+    def test_binary_args_dropped_silently(self):
+        cfg = AgentConfig(agent_id="alice", harness="kiro", binary="kiro-cli", args=["acp"])
+        assert not hasattr(cfg, "binary")
 
-    def test_display_name_when_no_label_returns_id(self):
-        cfg = AgentConfig(id="a", cmd=["bin"])
-        assert cfg.display_name == "a"
+    def test_label_dropped_silently(self):
+        cfg = AgentConfig(agent_id="alice", harness="kiro", label="Alice")
+        assert not hasattr(cfg, "label")
+
+    def test_autostart_dropped_silently(self):
+        cfg = AgentConfig(agent_id="alice", harness="kiro", autostart=True)
+        assert not hasattr(cfg, "autostart")
+
+
+class TestAgentModeDataclass:
+    def test_agent_mode_fields(self):
+        mode = AgentMode(id="architect", name="Architect", description="Plan only")
+        assert mode.id == "architect"
+        assert mode.name == "Architect"
+        assert mode.description == "Plan only"
+
+    def test_agent_mode_description_optional(self):
+        mode = AgentMode(id="code", name="Code")
+        assert mode.description is None
+
+
+class TestAgentModelDataclass:
+    def test_agent_model_fields(self):
+        model = AgentModel(id="claude-sonnet-4-5", name="Claude Sonnet 4.5")
+        assert model.id == "claude-sonnet-4-5"
+        assert model.name == "Claude Sonnet 4.5"
+        assert model.description is None
 
 
 class TestStateTransitions:

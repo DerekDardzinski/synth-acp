@@ -3,4 +3,3 @@ name = "Claude Code"
 short_name = "claude"
 binary_names = ["claude"]
 run_cmd = "claude mcp"
-run_cmd_with_agent = "claude mcp --agent {agent}"

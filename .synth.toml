@@ -1,11 +1,11 @@
 project = "test"
 
 [[agents]]
-id = "kiro"
-cmd = ["kiro-cli", "acp", "--agent", "coder"]
-cwd = "."
+agent_id = "kiro"
+harness = "kiro"
+agent_mode = "coder"
 
 [[agents]]
-id = "kiro-2"
-cmd = ["kiro-cli", "acp", "--agent", "coder"]
-cwd = "."
+agent_id = "kiro-2"
+harness = "kiro"
+agent_mode = "coder"

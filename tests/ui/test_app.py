@@ -29,7 +29,7 @@ def _make_config(*agent_ids: str) -> SessionConfig:
     """Create a minimal SessionConfig."""
     return SessionConfig(
         project="test",
-        agents=[{"id": aid, "cmd": ["echo"]} for aid in agent_ids],
+        agents=[{"agent_id": aid, "harness": "kiro"} for aid in agent_ids],
     )
 
 
@@ -75,7 +75,7 @@ class TestCLIModeSelection:
     @pytest.mark.filterwarnings("ignore::RuntimeWarning")
     def test_main_when_headless_flag_calls_async_run(self, tmp_path: Path) -> None:
         config_file = tmp_path / ".synth.toml"
-        config_file.write_text('project = "s"\n\n[[agents]]\nid = "a"\ncmd = ["echo"]\n')
+        config_file.write_text('project = "s"\n\n[[agents]]\nagent_id = "a"\nharness = "kiro"\n')
 
         with (
             patch("synth_acp.cli.asyncio.run") as mock_run,
@@ -94,7 +94,7 @@ class TestCLIModeSelection:
 
     def test_main_when_default_calls_tui(self, tmp_path: Path) -> None:
         config_file = tmp_path / ".synth.toml"
-        config_file.write_text('project = "s"\n\n[[agents]]\nid = "a"\ncmd = ["echo"]\n')
+        config_file.write_text('project = "s"\n\n[[agents]]\nagent_id = "a"\nharness = "kiro"\n')
 
         with (
             patch("synth_acp.cli._run_tui") as mock_tui,

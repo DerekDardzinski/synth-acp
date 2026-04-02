@@ -184,14 +184,10 @@ def _build_transient_config(harness_name: str, agent_name: str | None) -> Sessio
         raise typer.Exit(1)
 
     agent_id = agent_name or harness.short_name
-    if agent_name:
-        cmd = harness.run_cmd_with_agent.format(agent=agent_id).split()
-    else:
-        cmd = harness.run_cmd.split()
 
     return SessionConfig(
         project=Path.cwd().name,
-        agents=[{"id": agent_id, "cmd": cmd}],
+        agents=[{"agent_id": agent_id, "harness": harness_name}],
     )
 
 
@@ -302,15 +298,10 @@ def _first_run_picker() -> SessionConfig:
     project_input = input(f"Project name [{default_project}]: ").strip()
     project_name = project_input or default_project
 
-    # Build cmd
-    if agent_name != default_agent:
-        cmd = selected_harness.run_cmd_with_agent.format(agent=agent_name).split()
-    else:
-        cmd = selected_harness.run_cmd.split()
-
+    # Build config
     config = SessionConfig(
         project=project_name,
-        agents=[{"id": agent_name, "cmd": cmd}],
+        agents=[{"agent_id": agent_name, "harness": selected_harness.short_name}],
     )
 
     config_path = Path.cwd() / ".synth.toml"
@@ -339,12 +330,12 @@ async def _run(config: SessionConfig) -> None:
 
     # Launch all agents
     for agent in config.agents:
-        print(f"[synth] Launching {agent.id}...")
-        await broker.handle(LaunchAgent(agent_id=agent.id))
+        print(f"[synth] Launching {agent.agent_id}...")
+        await broker.handle(LaunchAgent(agent_id=agent.agent_id))
 
     # Wait for all agents to reach IDLE
     idle_agents: set[str] = set()
-    expected = {a.id for a in config.agents}
+    expected = {a.agent_id for a in config.agents}
     async for event in broker.events():
         _print_event(event, [])
         if isinstance(event, AgentStateChanged) and event.new_state == "idle":
@@ -356,7 +347,7 @@ async def _run(config: SessionConfig) -> None:
             return
 
     # Auto-select default agent if only one
-    default_agent: str | None = config.agents[0].id if len(config.agents) == 1 else None
+    default_agent: str | None = config.agents[0].agent_id if len(config.agents) == 1 else None
     pending_permissions: list[dict[str, Any]] = []
 
     # Start event consumer task

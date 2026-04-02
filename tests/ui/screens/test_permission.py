@@ -76,7 +76,7 @@ def _make_app():
 
     config = SessionConfig(
         project="test",
-        agents=[{"id": "a", "cmd": ["echo"]}],
+        agents=[{"agent_id": "a", "harness": "kiro"}],
     )
     broker = MagicMock()
     broker.handle = AsyncMock()

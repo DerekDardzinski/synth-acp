@@ -14,10 +14,14 @@ from textual.widgets import ContentSwitcher, Footer, Static
 from textual.worker import WorkerState
 
 from synth_acp.broker.broker import ACPBroker
-from synth_acp.models.agent import AgentState
+from synth_acp.models.agent import AgentMode, AgentModel, AgentState
 from synth_acp.models.commands import LaunchAgent, RespondPermission
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
+    AgentModeChanged,
+    AgentModelChanged,
+    AgentModelsReceived,
+    AgentModesReceived,
     AgentStateChanged,
     AgentThoughtReceived,
     BrokerError,
@@ -85,6 +89,10 @@ class SynthApp(App):
         self._mcp_count: int = 0
         self._mcp_panel: MessageQueue | None = None
         self._dynamic_agents: dict[str, DynamicAgentInfo] = {}
+        self._agent_modes: dict[str, list[AgentMode]] = {}
+        self._agent_current_mode: dict[str, str] = {}
+        self._agent_models: dict[str, list[AgentModel]] = {}
+        self._agent_current_model: dict[str, str] = {}
 
     def _handle_exception(self, error: Exception) -> None:
         """Log unhandled exceptions to file before Textual's default handling."""
@@ -103,7 +111,7 @@ class SynthApp(App):
             yield Static(f"project: {self.config.project}", id="tb-session")
             yield Static("", id="tb-right")
         with Horizontal(id="main"):
-            agents = [a.id for a in self.config.agents]
+            agents = [a.agent_id for a in self.config.agents]
             with Vertical(id="sidebar"):
                 yield AgentList(agents)
             yield ContentSwitcher(id="right")
@@ -113,11 +121,11 @@ class SynthApp(App):
         """Launch all agents, select the first, and start the broker event consumer."""
         self.theme = "catppuccin-mocha"
         for agent in self.config.agents:
-            self._event_buffers[agent.id] = []
+            self._event_buffers[agent.agent_id] = []
         for agent in self.config.agents:
-            await self.broker.handle(LaunchAgent(agent_id=agent.id))
+            await self.broker.handle(LaunchAgent(agent_id=agent.agent_id))
         if self.config.agents:
-            await self.select_agent(self.config.agents[0].id)
+            await self.select_agent(self.config.agents[0].agent_id)
         self.run_worker(self._consume_broker_events(), exit_on_error=False, name="broker-consumer")
 
     async def _consume_broker_events(self) -> None:
@@ -163,7 +171,7 @@ class SynthApp(App):
 
         if isinstance(event, AgentStateChanged):
             self._agent_states[event.agent_id] = event.new_state
-            if event.agent_id not in self._dynamic_agents and event.agent_id not in {a.id for a in self.config.agents}:
+            if event.agent_id not in self._dynamic_agents and event.agent_id not in {a.agent_id for a in self.config.agents}:
                 parent = self.broker.get_agent_parent(event.agent_id)
                 self._dynamic_agents[event.agent_id] = DynamicAgentInfo(parent=parent, task="")
                 self._event_buffers[event.agent_id] = []
@@ -175,11 +183,31 @@ class SynthApp(App):
             try:
                 tile = self.query_one(f"#tile-{event.agent_id}", AgentTile)
                 if event.new_state == AgentState.TERMINATED:
+                    self._agent_modes.pop(event.agent_id, None)
+                    self._agent_current_mode.pop(event.agent_id, None)
+                    self._agent_models.pop(event.agent_id, None)
+                    self._agent_current_model.pop(event.agent_id, None)
                     tile.remove()
                 else:
                     tile.update_state(event.new_state)
             except Exception:
                 log.debug("Agent tile not found for %s", event.agent_id, exc_info=True)
+
+        if isinstance(event, AgentModesReceived):
+            self._agent_modes[event.agent_id] = event.available_modes
+            self._agent_current_mode[event.agent_id] = event.current_mode_id
+            self._update_tile_mode(event.agent_id)
+
+        if isinstance(event, AgentModeChanged):
+            self._agent_current_mode[event.agent_id] = event.mode_id
+            self._update_tile_mode(event.agent_id)
+
+        if isinstance(event, AgentModelsReceived):
+            self._agent_models[event.agent_id] = event.available_models
+            self._agent_current_model[event.agent_id] = event.current_model_id
+
+        if isinstance(event, AgentModelChanged):
+            self._agent_current_model[event.agent_id] = event.model_id
 
         # Route to the agent's panel if it exists (regardless of selection)
         if event.agent_id in self._panels:
@@ -306,6 +334,17 @@ class SynthApp(App):
         else:
             bar.set_disabled(disabled=False, hint=f"Message {agent_id}…")
 
+    def _update_tile_mode(self, agent_id: str) -> None:
+        """Resolve the current mode name and push it to the agent's tile."""
+        mode_id = self._agent_current_mode.get(agent_id)
+        modes = self._agent_modes.get(agent_id, [])
+        mode_name = next((m.name for m in modes if m.id == mode_id), None)
+        try:
+            tile = self.query_one(f"#tile-{agent_id}", AgentTile)
+            tile.update_mode(mode_name)
+        except Exception:
+            log.debug("Agent tile not found for mode update: %s", agent_id, exc_info=True)
+
     def _update_usage_display(self, event: UsageUpdated) -> None:
         """Update the topbar usage display for the selected agent.
 
@@ -352,7 +391,7 @@ class SynthApp(App):
             agent_id: The agent to display.
         """
         if agent_id not in self._panels:
-            agent_cfg = next((a for a in self.config.agents if a.id == agent_id), None)
+            agent_cfg = next((a for a in self.config.agents if a.agent_id == agent_id), None)
             agent_name = agent_cfg.display_name if agent_cfg else agent_id
             feed = ConversationFeed(agent_id, agent_name, self.config.project, id=f"feed-{agent_id}")
             self._panels[agent_id] = feed
@@ -386,8 +425,8 @@ class SynthApp(App):
         # Update topbar with agent display name
         display_name = agent_id
         for a in self.config.agents:
-            if a.id == agent_id:
-                display_name = getattr(a, "display_name", a.id)
+            if a.agent_id == agent_id:
+                display_name = getattr(a, "display_name", a.agent_id)
                 break
         try:
             self.query_one("#tb-session", Static).update(display_name)
@@ -424,7 +463,7 @@ class SynthApp(App):
 
     async def action_next_agent(self) -> None:
         """Cycle to the next agent in config order."""
-        ids = [a.id for a in self.config.agents]
+        ids = [a.agent_id for a in self.config.agents]
         if not ids:
             return
         idx = ids.index(self.selected_agent) if self.selected_agent in ids else -1
@@ -442,7 +481,7 @@ class SynthApp(App):
     async def _do_launch(self) -> None:
         """Launch modal logic, separated for testability."""
         agents: list[tuple[str, str, AgentState | None]] = [
-            (a.id, a.display_name, self._agent_states.get(a.id)) for a in self.config.agents
+            (a.agent_id, a.display_name, self._agent_states.get(a.agent_id)) for a in self.config.agents
         ]
         for agent_id in self._dynamic_agents:
             agents.append((agent_id, agent_id, self._agent_states.get(agent_id)))

@@ -125,9 +125,9 @@ class TestLaunchAgent:
         result = json.loads(
             await launch_agent(
                 agent_id="worker-1",
-                agent_name="implementor",
                 harness="kiro",
                 cwd="/tmp",
+                agent_mode="kiro_planner",
                 task="Fix auth",
                 message="Start working",
             )
@@ -146,7 +146,7 @@ class TestLaunchAgent:
         assert row[3] == "pending"
         payload = json.loads(row[2])
         assert payload["agent_id"] == "worker-1"
-        assert payload["agent_name"] == "implementor"
+        assert payload["agent_mode"] == "kiro_planner"
         assert payload["harness"] == "kiro"
         assert payload["cwd"] == "/tmp"
         assert payload["task"] == "Fix auth"
@@ -160,7 +160,6 @@ class TestLaunchAgent:
             result = json.loads(
                 await launch_agent(
                     agent_id="worker-1",
-                    agent_name="implementor",
                     harness="kiro",
                 )
             )

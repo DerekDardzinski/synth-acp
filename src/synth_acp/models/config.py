@@ -8,7 +8,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, model_validator
 
 from synth_acp.models.agent import AgentConfig
 
@@ -32,10 +32,9 @@ class HarnessEntry(BaseModel, frozen=True):
     Attributes:
         identity: Unique key for the harness.
         name: Human-readable display name.
-        short_name: Used with ``--harness`` flag.
+        short_name: Used with the ``harness`` config field.
         binary_names: Executables searched in PATH.
-        run_cmd: Command template without agent.
-        run_cmd_with_agent: Command template with ``{agent}`` placeholder.
+        run_cmd: Command string to launch the harness (no agent flag).
     """
 
     identity: str
@@ -43,14 +42,6 @@ class HarnessEntry(BaseModel, frozen=True):
     short_name: str
     binary_names: list[str]
     run_cmd: str
-    run_cmd_with_agent: str
-
-    @field_validator("run_cmd_with_agent")
-    @classmethod
-    def _must_contain_agent_placeholder(cls, v: str) -> str:
-        if "{agent}" not in v:
-            raise ValueError("run_cmd_with_agent must contain {agent} placeholder")
-        return v
 
 
 class UIConfig(BaseModel, frozen=True):
@@ -84,7 +75,7 @@ class SessionConfig(BaseModel, frozen=True):
     @model_validator(mode="after")
     def validate_unique_ids(self) -> SessionConfig:
         """Ensure no duplicate agent IDs."""
-        ids = [a.id for a in self.agents]
+        ids = [a.agent_id for a in self.agents]
         dupes = [x for x in ids if ids.count(x) > 1]
         if dupes:
             raise ValueError(f"Duplicate agent IDs: {set(dupes)}")
@@ -148,12 +139,10 @@ def write_toml_config(path: Path, config: SessionConfig) -> None:
     lines = [f'project = "{config.project}"', ""]
     for agent in config.agents:
         lines.append("[[agents]]")
-        lines.append(f'id = "{agent.id}"')
-        lines.append(f"cmd = {agent.cmd!r}")
-        if agent.label:
-            lines.append(f'label = "{agent.label}"')
-        if agent.profile:
-            lines.append(f'profile = "{agent.profile}"')
+        lines.append(f'agent_id = "{agent.agent_id}"')
+        lines.append(f'harness = "{agent.harness}"')
+        if agent.agent_mode:
+            lines.append(f'agent_mode = "{agent.agent_mode}"')
         if agent.cwd != ".":
             lines.append(f'cwd = "{agent.cwd}"')
         lines.append("")

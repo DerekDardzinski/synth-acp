@@ -16,7 +16,7 @@ def _make_config(*agent_ids: str) -> SessionConfig:
     """Create a minimal SessionConfig."""
     return SessionConfig(
         project="test",
-        agents=[{"id": aid, "cmd": ["echo"]} for aid in agent_ids],
+        agents=[{"agent_id": aid, "harness": "kiro"} for aid in agent_ids],
     )
 
 

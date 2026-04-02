@@ -9,11 +9,18 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from acp.schema import PermissionOption
 
+from synth_acp.acp.session import ACPSession
 from synth_acp.broker.broker import ACPBroker
 from synth_acp.models.agent import AgentState
-from synth_acp.models.commands import LaunchAgent, RespondPermission, SendPrompt
+from synth_acp.models.commands import (
+    LaunchAgent,
+    RespondPermission,
+    SendPrompt,
+    SetAgentMode,
+    SetAgentModel,
+)
 from synth_acp.models.config import SessionConfig
-from synth_acp.models.events import BrokerError, PermissionRequested, UsageUpdated
+from synth_acp.models.events import BrokerError, BrokerEvent, PermissionRequested, UsageUpdated
 from synth_acp.models.permissions import PermissionDecision
 
 
@@ -21,7 +28,7 @@ def _make_config(*agent_ids: str) -> SessionConfig:
     """Create a minimal SessionConfig with the given agent IDs."""
     return SessionConfig(
         project="test-session",
-        agents=[{"id": aid, "cmd": ["echo"], "cwd": "."} for aid in agent_ids],
+        agents=[{"agent_id": aid, "harness": "kiro"} for aid in agent_ids],
     )
 
 
@@ -140,6 +147,84 @@ class TestBrokerDispatch:
         assert rule.session_id == broker._session_id
         assert rule.decision == PermissionDecision.allow_always
 
+    async def test_set_agent_mode_when_idle_calls_session_set_mode(
+        self, tmp_path: Path
+    ) -> None:
+        """SetAgentMode must forward to session.set_mode() when agent is IDLE."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=broker._sink,
+        )
+        session.state = AgentState.IDLE
+        session.set_mode = AsyncMock()  # type: ignore[method-assign]
+        broker._sessions["agent-1"] = session
+
+        await broker.handle(SetAgentMode(agent_id="agent-1", mode_id="architect"))
+
+        session.set_mode.assert_awaited_once_with("architect")
+
+    async def test_set_agent_mode_when_not_idle_emits_broker_error(
+        self, tmp_path: Path
+    ) -> None:
+        """SetAgentMode on a non-idle agent must emit BrokerError and not call set_mode."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        events: list[BrokerEvent] = []
+        broker._sink = AsyncMock(side_effect=lambda e: events.append(e))  # type: ignore[method-assign]
+
+        session = ACPSession(
+            agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
+        )
+        session.state = AgentState.TERMINATED
+        session.set_mode = AsyncMock()  # type: ignore[method-assign]
+        broker._sessions["agent-1"] = session
+
+        await broker.handle(SetAgentMode(agent_id="agent-1", mode_id="code"))
+
+        session.set_mode.assert_not_awaited()
+        assert any(isinstance(e, BrokerError) for e in events)
+
+    async def test_set_agent_model_when_idle_calls_session_set_model(
+        self, tmp_path: Path
+    ) -> None:
+        """SetAgentModel must forward to session.set_model() when agent is IDLE."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+
+        session = ACPSession(
+            agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
+        )
+        session.state = AgentState.IDLE
+        session.set_model = AsyncMock()  # type: ignore[method-assign]
+        broker._sessions["agent-1"] = session
+
+        await broker.handle(SetAgentModel(agent_id="agent-1", model_id="claude-sonnet-4-5"))
+
+        session.set_model.assert_awaited_once_with("claude-sonnet-4-5")
+
+    async def test_set_agent_model_when_not_idle_emits_broker_error(
+        self, tmp_path: Path
+    ) -> None:
+        """SetAgentModel on a non-idle agent must emit BrokerError and not call set_model."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        events: list[BrokerEvent] = []
+        broker._sink = AsyncMock(side_effect=lambda e: events.append(e))  # type: ignore[method-assign]
+
+        session = ACPSession(
+            agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
+        )
+        session.state = AgentState.BUSY
+        session.set_model = AsyncMock()  # type: ignore[method-assign]
+        broker._sessions["agent-1"] = session
+
+        await broker.handle(SetAgentModel(agent_id="agent-1", model_id="claude-opus-4-5"))
+
+        session.set_model.assert_not_awaited()
+        assert any(isinstance(e, BrokerError) for e in events)
+
 
 class TestBrokerUsageAccumulation:
     async def test_broker_get_usage_when_multiple_updates_keeps_latest(
@@ -226,7 +311,7 @@ class TestProcessCommands:
             payload = json.dumps(
                 {
                     "agent_id": "worker-1",
-                    "agent_name": "implementor",
+                    "agent_mode": "",
                     "harness": "kiro",
                     "cwd": "/tmp",
                     "task": "Fix auth",
@@ -262,7 +347,7 @@ class TestProcessCommands:
             payload = json.dumps(
                 {
                     "agent_id": "worker-1",
-                    "agent_name": "implementor",
+                    "agent_mode": "",
                     "harness": "nonexistent",
                     "cwd": ".",
                     "task": "",
@@ -326,7 +411,7 @@ class TestProcessCommands:
             payload = json.dumps(
                 {
                     "agent_id": "worker-1",
-                    "agent_name": "implementor",
+                    "agent_mode": "",
                     "harness": "kiro",
                     "cwd": ".",
                     "task": "",
@@ -379,7 +464,7 @@ class TestProcessCommands:
             payload = json.dumps(
                 {
                     "agent_id": "worker-1",
-                    "agent_name": "implementor",
+                    "agent_mode": "",
                     "harness": "kiro",
                     "cwd": ".",
                     "task": "Fix auth",
@@ -419,7 +504,7 @@ class TestProcessCommands:
 
         config = SessionConfig(
             project="test-session",
-            agents=[{"id": "orchestrator", "cmd": ["echo"], "cwd": "."}],
+            agents=[{"agent_id": "orchestrator", "harness": "kiro"}],
             settings=SettingsConfig(communication_mode=CommunicationMode.LOCAL),
         )
         broker = ACPBroker(config=config, db_path=tmp_path / "synth.db")
@@ -441,7 +526,7 @@ class TestProcessCommands:
             payload = json.dumps(
                 {
                     "agent_id": "worker",
-                    "agent_name": "implementor",
+                    "agent_mode": "",
                     "harness": "kiro",
                     "cwd": ".",
                     "task": "Fix auth",

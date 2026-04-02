@@ -27,8 +27,18 @@ from acp.schema import (
 from acp.transports import default_environment
 
 from acp import text_block
-from synth_acp.models.agent import TRANSITIONS, AgentState, InvalidTransitionError
+from synth_acp.models.agent import (
+    TRANSITIONS,
+    AgentMode,
+    AgentModel,
+    AgentState,
+    InvalidTransitionError,
+)
 from synth_acp.models.events import (
+    AgentModeChanged,
+    AgentModelChanged,
+    AgentModelsReceived,
+    AgentModesReceived,
     AgentStateChanged,
     AgentThoughtReceived,
     BrokerError,
@@ -160,6 +170,7 @@ class ACPSession:
         cwd: str,
         event_sink: EventSink,
         mcp_servers: list[McpServerStdio] | None = None,
+        agent_mode: str | None = None,
     ) -> None:
         self.agent_id = agent_id
         self.state = AgentState.UNSTARTED
@@ -173,6 +184,11 @@ class ACPSession:
         self._session_id: str | None = None
         self._permission_future: asyncio.Future[str] | None = None
         self._capabilities: Any = None
+        self._agent_mode = agent_mode
+        self._available_modes: list[AgentMode] = []
+        self._current_mode_id: str | None = None
+        self._available_models: list[AgentModel] = []
+        self._current_model_id: str | None = None
 
     async def _set_state(self, new_state: AgentState) -> None:
         """Transition state and notify broker. Awaited to prevent races."""
@@ -205,6 +221,57 @@ class ACPSession:
                 self._capabilities = getattr(init_response, "agent_capabilities", None)
                 session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers)
                 self._session_id = session.session_id
+
+                # Capture modes
+                if session.modes is not None:
+                    self._available_modes = [
+                        AgentMode(
+                            id=m.id,
+                            name=m.name,
+                            description=getattr(m, "description", None),
+                        )
+                        for m in session.modes.available_modes
+                    ]
+                    self._current_mode_id = session.modes.current_mode_id
+                    await self._event_sink(
+                        AgentModesReceived(
+                            agent_id=self.agent_id,
+                            available_modes=self._available_modes,
+                            current_mode_id=self._current_mode_id,
+                        )
+                    )
+
+                # Capture models (UNSTABLE capability — may be absent)
+                if session.models is not None:
+                    self._available_models = [
+                        AgentModel(
+                            id=m.model_id,
+                            name=m.name,
+                            description=getattr(m, "description", None),
+                        )
+                        for m in session.models.available_models
+                    ]
+                    self._current_model_id = session.models.current_model_id
+                    await self._event_sink(
+                        AgentModelsReceived(
+                            agent_id=self.agent_id,
+                            available_models=self._available_models,
+                            current_model_id=self._current_model_id,
+                        )
+                    )
+
+                # Apply agent_mode from config if advertised
+                if self._agent_mode is not None:
+                    mode_ids = {m.id for m in self._available_modes}
+                    if self._agent_mode in mode_ids:
+                        await self.set_mode(self._agent_mode)
+                    else:
+                        log.warning(
+                            "agent_mode '%s' not in available_modes for %s — skipping",
+                            self._agent_mode,
+                            self.agent_id,
+                        )
+
                 await self._set_state(AgentState.IDLE)
                 await proc.wait()
         except Exception as e:
@@ -244,6 +311,30 @@ class ACPSession:
         """Switch the agent's model."""
         if self._conn and self._session_id and self.state == AgentState.IDLE:
             await self._conn.set_session_model(model_id=model_id, session_id=self._session_id)
+            self._current_model_id = model_id
+            await self._event_sink(
+                AgentModelChanged(agent_id=self.agent_id, model_id=model_id)
+            )
+
+    @property
+    def available_modes(self) -> list[AgentMode]:
+        """Return a copy of available modes, or [] if none received."""
+        return list(self._available_modes)
+
+    @property
+    def current_mode_id(self) -> str | None:
+        """Return the current mode id, or None if not known."""
+        return self._current_mode_id
+
+    @property
+    def available_models(self) -> list[AgentModel]:
+        """Return a copy of available models, or [] if none received."""
+        return list(self._available_models)
+
+    @property
+    def current_model_id(self) -> str | None:
+        """Return the current model id, or None if not known."""
+        return self._current_model_id
 
     async def cancel(self) -> None:
         """Cancel the active prompt turn."""
@@ -327,6 +418,15 @@ class ACPSession:
                     cost_currency=getattr(cost, "currency", None) if cost else None,
                 )
             )
+        elif su == "current_mode_update":
+            mode_id = getattr(update, "current_mode_id", None) or getattr(
+                update, "currentModeId", None
+            )
+            if mode_id:
+                self._current_mode_id = mode_id
+                await self._event_sink(
+                    AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id)
+                )
 
     def resolve_permission(self, option_id: str) -> None:
         """Resolve the pending permission Future with the selected option_id.

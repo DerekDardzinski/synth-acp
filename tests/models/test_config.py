@@ -17,15 +17,15 @@ class TestSessionConfigValidation:
             SessionConfig(
                 project="test",
                 agents=[
-                    {"id": "agent1", "cmd": ["kiro-cli"]},
-                    {"id": "agent1", "cmd": ["claude"]},
+                    {"agent_id": "agent1", "harness": "kiro"},
+                    {"agent_id": "agent1", "harness": "claude"},
                 ],
             )
 
     def test_session_config_when_session_key_coerces_to_project(self):
         config = SessionConfig(
             session="test",
-            agents=[{"id": "a1", "cmd": ["kiro-cli"]}],
+            agents=[{"agent_id": "a1", "harness": "kiro"}],
         )
         assert config.project == "test"
 
@@ -39,7 +39,7 @@ class TestLoadConfig:
             json.dumps(
                 {
                     "session": "test",
-                    "agents": [{"id": "a1", "binary": "kiro-cli", "cwd": "./src/auth"}],
+                    "agents": [{"agent_id": "a1", "harness": "kiro", "cwd": "./src/auth"}],
                 }
             )
         )
@@ -54,24 +54,24 @@ class TestLoadConfig:
     def test_load_config_when_toml_file_parses_correctly(self, tmp_path: Path):
         config_file = tmp_path / ".synth.toml"
         config_file.write_text(
-            'project = "myproject"\n\n[[agents]]\nid = "kiro"\ncmd = ["kiro-cli", "acp"]\n'
+            'project = "myproject"\n\n[[agents]]\nagent_id = "kiro"\nharness = "kiro"\n'
         )
         config = load_config(config_file)
         assert config.project == "myproject"
-        assert config.agents[0].id == "kiro"
-        assert config.agents[0].cmd == ["kiro-cli", "acp"]
+        assert config.agents[0].agent_id == "kiro"
+        assert config.agents[0].harness == "kiro"
 
 
 class TestFindConfig:
     def test_find_config_when_both_files_exist_prefers_toml(self, tmp_path: Path):
-        (tmp_path / ".synth.toml").write_text('project = "t"\n[[agents]]\nid="a"\ncmd=["x"]\n')
-        (tmp_path / ".synth.json").write_text('{"project":"t","agents":[{"id":"a","cmd":["x"]}]}')
+        (tmp_path / ".synth.toml").write_text('project = "t"\n[[agents]]\nagent_id="a"\nharness="kiro"\n')
+        (tmp_path / ".synth.json").write_text('{"project":"t","agents":[{"agent_id":"a","harness":"kiro"}]}')
         result = find_config(tmp_path)
         assert result is not None
         assert result.name == ".synth.toml"
 
     def test_find_config_when_only_json_returns_json(self, tmp_path: Path):
-        (tmp_path / ".synth.json").write_text('{"project":"t","agents":[{"id":"a","cmd":["x"]}]}')
+        (tmp_path / ".synth.json").write_text('{"project":"t","agents":[{"agent_id":"a","harness":"kiro"}]}')
         result = find_config(tmp_path)
         assert result is not None
         assert result.name == ".synth.json"
@@ -85,13 +85,13 @@ class TestSettingsConfig:
         config_file = tmp_path / ".synth.toml"
         config_file.write_text(
             'project = "p"\n\n[settings]\ncommunication_mode = "LOCAL"\n\n'
-            '[[agents]]\nid = "a"\ncmd = ["x"]\n'
+            '[[agents]]\nagent_id = "a"\nharness = "kiro"\n'
         )
         config = load_config(config_file)
         assert config.settings.communication_mode == CommunicationMode.LOCAL
 
     def test_load_config_when_settings_absent_defaults_mesh(self, tmp_path: Path):
         config_file = tmp_path / ".synth.toml"
-        config_file.write_text('project = "p"\n\n[[agents]]\nid = "a"\ncmd = ["x"]\n')
+        config_file.write_text('project = "p"\n\n[[agents]]\nagent_id = "a"\nharness = "kiro"\n')
         config = load_config(config_file)
         assert config.settings.communication_mode == CommunicationMode.MESH

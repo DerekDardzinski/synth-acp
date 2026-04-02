@@ -9,7 +9,7 @@ from typing import Any, Literal
 from acp.schema import PermissionOption
 from pydantic import BaseModel, Field
 
-from synth_acp.models.agent import AgentState
+from synth_acp.models.agent import AgentMode, AgentModel, AgentState
 from synth_acp.models.permissions import PermissionDecision
 
 
@@ -136,3 +136,43 @@ class McpMessageDelivered(BrokerEvent):
     message_id: int | None = None
     kind: str = "chat"
     reply_to: int | None = None
+
+
+class AgentModesReceived(BrokerEvent):
+    """Agent advertised available modes after session creation.
+
+    Emitted once per session, immediately before AgentStateChanged(IDLE).
+    Only emitted if the agent's NewSessionResponse includes a modes payload.
+    """
+
+    available_modes: list[AgentMode]
+    current_mode_id: str
+
+
+class AgentModeChanged(BrokerEvent):
+    """Agent confirmed a mode switch via current_mode_update stream event."""
+
+    mode_id: str
+
+
+class AgentModelsReceived(BrokerEvent):
+    """Agent advertised available models after session creation.
+
+    Only emitted if the agent's NewSessionResponse includes a models payload.
+    This capability is marked UNSTABLE in the ACP SDK — many agents will not
+    include it. The UI must handle the case where this event never arrives.
+    """
+
+    available_models: list[AgentModel]
+    current_model_id: str
+
+
+class AgentModelChanged(BrokerEvent):
+    """The agent's active model changed.
+
+    Fired by the session after a successful set_session_model() call.
+    There is no ACP push notification for model changes, so this event is
+    emitted optimistically by the client immediately after the call returns.
+    """
+
+    model_id: str

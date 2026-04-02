@@ -39,3 +39,28 @@ class CancelTurn(BrokerCommand):
     """Cancel the active prompt on an agent."""
 
     agent_id: str
+
+
+class SetAgentMode(BrokerCommand):
+    """Request the broker to switch an agent's active mode.
+
+    Only valid when the agent is IDLE. The broker forwards this to
+    session.set_mode(), which calls set_session_mode() on the ACP connection.
+    The agent confirms via a current_mode_update stream event.
+    """
+
+    agent_id: str
+    mode_id: str
+
+
+class SetAgentModel(BrokerCommand):
+    """Request the broker to switch an agent's active model.
+
+    Only valid when the agent is IDLE. The broker forwards this to
+    session.set_model(), which calls set_session_model() on the ACP connection.
+    AgentModelChanged is emitted immediately after the call returns (no ACP
+    push notification exists for model changes).
+    """
+
+    agent_id: str
+    model_id: str

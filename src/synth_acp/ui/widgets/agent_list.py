@@ -51,6 +51,7 @@ class AgentTile(Vertical):
         self._state = state
         self._agent_task = task
         self._parent_agent = parent
+        self._current_mode: str | None = None
         super().__init__(id=f"tile-{agent_id}")
         if state == AgentState.AWAITING_PERMISSION:
             self.add_class("tile-permission")
@@ -73,12 +74,17 @@ class AgentTile(Vertical):
         name = f"[$primary bold]{self._agent_id}[/]"
         if self._parent_agent:
             name += f" [$text-muted](via {self._parent_agent})[/]"
+        mode_badge = (
+            f"  [$accent dim]{self._current_mode}[/]"
+            if self._current_mode
+            else ""
+        )
         preview = (
             f"[dim italic]{self._agent_task}[/dim italic]"
             if self._agent_task
             else PREVIEW_TEXT.get(self._state, DEFAULT_PREVIEW)
         )
-        return f"{dot} {name}{warn}\n  {preview}"
+        return f"{dot} {name}{warn}{mode_badge}\n  {preview}"
 
     def update_state(self, new_state: AgentState) -> None:
         """Update the tile to reflect a new agent state.
@@ -93,6 +99,17 @@ class AgentTile(Vertical):
             self.add_class("tile-permission")
         else:
             self.remove_class("tile-permission")
+
+    def update_mode(self, mode_name: str | None) -> None:
+        """Update the mode badge shown in the tile.
+
+        Pass None to clear the badge (e.g. on agent termination).
+
+        Args:
+            mode_name: Human-readable mode name, or None to clear.
+        """
+        self._current_mode = mode_name
+        self.query_one(".tile-label", Static).update(self._build_markup())
 
     def on_click(self) -> None:
         """Select this agent in the app."""

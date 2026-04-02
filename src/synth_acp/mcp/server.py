@@ -133,9 +133,9 @@ async def check_delivery(message_id: int) -> str:
 @mcp.tool()
 async def launch_agent(
     agent_id: str,
-    agent_name: str,
     harness: str,
     cwd: str = ".",
+    agent_mode: str = "",
     task: str = "",
     message: str = "",
 ) -> str:
@@ -143,9 +143,9 @@ async def launch_agent(
 
     Args:
         agent_id: Unique identifier for the new agent.
-        agent_name: Name/profile for the agent.
-        harness: Harness to use (e.g. 'kiro', 'claude').
+        harness: Harness to use (e.g. 'kiro', 'claude', 'opencode').
         cwd: Working directory for the agent.
+        agent_mode: ACP mode id to apply after session creation (optional).
         task: Description of the task for the agent.
         message: Initial message to send after the agent is idle.
 
@@ -158,8 +158,8 @@ async def launch_agent(
     payload = json.dumps(
         {
             "agent_id": agent_id,
-            "agent_name": agent_name,
             "harness": harness,
+            "agent_mode": agent_mode,
             "cwd": cwd,
             "task": task,
             "message": message,
