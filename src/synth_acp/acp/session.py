@@ -280,7 +280,9 @@ class ACPSession:
                         # exists yet.
                         try:
                             loaded = await conn.load_session(
-                                session_id=self._session_id, cwd=self._cwd
+                                session_id=self._session_id,
+                                cwd=self._cwd,
+                                mcp_servers=self._mcp_servers or None,
                             )
                             if loaded.models is not None:
                                 new_model = loaded.models.current_model_id
