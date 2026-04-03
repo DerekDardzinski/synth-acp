@@ -137,3 +137,16 @@ class TestToolCallBlockContent:
             block = app.query_one("#tool-tc7", ToolCallBlock)
             ro = block.query_one("#tc-raw-output", Static)
             assert "truncated" in str(ro.content)
+
+    async def test_tool_call_block_renders_kiro_nested_raw_output(self) -> None:
+        """Kiro's items[].Json.stdout format is extracted and rendered."""
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)):
+            feed = await _get_feed(app)
+            await feed.add_tool_call(
+                "tc8", "Run", "execute", "completed",
+                raw_output={"items": [{"Json": {"exit_status": "exit status: 0", "stdout": "hello world\n", "stderr": ""}}]},
+            )
+            block = app.query_one("#tool-tc8", ToolCallBlock)
+            ro = block.query_one("#tc-raw-output", Static)
+            assert "hello world" in str(ro.content)

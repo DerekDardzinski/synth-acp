@@ -21,18 +21,25 @@ from acp.schema import (
     AllowedOutcome,
     AvailableCommandsUpdate,
     ClientCapabilities,
+    CreateTerminalResponse,
     CurrentModeUpdate,
     DeniedOutcome,
+    EnvVariable,
     FileSystemCapabilities,
     Implementation,
+    KillTerminalResponse,
     McpServerStdio,
     PermissionOption,
+    ReleaseTerminalResponse,
     RequestPermissionResponse,
     SessionNotification,
+    TerminalExitStatus,
+    TerminalOutputResponse,
     ToolCallProgress,
     ToolCallStart,
     ToolCallUpdate,
     UsageUpdate,
+    WaitForTerminalExitResponse,
 )
 from acp.transports import default_environment
 
@@ -57,12 +64,14 @@ from synth_acp.models.events import (
     MessageChunkReceived,
     PermissionRequested,
     PlanReceived,
+    TerminalCreated,
     ToolCallDiff,
     ToolCallLocation,
     ToolCallUpdated,
     TurnComplete,
     UsageUpdated,
 )
+from synth_acp.terminal.manager import Command, TerminalProcess
 
 log = logging.getLogger(__name__)
 
@@ -162,6 +171,8 @@ class ACPSession:
         self._suppress_history_replay: bool = False
         self._accumulator = SessionAccumulator()
         self._accumulator.subscribe(self._on_snapshot)
+        self._terminals: dict[str, TerminalProcess] = {}
+        self._terminal_count: int = 0
 
     async def _set_state(self, new_state: AgentState) -> None:
         """Transition state and notify broker. Awaited to prevent races."""
@@ -188,7 +199,7 @@ class ACPSession:
                     protocol_version=1,
                     client_capabilities=ClientCapabilities(
                         fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
-                        terminal=False,
+                        terminal=True,
                     ),
                     client_info=Implementation(name="synth", version="0.1.0"),
                 )
@@ -280,6 +291,8 @@ class ACPSession:
             await self._event_sink(BrokerError(agent_id=self.agent_id, message=f"Agent error: {e}"))
 
         finally:
+            for t in self._terminals.values():
+                t.kill()
             if self._permission_future and not self._permission_future.done():
                 self._permission_future.cancel()
             if self.state != AgentState.TERMINATED:
@@ -406,6 +419,8 @@ class ACPSession:
         """
         if self._permission_future and not self._permission_future.done():
             self._permission_future.cancel()
+        for t in self._terminals.values():
+            t.kill()
         if self._proc is None:
             return
         try:
@@ -508,6 +523,7 @@ class ACPSession:
             default_status = "pending" if isinstance(update, ToolCallStart) else "in_progress"
             diffs: list[ToolCallDiff] = []
             text_parts: list[str] = []
+            terminal_id: str | None = None
             for item in update.content or []:
                 if item.type == "diff":
                     diffs.append(
@@ -523,6 +539,8 @@ class ACPSession:
                         text = getattr(inner, "text", None)
                         if text:
                             text_parts.append(text)
+                elif item.type == "terminal":
+                    terminal_id = item.terminal_id
             locations: list[ToolCallLocation] = [
                 ToolCallLocation(path=loc.path or "", line=loc.line)
                 for loc in update.locations or []
@@ -539,6 +557,7 @@ class ACPSession:
                     locations=locations,
                     raw_input=update.raw_input,
                     raw_output=update.raw_output,
+                    terminal_id=terminal_id,
                 )
             )
         elif isinstance(update, CurrentModeUpdate):
@@ -604,6 +623,120 @@ class ACPSession:
         return RequestPermissionResponse(
             outcome=AllowedOutcome(option_id=option_id, outcome="selected")
         )
+
+    async def create_terminal(
+        self,
+        command: str,
+        session_id: str,
+        args: list[str] | None = None,
+        cwd: str | None = None,
+        env: list[EnvVariable] | None = None,
+        output_byte_limit: int | None = None,
+        **kwargs: Any,
+    ) -> CreateTerminalResponse:
+        """Create a terminal process for the agent.
+
+        Args:
+            command: Command to execute.
+            session_id: ACP session ID.
+            args: Command arguments.
+            cwd: Working directory.
+            env: Environment variables.
+            output_byte_limit: Max bytes to retain in output buffer.
+
+        Returns:
+            Response containing the terminal ID.
+        """
+        terminal_env = {e.name: e.value for e in env} if env else {}
+        cmd = Command(command=command, args=args or [], env=terminal_env, cwd=cwd or self._cwd)
+        terminal = TerminalProcess(cmd, output_byte_limit=output_byte_limit)
+        await terminal.start()
+        self._terminal_count += 1
+        terminal_id = f"terminal-{self._terminal_count}"
+        self._terminals[terminal_id] = terminal
+        await self._event_sink(
+            TerminalCreated(
+                agent_id=self.agent_id,
+                terminal_id=terminal_id,
+                command=str(cmd),
+                terminal_process=terminal,
+            )
+        )
+        return CreateTerminalResponse(terminal_id=terminal_id)
+
+    async def terminal_output(
+        self, session_id: str, terminal_id: str, **kwargs: Any
+    ) -> TerminalOutputResponse:
+        """Return buffered output from a terminal.
+
+        Args:
+            session_id: ACP session ID.
+            terminal_id: Terminal to query.
+
+        Returns:
+            Response with output text, truncation flag, and optional exit status.
+
+        Raises:
+            KeyError: If terminal_id is unknown.
+        """
+        terminal = self._terminals[terminal_id]
+        state = terminal.tool_state
+        exit_status = (
+            TerminalExitStatus(exit_code=state.return_code, signal=state.signal)
+            if state.return_code is not None
+            else None
+        )
+        return TerminalOutputResponse(
+            output=state.output, truncated=state.truncated, exit_status=exit_status
+        )
+
+    async def kill_terminal(
+        self, session_id: str, terminal_id: str, **kwargs: Any
+    ) -> KillTerminalResponse | None:
+        """Kill a terminal process.
+
+        Args:
+            session_id: ACP session ID.
+            terminal_id: Terminal to kill.
+
+        Returns:
+            Empty response.
+        """
+        self._terminals[terminal_id].kill()
+        return KillTerminalResponse()
+
+    async def release_terminal(
+        self, session_id: str, terminal_id: str, **kwargs: Any
+    ) -> ReleaseTerminalResponse | None:
+        """Kill and release a terminal process.
+
+        Args:
+            session_id: ACP session ID.
+            terminal_id: Terminal to release.
+
+        Returns:
+            Empty response.
+        """
+        terminal = self._terminals[terminal_id]
+        terminal.kill()
+        terminal.release()
+        return ReleaseTerminalResponse()
+
+    async def wait_for_terminal_exit(
+        self, session_id: str, terminal_id: str, **kwargs: Any
+    ) -> WaitForTerminalExitResponse:
+        """Wait for a terminal process to exit.
+
+        Args:
+            session_id: ACP session ID.
+            terminal_id: Terminal to wait on.
+
+        Returns:
+            Response with exit code and signal.
+        """
+        terminal = self._terminals[terminal_id]
+        exit_code, terminal_signal = await terminal.wait_for_exit()
+        return WaitForTerminalExitResponse(exit_code=exit_code, signal=terminal_signal)
 
     def on_connect(self, conn: Any) -> None:
         """Called when the ACP connection is established."""

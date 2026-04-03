@@ -31,6 +31,7 @@ from synth_acp.models.events import (
     MessageChunkReceived,
     PermissionRequested,
     PlanReceived,
+    TerminalCreated,
     ToolCallUpdated,
     TurnComplete,
     UsageUpdated,
@@ -252,7 +253,10 @@ class SynthApp(App):
                 raw_output=event.raw_output,
                 diffs=event.diffs,
                 text_content=event.text_content,
+                terminal_id=event.terminal_id,
             )
+        elif isinstance(event, TerminalCreated):
+            await feed.mount_terminal(event.terminal_id, event.terminal_process)
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
             feed.input_bar.set_busy(False)
@@ -320,7 +324,10 @@ class SynthApp(App):
                 raw_output=event.raw_output,
                 diffs=event.diffs,
                 text_content=event.text_content,
+                terminal_id=event.terminal_id,
             )
+        elif isinstance(event, TerminalCreated):
+            await feed.mount_terminal(event.terminal_id, event.terminal_process)
         elif isinstance(event, PermissionRequested):
             if self.broker.is_permission_pending(event.agent_id):
                 self._mount_permission_bar(feed, event)

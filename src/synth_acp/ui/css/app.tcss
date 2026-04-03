@@ -427,3 +427,15 @@ LaunchAgentScreen, HelpScreen {
     padding: 0 1;
     color: $text-muted;
 }
+
+/* ── Terminal widget ── */
+Terminal {
+    height: auto;
+    border: panel $text-primary;
+}
+Terminal.-success {
+    border: panel $success 90%;
+}
+Terminal.-error {
+    border: panel $error 90%;
+}

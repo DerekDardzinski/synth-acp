@@ -32,6 +32,39 @@ _STATUS_BADGE: dict[str, str] = {
 }
 
 
+def _extract_raw_output_text(raw_output: Any) -> str | None:
+    """Extract display text from raw_output, handling nested formats.
+
+    Supports:
+    - Direct string
+    - Dict with top-level keys: output, stdout, result, content
+    - Kiro format: {"items": [{"Json": {"stdout": "...", "stderr": "..."}}]}
+    """
+    if isinstance(raw_output, str):
+        return raw_output
+    if not isinstance(raw_output, dict):
+        return None
+    # Top-level keys
+    for key in ("output", "stdout", "result", "content"):
+        if key in raw_output:
+            return str(raw_output[key])
+    # Kiro nested format: items[].Json.{stdout,stderr}
+    items = raw_output.get("items")
+    if isinstance(items, list):
+        parts: list[str] = []
+        for item in items:
+            if isinstance(item, dict):
+                json_val = item.get("Json") or item.get("json")
+                if isinstance(json_val, dict):
+                    for key in ("stdout", "output", "result", "content"):
+                        if json_val.get(key):
+                            parts.append(str(json_val[key]))
+                            break
+        if parts:
+            return "".join(parts)
+    return None
+
+
 class ToolCallBlock(Vertical):
     """Displays a tool call with kind icon, title, status badge, and content.
 
@@ -58,11 +91,13 @@ class ToolCallBlock(Vertical):
         raw_output: Any = None,
         diffs: list[ToolCallDiff] | None = None,
         text_content: str | None = None,
+        terminal_id: str | None = None,
     ) -> None:
         super().__init__(id=f"tool-{tool_call_id}")
         self._title = title
         self._kind = kind
         self._status = status
+        self._terminal_id = terminal_id
         self._initial_locations = locations
         self._initial_raw_input = raw_input
         self._initial_raw_output = raw_output
@@ -133,14 +168,7 @@ class ToolCallBlock(Vertical):
             return []
         if raw_output is None or self._raw_output_rendered:
             return []
-        text = None
-        if isinstance(raw_output, dict):
-            for key in ("output", "stdout", "result", "content"):
-                if key in raw_output:
-                    text = str(raw_output[key])
-                    break
-        elif isinstance(raw_output, str):
-            text = raw_output
+        text = _extract_raw_output_text(raw_output)
         if not text:
             return []
         lines = text.split("\n")

@@ -68,6 +68,7 @@ ignore = [
 "src/*" = ["T201"]
 "src/synth_acp/cli.py" = ["T201", "B008"]
 "src/synth_acp/acp/session.py" = ["ARG002"]  # ACP Client protocol requires unused params
+"src/synth_acp/ui/ansi/*" = ["N806", "B019", "RUF012", "C416", "A001", "RUF009", "B905", "RUF001", "F601", "UP028", "PLC0205"]  # Vendored from toad — no logic changes (NFR-001)
 
 [tool.ruff.lint.isort]
 known-first-party = ["synth_acp"]
@@ -82,3 +83,12 @@ python-version = "3.12"
 
 [tool.ty.src]
 include = ["src", "tests"]
+
+# Vendored from toad — no logic changes (NFR-001)
+[[tool.ty.overrides]]
+include = ["src/synth_acp/ui/ansi/*"]
+
+[tool.ty.overrides.rules]
+invalid-return-type = "ignore"
+invalid-assignment = "ignore"
+invalid-argument-type = "ignore"

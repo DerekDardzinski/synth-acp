@@ -639,3 +639,92 @@ class TestMcpRestore:
         await session.session_update("sess-1", _msg_chunk("still works"))
         await asyncio.sleep(0)
         assert len(events) == 1
+
+
+class TestTerminalCallbacks:
+    """Tests for ACPSession terminal RPC callbacks."""
+
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def session(self, events: list[BrokerEvent]) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        s = ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd="/tmp",
+            event_sink=sink,
+        )
+        s._session_id = "sess-1"
+        return s
+
+    async def test_create_terminal_when_called_returns_terminal_id_and_emits_event(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Terminal creation must return an ID and emit TerminalCreated — otherwise
+        agent gets no terminal_id and all subsequent RPCs fail."""
+        from synth_acp.models.events import TerminalCreated
+
+        resp = await session.create_terminal(command="echo", session_id="s1", args=["hi"])
+        assert resp.terminal_id
+        assert len(events) == 1
+        evt = events[0]
+        assert isinstance(evt, TerminalCreated)
+        assert evt.terminal_id == resp.terminal_id
+        assert evt.agent_id == "test"
+
+    async def test_terminal_output_when_process_exited_includes_exit_status(
+        self, session: ACPSession
+    ) -> None:
+        """terminal_output must include exit_status when process has exited — otherwise
+        agent can't tell if command succeeded."""
+        from unittest.mock import MagicMock
+
+        from synth_acp.terminal.manager import ToolState
+
+        mock_terminal = MagicMock()
+        mock_terminal.tool_state = ToolState(output="hi", truncated=False, return_code=0)
+        session._terminals["t-1"] = mock_terminal
+
+        resp = await session.terminal_output(session_id="s1", terminal_id="t-1")
+        assert resp.output == "hi"
+        assert resp.exit_status is not None
+        assert resp.exit_status.exit_code == 0
+
+    async def test_terminal_output_when_unknown_terminal_id_raises_key_error(
+        self, session: ACPSession
+    ) -> None:
+        """Unknown terminal_id must raise KeyError — SDK propagates as JSON-RPC error."""
+        with pytest.raises(KeyError):
+            await session.terminal_output(session_id="s1", terminal_id="nonexistent")
+
+    async def test_emit_from_notification_when_terminal_content_extracts_terminal_id(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """TerminalToolCallContent must extract terminal_id into ToolCallUpdated —
+        otherwise UI can't associate terminal widget with tool call block."""
+        from acp.schema import TerminalToolCallContent
+
+        terminal_item = TerminalToolCallContent(type="terminal", terminal_id="t-1")
+        update = ToolCallStart(
+            tool_call_id="tc-1",
+            title="Run command",
+            kind="execute",
+            status="pending",
+            content=[terminal_item],
+            locations=None,
+            raw_input=None,
+            raw_output=None,
+            session_update="tool_call",
+        )
+        await session.session_update("sess-1", update)
+        await asyncio.sleep(0)
+        assert len(events) == 1
+        evt = events[0]
+        assert isinstance(evt, ToolCallUpdated)
+        assert evt.terminal_id == "t-1"

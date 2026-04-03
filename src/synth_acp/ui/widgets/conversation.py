@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from textual.app import ComposeResult
 from textual.containers import ScrollableContainer, Vertical
@@ -17,6 +17,9 @@ from synth_acp.ui.widgets.plan_block import PlanBlock
 from synth_acp.ui.widgets.prompt_bubble import PromptBubble
 from synth_acp.ui.widgets.thought_block import ThoughtBlock
 from synth_acp.ui.widgets.tool_call import ToolCallBlock
+
+if TYPE_CHECKING:
+    from synth_acp.terminal.manager import TerminalProcess
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +50,7 @@ class ConversationFeed(Vertical):
         self._plan_block: PlanBlock | None = None
         self._scroll: ScrollableContainer | None = None
         self.input_bar: InputBar | None = None
+        self._pending_terminals: dict[str, TerminalProcess] = {}
 
     def compose(self) -> ComposeResult:
         """Yield the scrollable container and input bar."""
@@ -134,6 +138,7 @@ class ConversationFeed(Vertical):
         raw_output: Any = None,
         diffs: list[ToolCallDiff] | None = None,
         text_content: str | None = None,
+        terminal_id: str | None = None,
     ) -> None:
         """Mount a new ToolCallBlock or update an existing one.
 
@@ -150,6 +155,7 @@ class ConversationFeed(Vertical):
             raw_output: Raw output payload from the ACP SDK.
             diffs: File edit diffs extracted from the tool call.
             text_content: Extracted text content from the tool call.
+            terminal_id: Terminal ID to associate with this tool call.
         """
         try:
             existing = self.query_one(f"#tool-{tool_call_id}", ToolCallBlock)
@@ -176,11 +182,17 @@ class ConversationFeed(Vertical):
                 raw_output=raw_output,
                 diffs=diffs,
                 text_content=text_content,
+                terminal_id=terminal_id,
             )
             if self._scroll is None:
                 return
             target = self._mount_target or self._scroll
             await target.mount(block)
+            if terminal_id and terminal_id in self._pending_terminals:
+                from synth_acp.ui.widgets.terminal import Terminal
+
+                process = self._pending_terminals.pop(terminal_id)
+                await block.mount(Terminal(process))
             self._scroll.scroll_end(animate=False)
 
     async def finalize_current_message(self) -> None:
@@ -235,3 +247,21 @@ class ConversationFeed(Vertical):
         )
         turn.mount(widget)
         self._scroll.scroll_end(animate=False)
+
+    async def mount_terminal(self, terminal_id: str, terminal_process: TerminalProcess) -> None:
+        """Mount a Terminal widget inside the matching ToolCallBlock.
+
+        If no matching block exists yet, stash in _pending_terminals for
+        later mounting when add_tool_call creates the block.
+
+        Args:
+            terminal_id: Terminal identifier to match against ToolCallBlock.
+            terminal_process: The TerminalProcess to display.
+        """
+        from synth_acp.ui.widgets.terminal import Terminal
+
+        for block in self.query(ToolCallBlock):
+            if block._terminal_id == terminal_id:
+                await block.mount(Terminal(terminal_process))
+                return
+        self._pending_terminals[terminal_id] = terminal_process

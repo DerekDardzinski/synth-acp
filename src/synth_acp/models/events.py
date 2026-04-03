@@ -77,6 +77,7 @@ class ToolCallUpdated(BrokerEvent):
     raw_output: Any = None
     diffs: list[ToolCallDiff] = Field(default_factory=list)
     text_content: str | None = None
+    terminal_id: str | None = None
 
 
 class BrokerError(BrokerEvent):
@@ -189,3 +190,17 @@ class AvailableCommandsReceived(BrokerEvent):
     """Agent advertised its available slash commands."""
 
     commands: list[Any]
+
+
+class TerminalCreated(BrokerEvent):
+    """A terminal was created for an agent.
+
+    Attributes:
+        terminal_id: Unique identifier for the terminal.
+        command: The command that was executed.
+        terminal_process: Reference to the TerminalProcess (Any to avoid layer import).
+    """
+
+    terminal_id: str
+    command: str
+    terminal_process: Any
