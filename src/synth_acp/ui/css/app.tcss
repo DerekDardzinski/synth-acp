@@ -174,6 +174,7 @@ ToolCallBlock.tool-permission {
 /* ── ToolCallBlock content ── */
 #tc-location { color: $text-muted; text-style: italic; padding-left: 2; }
 #tc-raw-input { color: $text-muted; background: $surface; padding: 0 1; margin: 0 0 0 2; }
+#tc-raw-output { color: $text-muted; background: $surface; padding: 0 1; margin: 0 0 0 2; }
 #tc-text { padding-left: 2; }
 
 /* ── Diff view ── */

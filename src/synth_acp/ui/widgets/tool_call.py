@@ -15,6 +15,11 @@ TOOL_KIND_STYLE: dict[str, tuple[str, str]] = {
     "edit": ("✎", "#a78bfa"),
     "execute": ("⚡", "#f97316"),
     "delete": ("✕", "#f87171"),
+    "move": ("⇄", "#94a3b8"),
+    "search": ("⌕", "#34d399"),
+    "think": ("◌", "#c4b5fd"),
+    "fetch": ("↓", "#38bdf8"),
+    "switch_mode": ("⊞", "#64748b"),
 }
 
 _FALLBACK_STYLE = ("◈", "#64748b")
@@ -50,6 +55,7 @@ class ToolCallBlock(Vertical):
         *,
         locations: list[ToolCallLocation] | None = None,
         raw_input: Any = None,
+        raw_output: Any = None,
         diffs: list[ToolCallDiff] | None = None,
         text_content: str | None = None,
     ) -> None:
@@ -59,10 +65,12 @@ class ToolCallBlock(Vertical):
         self._status = status
         self._initial_locations = locations
         self._initial_raw_input = raw_input
+        self._initial_raw_output = raw_output
         self._initial_diffs = diffs
         self._initial_text_content = text_content
         self._locations_rendered = False
         self._raw_input_rendered = False
+        self._raw_output_rendered = False
         self._text_rendered = False
 
     def _build_markup(self) -> str:
@@ -78,6 +86,7 @@ class ToolCallBlock(Vertical):
         yield from self._raw_input_widgets(self._initial_raw_input)
         yield from self._text_widgets(self._initial_text_content)
         yield from self._diff_widgets(self._initial_diffs)
+        yield from self._raw_output_widgets(self._initial_raw_output)
 
     def _location_widgets(self, locations: list[ToolCallLocation] | None) -> list[Static]:
         """Build location widget if applicable."""
@@ -118,6 +127,30 @@ class ToolCallBlock(Vertical):
             for d in diffs
         ]
 
+    def _raw_output_widgets(self, raw_output: Any) -> list[Static]:
+        """Build raw output widget for execute/search/fetch kinds."""
+        if self._kind not in {"execute", "search", "fetch"}:
+            return []
+        if raw_output is None or self._raw_output_rendered:
+            return []
+        text = None
+        if isinstance(raw_output, dict):
+            for key in ("output", "stdout", "result", "content"):
+                if key in raw_output:
+                    text = str(raw_output[key])
+                    break
+        elif isinstance(raw_output, str):
+            text = raw_output
+        if not text:
+            return []
+        lines = text.split("\n")
+        if len(lines) > 200:
+            text = "\n".join(lines[:200]) + "\n[dim]… (truncated)[/dim]"
+        elif len(text) > 4000:
+            text = text[:4000] + "\n[dim]… (truncated)[/dim]"
+        self._raw_output_rendered = True
+        return [Static(text, id="tc-raw-output")]
+
     def update_status(self, status: str) -> None:
         """Update the status badge.
 
@@ -131,6 +164,7 @@ class ToolCallBlock(Vertical):
         self,
         locations: list[ToolCallLocation] | None = None,
         raw_input: Any = None,
+        raw_output: Any = None,
         diffs: list[ToolCallDiff] | None = None,
         text_content: str | None = None,
     ) -> None:
@@ -139,6 +173,7 @@ class ToolCallBlock(Vertical):
         Args:
             locations: File locations referenced by the tool call.
             raw_input: Raw input payload from the ACP SDK.
+            raw_output: Raw output payload from the ACP SDK.
             diffs: File edit diffs extracted from the tool call.
             text_content: Extracted text content from the tool call.
         """
@@ -150,5 +185,6 @@ class ToolCallBlock(Vertical):
         for dv in diff_views:
             await dv.prepare()
         widgets.extend(diff_views)
+        widgets.extend(self._raw_output_widgets(raw_output))
         for w in widgets:
             await self.mount(w)

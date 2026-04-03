@@ -195,6 +195,7 @@ class InputBar(Vertical):
         self._agent_id = agent_id
         self._agent_name = agent_name
         self._harness = harness
+        self._slash_commands: list[object] = []
 
     def compose(self) -> ComposeResult:
         """Yield the text area and info bar."""
@@ -274,6 +275,16 @@ class InputBar(Vertical):
             app.run_worker(
                 app.broker.handle(SetAgentModel(agent_id=self._agent_id, model_id=option_id))
             )
+
+    # --- Slash commands ---
+
+    def update_slash_commands(self, commands: list[object]) -> None:
+        """Store available slash commands received from the agent.
+
+        Args:
+            commands: List of AvailableCommand from the ACP SDK.
+        """
+        self._slash_commands = list(commands)
 
     # --- Existing functionality ---
 

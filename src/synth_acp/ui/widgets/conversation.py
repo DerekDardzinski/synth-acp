@@ -13,6 +13,7 @@ from textual.widgets import Static
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.widgets.agent_message import AgentMessage
 from synth_acp.ui.widgets.input_bar import InputBar
+from synth_acp.ui.widgets.plan_block import PlanBlock
 from synth_acp.ui.widgets.prompt_bubble import PromptBubble
 from synth_acp.ui.widgets.thought_block import ThoughtBlock
 from synth_acp.ui.widgets.tool_call import ToolCallBlock
@@ -43,6 +44,7 @@ class ConversationFeed(Vertical):
         self._current_message: AgentMessage | None = None
         self._current_thought: ThoughtBlock | None = None
         self._current_turn: TurnContainer | None = None
+        self._plan_block: PlanBlock | None = None
         self._scroll: ScrollableContainer | None = None
         self.input_bar: InputBar | None = None
 
@@ -129,6 +131,7 @@ class ConversationFeed(Vertical):
         *,
         locations: list[ToolCallLocation] | None = None,
         raw_input: Any = None,
+        raw_output: Any = None,
         diffs: list[ToolCallDiff] | None = None,
         text_content: str | None = None,
     ) -> None:
@@ -144,6 +147,7 @@ class ConversationFeed(Vertical):
             status: Current status string.
             locations: File locations referenced by the tool call.
             raw_input: Raw input payload from the ACP SDK.
+            raw_output: Raw output payload from the ACP SDK.
             diffs: File edit diffs extracted from the tool call.
             text_content: Extracted text content from the tool call.
         """
@@ -153,6 +157,7 @@ class ConversationFeed(Vertical):
             await existing.update_content(
                 locations=locations,
                 raw_input=raw_input,
+                raw_output=raw_output,
                 diffs=diffs,
                 text_content=text_content,
             )
@@ -168,6 +173,7 @@ class ConversationFeed(Vertical):
                 status,
                 locations=locations,
                 raw_input=raw_input,
+                raw_output=raw_output,
                 diffs=diffs,
                 text_content=text_content,
             )
@@ -186,6 +192,23 @@ class ConversationFeed(Vertical):
             await self._current_message.finalize()
             self._current_message = None
         self._current_turn = None
+
+    async def update_plan(self, entries: list[object]) -> None:
+        """Replace the plan block with updated entries.
+
+        Args:
+            entries: Full replacement list of plan entries from the agent.
+        """
+        if self._scroll is None:
+            return
+        if self._plan_block is not None:
+            await self._plan_block.remove()
+            self._plan_block = None
+        block = PlanBlock(entries)  # type: ignore[arg-type]
+        self._plan_block = block
+        target = self._mount_target or self._scroll
+        await target.mount(block)
+        self._scroll.scroll_end(animate=False)
 
     def add_mcp_message(self, from_agent: str, to_agent: str, preview: str) -> None:
         """Mount an MCP message delivery notification inside a new turn.

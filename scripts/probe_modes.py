@@ -18,8 +18,9 @@ class ProbeClient(Client):
         pass
 
     async def request_permission(self, options: Any, session_id: str, tool_call: Any, **kwargs: Any) -> Any:
-        from acp import RequestPermissionResponse
         from acp.schema import AllowedOutcome
+
+        from acp import RequestPermissionResponse
         return RequestPermissionResponse(
             outcome=AllowedOutcome(option_id=options[0].option_id, outcome="selected")
         )

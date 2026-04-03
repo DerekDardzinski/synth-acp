@@ -16,8 +16,10 @@ from acp.client.connection import ClientSideConnection
 from acp.contrib.session_state import SessionAccumulator
 from acp.schema import (
     AgentMessageChunk,
+    AgentPlanUpdate,
     AgentThoughtChunk,
     AllowedOutcome,
+    AvailableCommandsUpdate,
     ClientCapabilities,
     CurrentModeUpdate,
     DeniedOutcome,
@@ -49,10 +51,12 @@ from synth_acp.models.events import (
     AgentModesReceived,
     AgentStateChanged,
     AgentThoughtReceived,
+    AvailableCommandsReceived,
     BrokerError,
     BrokerEvent,
     MessageChunkReceived,
     PermissionRequested,
+    PlanReceived,
     ToolCallDiff,
     ToolCallLocation,
     ToolCallUpdated,
@@ -534,6 +538,7 @@ class ACPSession:
                     text_content="\n".join(text_parts) if text_parts else None,
                     locations=locations,
                     raw_input=update.raw_input,
+                    raw_output=update.raw_output,
                 )
             )
         elif isinstance(update, CurrentModeUpdate):
@@ -541,6 +546,17 @@ class ACPSession:
             if mode_id is not None:
                 self._current_mode_id = mode_id
                 await self._event_sink(AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id))
+        elif isinstance(update, AgentPlanUpdate):
+            await self._event_sink(
+                PlanReceived(agent_id=self.agent_id, entries=list(update.entries))
+            )
+        elif isinstance(update, AvailableCommandsUpdate):
+            await self._event_sink(
+                AvailableCommandsReceived(
+                    agent_id=self.agent_id,
+                    commands=list(update.available_commands),
+                )
+            )
         else:
             log.debug("Unhandled update type: %s", type(update).__name__)
 

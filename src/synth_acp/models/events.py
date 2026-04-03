@@ -74,6 +74,7 @@ class ToolCallUpdated(BrokerEvent):
     status: str
     locations: list[ToolCallLocation] = Field(default_factory=list)
     raw_input: Any = None
+    raw_output: Any = None
     diffs: list[ToolCallDiff] = Field(default_factory=list)
     text_content: str | None = None
 
@@ -176,3 +177,15 @@ class AgentModelChanged(BrokerEvent):
     """
 
     model_id: str
+
+
+class PlanReceived(BrokerEvent):
+    """Agent sent a full plan update."""
+
+    entries: list[Any]
+
+
+class AvailableCommandsReceived(BrokerEvent):
+    """Agent advertised its available slash commands."""
+
+    commands: list[Any]

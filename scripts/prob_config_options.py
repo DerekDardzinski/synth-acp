@@ -37,7 +37,6 @@ from acp.schema import (
 )
 from acp.transports import default_environment
 
-
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 
 RESET = "\033[0m"
@@ -319,7 +318,7 @@ async def _test_resume_session(
 ) -> None:
     section("4 · session/resume — MCP server re-passing after mode switch")
 
-    print(f"""
+    print("""
   Context: Kiro drops MCP server connections when set_session_mode is called.
   session/resume re-passes mcp_servers to an existing session. Unlike
   session/load it should NOT replay conversation history.
@@ -423,7 +422,7 @@ async def _test_resume_session(
     print(f"  {'-' * 20} {'-' * 12} {'-' * 6}  {'-' * 8}")
 
     def result_str(ok_flag: bool, error: str) -> str:
-        return (GREEN + "ok" + RESET) if ok_flag else (RED + f"error" + RESET)
+        return (GREEN + "ok" + RESET) if ok_flag else (RED + "error" + RESET)
 
     print(
         f"  {'session/resume':<20} {result_str(resume_ok, resume_error):<20} {resume_elapsed:>6}  {resume_updates:>8}"
@@ -440,7 +439,7 @@ async def _test_resume_session(
     if resume_ok and resume_updates == 0:
         ok("session/resume works cleanly — use it to restore MCP servers after set_session_mode")
         ok("No history replay, no suppression flag needed")
-        print(f"""
+        print("""
     Sequence:
       set_session_mode(new_mode)
       set_session_model(current_model)   # Option A: preserve model
@@ -449,7 +448,7 @@ async def _test_resume_session(
     elif resume_ok and resume_updates > 0:
         warn("session/resume works but triggers updates — behaves like session/load")
         warn("Use _suppress_history_replay flag in session_update for both methods")
-        print(f"""
+        print("""
     Sequence:
       set_session_mode(new_mode)
       set_session_model(current_model)

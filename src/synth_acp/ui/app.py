@@ -24,11 +24,13 @@ from synth_acp.models.events import (
     AgentModesReceived,
     AgentStateChanged,
     AgentThoughtReceived,
+    AvailableCommandsReceived,
     BrokerError,
     BrokerEvent,
     McpMessageDelivered,
     MessageChunkReceived,
     PermissionRequested,
+    PlanReceived,
     ToolCallUpdated,
     TurnComplete,
     UsageUpdated,
@@ -247,12 +249,18 @@ class SynthApp(App):
                 event.status,
                 locations=event.locations,
                 raw_input=event.raw_input,
+                raw_output=event.raw_output,
                 diffs=event.diffs,
                 text_content=event.text_content,
             )
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
             feed.input_bar.set_busy(False)
+        elif isinstance(event, PlanReceived):
+            await feed.update_plan(event.entries)
+        elif isinstance(event, AvailableCommandsReceived):
+            if feed.input_bar is not None:
+                feed.input_bar.update_slash_commands(event.commands)
         elif isinstance(event, UsageUpdated):
             self._update_usage_display(event)
         elif isinstance(event, BrokerError):
@@ -309,6 +317,7 @@ class SynthApp(App):
                 event.status,
                 locations=event.locations,
                 raw_input=event.raw_input,
+                raw_output=event.raw_output,
                 diffs=event.diffs,
                 text_content=event.text_content,
             )
@@ -317,6 +326,11 @@ class SynthApp(App):
                 self._mount_permission_bar(feed, event)
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
+        elif isinstance(event, PlanReceived):
+            await feed.update_plan(event.entries)
+        elif isinstance(event, AvailableCommandsReceived):
+            if feed.input_bar is not None:
+                feed.input_bar.update_slash_commands(event.commands)
         elif isinstance(event, McpMessageDelivered):
             feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
 

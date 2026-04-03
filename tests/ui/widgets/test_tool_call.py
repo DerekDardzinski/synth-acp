@@ -99,3 +99,41 @@ class TestToolCallBlockContent:
             )
             loc_widgets = block.query("#tc-location")
             assert len(loc_widgets) == 1
+
+    async def test_tool_call_block_renders_raw_output_for_execute_kind(self) -> None:
+        """raw_output with execute kind renders the output widget."""
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)):
+            feed = await _get_feed(app)
+            await feed.add_tool_call(
+                "tc5", "Run", "execute", "completed",
+                raw_output={"output": "hello"},
+            )
+            block = app.query_one("#tool-tc5", ToolCallBlock)
+            ro = block.query_one("#tc-raw-output", Static)
+            assert "hello" in str(ro.content)
+
+    async def test_tool_call_block_does_not_render_raw_output_for_read_kind(self) -> None:
+        """raw_output with read kind is suppressed."""
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)):
+            feed = await _get_feed(app)
+            await feed.add_tool_call(
+                "tc6", "Read", "read", "completed",
+                raw_output={"output": "content"},
+            )
+            block = app.query_one("#tool-tc6", ToolCallBlock)
+            assert len(block.query("#tc-raw-output")) == 0
+
+    async def test_tool_call_block_truncates_long_raw_output(self) -> None:
+        """Output exceeding 200 lines is truncated."""
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)):
+            feed = await _get_feed(app)
+            await feed.add_tool_call(
+                "tc7", "Run", "execute", "completed",
+                raw_output={"output": "\n".join(["x"] * 300)},
+            )
+            block = app.query_one("#tool-tc7", ToolCallBlock)
+            ro = block.query_one("#tc-raw-output", Static)
+            assert "truncated" in str(ro.content)
