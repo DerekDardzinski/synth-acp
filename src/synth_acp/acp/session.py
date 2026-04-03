@@ -13,16 +13,24 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from acp.client.connection import ClientSideConnection
+from acp.contrib.session_state import SessionAccumulator
 from acp.schema import (
+    AgentMessageChunk,
+    AgentThoughtChunk,
     AllowedOutcome,
     ClientCapabilities,
+    CurrentModeUpdate,
     DeniedOutcome,
     FileSystemCapabilities,
     Implementation,
     McpServerStdio,
     PermissionOption,
     RequestPermissionResponse,
+    SessionNotification,
+    ToolCallProgress,
+    ToolCallStart,
     ToolCallUpdate,
+    UsageUpdate,
 )
 from acp.transports import default_environment
 
@@ -55,48 +63,6 @@ from synth_acp.models.events import (
 log = logging.getLogger(__name__)
 
 EventSink = Callable[[BrokerEvent], Awaitable[None]]
-
-
-def _extract_tool_call_content(update: Any) -> dict[str, Any]:
-    """Extract diffs, text_content, locations, and raw_input from an ACP update.
-
-    Args:
-        update: ACP SDK ToolCallUpdate or similar object.
-
-    Returns:
-        Dict with keys diffs, text_content, locations, raw_input suitable
-        for passing to ToolCallUpdated.
-    """
-    diffs: list[ToolCallDiff] = []
-    text_parts: list[str] = []
-    for item in getattr(update, "content", None) or []:
-        item_type = getattr(item, "type", None)
-        if item_type == "diff":
-            diffs.append(
-                ToolCallDiff(
-                    path=getattr(item, "path", ""),
-                    old_text=getattr(item, "old_text", None),
-                    new_text=getattr(item, "new_text", ""),
-                )
-            )
-        elif item_type == "content":
-            inner = getattr(item, "content", None)
-            if inner and getattr(inner, "type", None) == "text":
-                text = getattr(inner, "text", None)
-                if text:
-                    text_parts.append(text)
-    locations: list[ToolCallLocation] = []
-    for loc in getattr(update, "locations", None) or []:
-        locations.append(
-            ToolCallLocation(path=getattr(loc, "path", ""), line=getattr(loc, "line", None))
-        )
-    text_content = "\n".join(text_parts) if text_parts else None
-    return {
-        "diffs": diffs,
-        "text_content": text_content,
-        "locations": locations,
-        "raw_input": getattr(update, "raw_input", None),
-    }
 
 
 _SHUTDOWN_TIMEOUT = 2.0
@@ -190,6 +156,8 @@ class ACPSession:
         self._available_models: list[AgentModel] = []
         self._current_model_id: str | None = None
         self._suppress_history_replay: bool = False
+        self._accumulator = SessionAccumulator()
+        self._accumulator.subscribe(self._on_snapshot)
 
     async def _set_state(self, new_state: AgentState) -> None:
         """Transition state and notify broker. Awaited to prevent races."""
@@ -205,9 +173,10 @@ class ACPSession:
         """Main lifecycle — spawns agent, handshakes, waits for exit."""
         try:
             await self._set_state(AgentState.INITIALIZING)
-            async with _spawn_isolated_agent(
-                self, self._binary, *self._args, cwd=self._cwd
-            ) as (conn, proc):
+            async with _spawn_isolated_agent(self, self._binary, *self._args, cwd=self._cwd) as (
+                conn,
+                proc,
+            ):
                 self._conn = conn
                 self._proc = proc
 
@@ -270,9 +239,7 @@ class ACPSession:
                         )
                         self._current_mode_id = self._agent_mode
                         await self._event_sink(
-                            AgentModeChanged(
-                                agent_id=self.agent_id, mode_id=self._agent_mode
-                            )
+                            AgentModeChanged(agent_id=self.agent_id, mode_id=self._agent_mode)
                         )
                         # Re-read model state — mode switch may change the model.
                         # Safe to load_session here because no conversation history
@@ -286,14 +253,16 @@ class ACPSession:
                             if loaded.models is not None:
                                 new_model = loaded.models.current_model_id
                                 if new_model and new_model != self._current_model_id:
-                                        self._current_model_id = new_model
-                                        await self._event_sink(
-                                            AgentModelChanged(
-                                                agent_id=self.agent_id, model_id=new_model
-                                            )
+                                    self._current_model_id = new_model
+                                    await self._event_sink(
+                                        AgentModelChanged(
+                                            agent_id=self.agent_id, model_id=new_model
                                         )
+                                    )
                         except Exception:
-                            log.debug("Model re-read after initial mode switch failed", exc_info=True)
+                            log.debug(
+                                "Model re-read after initial mode switch failed", exc_info=True
+                            )
                     else:
                         log.warning(
                             "agent_mode '%s' not in available_modes for %s — skipping",
@@ -352,9 +321,7 @@ class ACPSession:
                     )
                 await self._restore_mcp_servers()
                 self._current_mode_id = mode_id
-                await self._event_sink(
-                    AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id)
-                )
+                await self._event_sink(AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id))
             finally:
                 if self.state == AgentState.CONFIGURING:
                     await self._set_state(AgentState.IDLE)
@@ -399,9 +366,7 @@ class ACPSession:
         if self._conn and self._session_id and self.state == AgentState.IDLE:
             await self._conn.set_session_model(model_id=model_id, session_id=self._session_id)
             self._current_model_id = model_id
-            await self._event_sink(
-                AgentModelChanged(agent_id=self.agent_id, model_id=model_id)
-            )
+            await self._event_sink(AgentModelChanged(agent_id=self.agent_id, model_id=model_id))
 
     @property
     def available_modes(self) -> list[AgentMode]:
@@ -455,69 +420,129 @@ class ACPSession:
     # ARG002 suppressed: these signatures are required by the acp.interfaces.Client protocol.
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
-        """Called by ACP SDK when agent streams a response."""
+        """Called by ACP SDK when agent streams a response.
+
+        Ordering: session_id guard → UsageUpdate isinstance check →
+        accumulator.apply(). UsageUpdate bypasses the accumulator because
+        SessionAccumulator silently ignores it.
+        """
         if session_id != self._session_id:
             return
-        if self._suppress_history_replay:
-            return
-        su = getattr(update, "session_update", None) or getattr(update, "sessionUpdate", None)
-        log.debug("session_update type=%s agent=%s", su, self.agent_id)
-        if su in ("agent_message_chunk",):
-            content = getattr(update, "content", None)
-            if content:
-                text = getattr(content, "text", None)
-                if text:
-                    await self._event_sink(MessageChunkReceived(agent_id=self.agent_id, chunk=text))
-        elif su in ("tool_call",):
-            extra = _extract_tool_call_content(update)
-            await self._event_sink(
-                ToolCallUpdated(
-                    agent_id=self.agent_id,
-                    tool_call_id=getattr(update, "tool_call_id", "") or "",
-                    title=getattr(update, "title", "") or "",
-                    kind=getattr(update, "kind", "other") or "other",
-                    status=getattr(update, "status", "pending") or "pending",
-                    **extra,
-                )
-            )
-        elif su in ("tool_call_update",):
-            extra = _extract_tool_call_content(update)
-            await self._event_sink(
-                ToolCallUpdated(
-                    agent_id=self.agent_id,
-                    tool_call_id=getattr(update, "tool_call_id", "") or "",
-                    title=getattr(update, "title", "") or "",
-                    kind=getattr(update, "kind", "other") or "other",
-                    status=getattr(update, "status", "in_progress") or "in_progress",
-                    **extra,
-                )
-            )
-        elif su == "agent_thought_chunk":
-            content = getattr(update, "content", None)
-            if content:
-                text = getattr(content, "text", None)
-                if text:
-                    await self._event_sink(AgentThoughtReceived(agent_id=self.agent_id, chunk=text))
-        elif su == "usage_update":
-            cost = getattr(update, "cost", None)
+
+        log.debug("session_update type=%s agent=%s", type(update).__name__, self.agent_id)
+
+        # UsageUpdate bypasses accumulator (it doesn't track usage).
+        if isinstance(update, UsageUpdate):
+            if self._suppress_history_replay:
+                return
+            cost = update.cost
             await self._event_sink(
                 UsageUpdated(
                     agent_id=self.agent_id,
-                    size=getattr(update, "size", 0),
-                    used=getattr(update, "used", 0),
-                    cost_amount=getattr(cost, "amount", None) if cost else None,
-                    cost_currency=getattr(cost, "currency", None) if cost else None,
+                    size=update.size or 0,
+                    used=update.used or 0,
+                    cost_amount=cost.amount if cost else None,
+                    cost_currency=cost.currency if cost else None,
                 )
             )
-        elif su == "current_mode_update":
-            mode_id = getattr(update, "current_mode_id", None) or getattr(
-                update, "currentModeId", None
+            return
+
+        # Everything else goes through the accumulator.
+        try:
+            notification = SessionNotification(session_id=session_id, update=update)
+            self._accumulator.apply(notification)
+        except Exception:
+            log.warning(
+                "accumulator.apply() failed for %s on %s",
+                type(update).__name__,
+                self.agent_id,
+                exc_info=True,
             )
-            if mode_id:
+
+    def _on_snapshot(
+        self,
+        snapshot: Any,
+        notification: SessionNotification,
+    ) -> None:
+        """Subscriber callback fired by SessionAccumulator after apply().
+
+        Checks suppress flag, then dispatches async event emission via
+        create_task with a done-callback that logs exceptions.
+        """
+        if self._suppress_history_replay:
+            return
+        task = asyncio.create_task(self._emit_from_notification(notification))
+        task.add_done_callback(self._log_task_exception)
+
+    @staticmethod
+    def _log_task_exception(task: asyncio.Task[None]) -> None:
+        """Done-callback that logs unhandled exceptions from _emit_from_notification."""
+        if not task.cancelled() and task.exception():
+            log.error("_emit_from_notification failed", exc_info=task.exception())
+
+    async def _emit_from_notification(self, notification: SessionNotification) -> None:
+        """Map a notification's update type to the corresponding BrokerEvent.
+
+        Args:
+            notification: The SessionNotification whose update to dispatch.
+        """
+        update = notification.update
+
+        if isinstance(update, AgentMessageChunk):
+            content = update.content
+            if content:
+                text = content.text
+                if text:
+                    await self._event_sink(MessageChunkReceived(agent_id=self.agent_id, chunk=text))
+        elif isinstance(update, AgentThoughtChunk):
+            content = update.content
+            if content:
+                text = content.text
+                if text:
+                    await self._event_sink(AgentThoughtReceived(agent_id=self.agent_id, chunk=text))
+        elif isinstance(update, (ToolCallStart, ToolCallProgress)):
+            default_status = "pending" if isinstance(update, ToolCallStart) else "in_progress"
+            diffs: list[ToolCallDiff] = []
+            text_parts: list[str] = []
+            for item in update.content or []:
+                if item.type == "diff":
+                    diffs.append(
+                        ToolCallDiff(
+                            path=getattr(item, "path", ""),
+                            old_text=getattr(item, "old_text", None),
+                            new_text=getattr(item, "new_text", ""),
+                        )
+                    )
+                elif item.type == "content":
+                    inner = getattr(item, "content", None)
+                    if inner and getattr(inner, "type", None) == "text":
+                        text = getattr(inner, "text", None)
+                        if text:
+                            text_parts.append(text)
+            locations: list[ToolCallLocation] = [
+                ToolCallLocation(path=loc.path or "", line=loc.line)
+                for loc in update.locations or []
+            ]
+            await self._event_sink(
+                ToolCallUpdated(
+                    agent_id=self.agent_id,
+                    tool_call_id=update.tool_call_id or "",
+                    title=update.title or "",
+                    kind=update.kind or "other",
+                    status=update.status or default_status,
+                    diffs=diffs,
+                    text_content="\n".join(text_parts) if text_parts else None,
+                    locations=locations,
+                    raw_input=update.raw_input,
+                )
+            )
+        elif isinstance(update, CurrentModeUpdate):
+            mode_id = update.current_mode_id
+            if mode_id is not None:
                 self._current_mode_id = mode_id
-                await self._event_sink(
-                    AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id)
-                )
+                await self._event_sink(AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id))
+        else:
+            log.debug("Unhandled update type: %s", type(update).__name__)
 
     def resolve_permission(self, option_id: str) -> None:
         """Resolve the pending permission Future with the selected option_id.
