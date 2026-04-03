@@ -42,7 +42,7 @@ from synth_acp.ui.widgets.conversation import ConversationFeed
 from synth_acp.ui.widgets.input_bar import InputBar
 from synth_acp.ui.widgets.message_queue import MessageQueue
 
-_DISABLED_STATES = {AgentState.BUSY, AgentState.AWAITING_PERMISSION}
+_DISABLED_STATES = {AgentState.BUSY, AgentState.CONFIGURING, AgentState.AWAITING_PERMISSION}
 
 log = logging.getLogger(__name__)
 
@@ -260,7 +260,7 @@ class SynthApp(App):
         elif isinstance(event, AgentStateChanged):
             if event.new_state in {AgentState.IDLE, AgentState.TERMINATED}:
                 feed.input_bar.set_busy(False)
-            elif event.new_state in {AgentState.INITIALIZING, AgentState.BUSY}:
+            elif event.new_state in {AgentState.INITIALIZING, AgentState.BUSY, AgentState.CONFIGURING}:
                 feed.input_bar.set_busy(True)
 
     def _mount_permission_bar(self, feed: ConversationFeed, event: PermissionRequested) -> None:
@@ -444,7 +444,7 @@ class SynthApp(App):
             self._event_buffers[agent_id] = []
             # Hide spinner if agent already passed INITIALIZING while buffered
             state = self._agent_states.get(agent_id)
-            if state not in {AgentState.INITIALIZING, AgentState.BUSY}:
+            if state not in {AgentState.INITIALIZING, AgentState.BUSY, AgentState.CONFIGURING}:
                 if feed.input_bar is not None:
                     feed.input_bar.set_busy(False)
             # Push any mode/model data that arrived before the panel existed

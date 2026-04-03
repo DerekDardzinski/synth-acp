@@ -16,6 +16,7 @@ class AgentState(StrEnum):
     UNSTARTED = "unstarted"
     INITIALIZING = "initializing"
     IDLE = "idle"
+    CONFIGURING = "configuring"
     BUSY = "busy"
     AWAITING_PERMISSION = "awaiting_permission"
     TERMINATED = "terminated"
@@ -24,7 +25,8 @@ class AgentState(StrEnum):
 TRANSITIONS: dict[AgentState, set[AgentState]] = {
     AgentState.UNSTARTED: {AgentState.INITIALIZING, AgentState.TERMINATED},
     AgentState.INITIALIZING: {AgentState.IDLE, AgentState.TERMINATED},
-    AgentState.IDLE: {AgentState.BUSY, AgentState.TERMINATED},
+    AgentState.IDLE: {AgentState.BUSY, AgentState.CONFIGURING, AgentState.TERMINATED},
+    AgentState.CONFIGURING: {AgentState.IDLE, AgentState.TERMINATED},
     AgentState.BUSY: {
         AgentState.IDLE,
         AgentState.AWAITING_PERMISSION,

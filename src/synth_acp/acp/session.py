@@ -334,23 +334,30 @@ class ACPSession:
     async def set_mode(self, mode_id: str) -> None:
         """Switch the agent's mode, preserving the current model.
 
-        Kiro silently changes the model to a mode's default on set_session_mode.
-        Re-asserting the previous model via set_session_model keeps the user's
-        active model consistent across mode switches, matching /agent swap behaviour.
-        OpenCode decouples mode and model entirely, so set_session_model is a no-op
-        there but harmless.
+        Transitions to CONFIGURING for the duration of the switch. This blocks
+        any concurrent prompt from being sent to the agent while set_session_mode,
+        set_session_model, and load_session (MCP restore) are in flight — sending
+        a prompt concurrently with load_session causes Kiro to hang indefinitely.
+
+        CONFIGURING → IDLE in the finally block ensures the state is always
+        restored even if an RPC fails mid-switch.
         """
         if self._conn and self._session_id and self.state == AgentState.IDLE:
-            await self._conn.set_session_mode(mode_id=mode_id, session_id=self._session_id)
-            if self._current_model_id:
-                await self._conn.set_session_model(
-                    model_id=self._current_model_id, session_id=self._session_id
+            await self._set_state(AgentState.CONFIGURING)
+            try:
+                await self._conn.set_session_mode(mode_id=mode_id, session_id=self._session_id)
+                if self._current_model_id:
+                    await self._conn.set_session_model(
+                        model_id=self._current_model_id, session_id=self._session_id
+                    )
+                await self._restore_mcp_servers()
+                self._current_mode_id = mode_id
+                await self._event_sink(
+                    AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id)
                 )
-            await self._restore_mcp_servers()
-            self._current_mode_id = mode_id
-            await self._event_sink(
-                AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id)
-            )
+            finally:
+                if self.state == AgentState.CONFIGURING:
+                    await self._set_state(AgentState.IDLE)
 
     async def _restore_mcp_servers(self) -> None:
         """Re-establish MCP server connections after a mode switch.

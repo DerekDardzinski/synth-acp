@@ -22,13 +22,15 @@ class TestSessionPermissionFlow:
         async def sink(event: BrokerEvent) -> None:
             events.append(event)
 
-        return ACPSession(
+        s = ACPSession(
             agent_id="test",
             binary="echo",
             args=[],
             cwd=".",
             event_sink=sink,
         )
+        s._session_id = "sess-1"
+        return s
 
     @pytest.fixture()
     def tool_call(self) -> ToolCallUpdate:

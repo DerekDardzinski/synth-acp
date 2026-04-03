@@ -95,3 +95,26 @@ class TestStateTransitions:
 
     def test_terminated_is_terminal(self):
         assert TRANSITIONS[AgentState.TERMINATED] == {AgentState.INITIALIZING}
+
+    def test_configuring_reachable_from_idle(self):
+        """IDLE → CONFIGURING must be a valid transition — it's the entry point
+        for mode switching."""
+        assert AgentState.CONFIGURING in TRANSITIONS[AgentState.IDLE]
+
+    def test_configuring_exits_to_idle(self):
+        """CONFIGURING → IDLE must be valid — it's how mode switching completes."""
+        assert AgentState.IDLE in TRANSITIONS[AgentState.CONFIGURING]
+
+    def test_configuring_exits_to_terminated(self):
+        """CONFIGURING → TERMINATED must be valid — agent may be killed mid-switch."""
+        assert AgentState.TERMINATED in TRANSITIONS[AgentState.CONFIGURING]
+
+    def test_configuring_cannot_go_to_busy(self):
+        """CONFIGURING → BUSY must be invalid — a prompt cannot be accepted
+        while the agent is mid-switch. This is the core of the race condition fix."""
+        assert AgentState.BUSY not in TRANSITIONS[AgentState.CONFIGURING]
+
+    def test_idle_cannot_go_to_configuring_from_busy(self):
+        """BUSY → CONFIGURING must be invalid — a mode switch cannot start
+        while a prompt is in flight."""
+        assert AgentState.CONFIGURING not in TRANSITIONS[AgentState.BUSY]

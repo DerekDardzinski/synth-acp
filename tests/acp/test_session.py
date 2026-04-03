@@ -290,6 +290,72 @@ class TestSessionModes:
         assert len(events) == 0
         assert session.current_mode_id is None
 
+    async def test_set_mode_transitions_through_configuring(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """set_mode must enter CONFIGURING before any RPC and return to IDLE after.
+        If state never enters CONFIGURING, concurrent prompts can race the switch."""
+        observed_states: list[AgentState] = []
+
+        original_sink = session._event_sink
+
+        async def tracking_sink(event: BrokerEvent) -> None:
+            if isinstance(event, AgentStateChanged):
+                observed_states.append(event.new_state)
+            await original_sink(event)
+
+        session._event_sink = tracking_sink
+
+        class StubConn:
+            async def set_session_mode(self, **kwargs: Any) -> None:
+                pass
+            async def set_session_model(self, **kwargs: Any) -> None:
+                pass
+            async def load_session(self, **kwargs: Any) -> None:
+                pass
+
+        session._conn = StubConn()
+        session._mcp_servers = []
+        await session._set_state(AgentState.INITIALIZING)
+        await session._set_state(AgentState.IDLE)
+        events.clear()
+        observed_states.clear()
+
+        await session.set_mode("kiro_planner")
+
+        assert AgentState.CONFIGURING in observed_states, (
+            "set_mode must transition to CONFIGURING — without it concurrent "
+            "prompts can race the mode switch"
+        )
+        assert session.state == AgentState.IDLE, (
+            "set_mode must return to IDLE when complete"
+        )
+        configuring_idx = observed_states.index(AgentState.CONFIGURING)
+        idle_idx = len(observed_states) - 1 - observed_states[::-1].index(AgentState.IDLE)
+        assert configuring_idx < idle_idx
+
+    async def test_set_mode_returns_to_idle_on_rpc_failure(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """set_mode must return to IDLE even if an RPC raises.
+        If it stays in CONFIGURING the agent is permanently unusable."""
+        class FailingConn:
+            async def set_session_mode(self, **kwargs: Any) -> None:
+                raise RuntimeError("RPC failed")
+
+        session._conn = FailingConn()
+        await session._set_state(AgentState.INITIALIZING)
+        await session._set_state(AgentState.IDLE)
+        events.clear()
+
+        with pytest.raises(RuntimeError, match="RPC failed"):
+            await session.set_mode("kiro_planner")
+
+        assert session.state == AgentState.IDLE, (
+            "set_mode must restore IDLE after an RPC failure — "
+            "the finally block must not skip the transition"
+        )
+
 
 class TestMcpRestore:
     """Tests for _suppress_history_replay and _restore_mcp_servers behaviour."""
