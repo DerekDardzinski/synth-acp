@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import ScrollableContainer, Vertical
+from textual.message import Message
 from textual.widgets import Static
 
 from synth_acp.models.agent import AgentState
@@ -31,6 +32,23 @@ DEFAULT_PREVIEW = "[$text-muted italic]idle[/]"
 _BUSY_STATES = {AgentState.INITIALIZING, AgentState.BUSY, AgentState.AWAITING_PERMISSION}
 
 
+class _TerminateBtn(Static):
+    """Inline close button for terminating an agent."""
+
+    def __init__(self, agent_id: str) -> None:
+        self._agent_id = agent_id
+        super().__init__("\u2297", classes="tile-close")
+
+    def on_click(self, event: object) -> None:
+        """Post TerminateClicked and stop propagation."""
+        from textual.events import Click
+
+        if isinstance(event, Click):
+            event.stop()
+        if self.parent is not None:
+            self.parent.post_message(AgentTile.TerminateClicked(self._agent_id))
+
+
 class AgentTile(Vertical):
     """Clickable agent tile showing status dot, name, activity preview, and activity bar.
 
@@ -38,6 +56,13 @@ class AgentTile(Vertical):
         agent_id: Unique agent identifier.
         state: Initial agent state.
     """
+
+    class TerminateClicked(Message):
+        """Posted when the close button is clicked on a tile."""
+
+        def __init__(self, agent_id: str) -> None:
+            self.agent_id = agent_id
+            super().__init__()
 
     def __init__(
         self,
@@ -58,6 +83,7 @@ class AgentTile(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static(self._build_markup(), classes="tile-label")
+        yield _TerminateBtn(self._agent_id)
         yield ActivityBar(classes="tile-activity")
 
     def on_mount(self) -> None:

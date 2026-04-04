@@ -67,6 +67,14 @@ AgentTile.tile-active {
 AgentTile.tile-permission { border-top: tall $warning; }
 AgentTile.tile-permission.tile-active { border-top: tall $warning; }
 .tile-label { height: auto; }
+.tile-close {
+    dock: right;
+    width: 1;
+    height: 1;
+    content-align: center middle;
+    color: $warning;
+}
+.tile-close:hover { color: $error; }
 .tile-activity { margin: 0; }
 .tile-activity GradientBar { background: $background-lighten-1; }
 .tile-activity .activity-bar-bg { background: $background-lighten-1; }

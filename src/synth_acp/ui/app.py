@@ -15,7 +15,7 @@ from textual.worker import WorkerState
 
 from synth_acp.broker.broker import ACPBroker
 from synth_acp.models.agent import AgentMode, AgentModel, AgentState
-from synth_acp.models.commands import LaunchAgent, RespondPermission
+from synth_acp.models.commands import LaunchAgent, RespondPermission, TerminateAgent
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
     AgentModeChanged,
@@ -302,6 +302,10 @@ class SynthApp(App):
             await self.broker.handle(
                 RespondPermission(agent_id=message.agent_id, option_id=message.option_id)
             )
+
+    async def on_agent_tile_terminate_clicked(self, message: AgentTile.TerminateClicked) -> None:
+        """Handle the close button on an agent tile."""
+        await self.broker.handle(TerminateAgent(agent_id=message.agent_id))
 
     async def _replay_event(self, feed: ConversationFeed, event: BrokerEvent) -> None:
         """Replay a buffered event to a conversation feed during drain.

@@ -337,7 +337,7 @@ class ACPBroker:
         self._tasks[f"prompt-{agent_id}"] = asyncio.create_task(session.prompt(text))
 
     async def _terminate(self, agent_id: str) -> None:
-        """Terminate a running agent session."""
+        """Terminate a running agent session and clean up SQLite state."""
         session = self._sessions.get(agent_id)
         if not session:
             await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
@@ -353,6 +353,25 @@ class ACPBroker:
                         await task
                     except (asyncio.CancelledError, ConnectionError, OSError, RuntimeError):
                         pass
+
+        # SQLite cleanup: mark inactive, orphan children, expire messages
+        db = await self._ensure_db()
+        await db.execute(
+            "UPDATE agents SET status = 'inactive' WHERE agent_id = ? AND session_id = ?",
+            (agent_id, self._session_id),
+        )
+        await db.execute(
+            "UPDATE agents SET parent = NULL WHERE parent = ? AND session_id = ?",
+            (agent_id, self._session_id),
+        )
+        await db.execute(
+            "UPDATE messages SET status = 'expired' WHERE to_agent = ? AND session_id = ? AND status = 'pending'",
+            (agent_id, self._session_id),
+        )
+        await db.commit()
+        for aid, p in self._agent_parents.items():
+            if p == agent_id:
+                self._agent_parents[aid] = None
 
     async def _cancel(self, agent_id: str) -> None:
         """Cancel the active prompt on an agent."""
@@ -639,27 +658,6 @@ class ACPBroker:
             return
 
         await self._terminate(agent_id)
-
-        # Mark agent as inactive in SQLite
-        db = await self._ensure_db()
-        await db.execute(
-            "UPDATE agents SET status = 'inactive' WHERE agent_id = ? AND session_id = ?",
-            (agent_id, self._session_id),
-        )
-        # Orphan handling: set children's parent to NULL
-        await db.execute(
-            "UPDATE agents SET parent = NULL WHERE parent = ? AND session_id = ?",
-            (agent_id, self._session_id),
-        )
-        # Expire undelivered messages
-        await db.execute(
-            "UPDATE messages SET status = 'expired' WHERE to_agent = ? AND session_id = ? AND status = 'pending'",
-            (agent_id, self._session_id),
-        )
-        await db.commit()
-        for aid, p in self._agent_parents.items():
-            if p == agent_id:
-                self._agent_parents[aid] = None
 
         await self._update_command_status(cmd_id, "processed")
 
