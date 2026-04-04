@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from textual.containers import Vertical
-from textual.widgets import Markdown, Static
+from textual.containers import Vertical, VerticalScroll
+from textual.highlight import highlight
+from textual.widgets import Label, Markdown, Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.widgets.diff_view import DiffView
@@ -62,6 +63,25 @@ def _extract_raw_output_text(raw_output: Any) -> str | None:
                             break
         if parts:
             return "".join(parts)
+    return None
+
+
+def _extract_exit_status(raw_output: Any) -> int | None:
+    """Extract exit code from raw_output if available."""
+    if not isinstance(raw_output, dict):
+        return None
+    items = raw_output.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict):
+                json_val = item.get("Json") or item.get("json")
+                if isinstance(json_val, dict):
+                    es = json_val.get("exit_status", "")
+                    if isinstance(es, str) and "exit status:" in es:
+                        try:
+                            return int(es.split(":")[-1].strip())
+                        except ValueError:
+                            pass
     return None
 
 
@@ -132,7 +152,7 @@ class ToolCallBlock(Vertical):
         label = f"{loc.path}:{loc.line}" if loc.line is not None else loc.path
         return [Static(label, id="tc-location")]
 
-    def _raw_input_widgets(self, raw_input: Any) -> list[Static]:
+    def _raw_input_widgets(self, raw_input: Any) -> list[Label]:
         """Build raw input widget if applicable."""
         if raw_input is None or self._raw_input_rendered:
             return []
@@ -144,7 +164,8 @@ class ToolCallBlock(Vertical):
         if cmd is None:
             return []
         self._raw_input_rendered = True
-        return [Static(f"$ {cmd}", id="tc-raw-input")]
+        content = highlight(f"$ {cmd}", language="bash")
+        return [Label(content, id="tc-raw-input")]
 
     def _text_widgets(self, text_content: str | None) -> list[Markdown]:
         """Build text content widget if applicable."""
@@ -162,7 +183,7 @@ class ToolCallBlock(Vertical):
             for d in diffs
         ]
 
-    def _raw_output_widgets(self, raw_output: Any) -> list[Static]:
+    def _raw_output_widgets(self, raw_output: Any) -> list[Static | Label | VerticalScroll]:
         """Build raw output widget for execute/search/fetch kinds."""
         if self._kind not in {"execute", "search", "fetch"}:
             return []
@@ -171,13 +192,20 @@ class ToolCallBlock(Vertical):
         text = _extract_raw_output_text(raw_output)
         if not text:
             return []
-        lines = text.split("\n")
-        if len(lines) > 200:
-            text = "\n".join(lines[:200]) + "\n[dim]… (truncated)[/dim]"
-        elif len(text) > 4000:
-            text = text[:4000] + "\n[dim]… (truncated)[/dim]"
         self._raw_output_rendered = True
-        return [Static(text, id="tc-raw-output")]
+        widgets: list[Static | Label | VerticalScroll] = []
+        lang = "bash" if self._kind == "execute" else None
+        content = highlight(text, language=lang)
+        label = Label(content, id="tc-raw-output-label")
+        scroll = VerticalScroll(label, id="tc-raw-output")
+        widgets.append(scroll)
+        exit_status = _extract_exit_status(raw_output)
+        if exit_status is not None:
+            style = "green" if exit_status == 0 else "red"
+            widgets.append(
+                Static(f"[{style}]exit {exit_status}[/{style}]", id="tc-exit-status")
+            )
+        return widgets
 
     def update_status(self, status: str) -> None:
         """Update the status badge.
@@ -205,7 +233,7 @@ class ToolCallBlock(Vertical):
             diffs: File edit diffs extracted from the tool call.
             text_content: Extracted text content from the tool call.
         """
-        widgets: list[Static | Markdown | DiffView] = []
+        widgets: list[Static | Label | Markdown | DiffView | VerticalScroll] = []
         widgets.extend(self._location_widgets(locations))
         widgets.extend(self._raw_input_widgets(raw_input))
         widgets.extend(self._text_widgets(text_content))
