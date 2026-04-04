@@ -110,10 +110,33 @@ class PromptTextArea(TextArea):
     @on(TextArea.Changed)
     def _on_text_changed(self, event: TextArea.Changed) -> None:  # noqa: ARG002
         self._highlight_cache = None
+        self._update_suggestion()
 
     def notify_style_update(self) -> None:
         self._highlight_cache = None
         super().notify_style_update()
+
+    # --- Placeholder & ghost text ---
+
+    def on_mount(self) -> None:
+        self.placeholder = Content.assemble(
+            "Ask anything\t".expandtabs(8),
+            ("▌@▐", "r"), " route  ",
+            ("▌!▐", "r"), " shell  ",
+            ("▌ctrl+j▐", "r"), " newline",
+        )
+
+    def _update_suggestion(self) -> None:
+        """Set inline ghost text based on the current prefix character."""
+        text = self.text
+        if text == "@":
+            self.suggestion = "agent-id message..."
+        elif text == "!":
+            self.suggestion = "command..."
+        elif text == "/":
+            self.suggestion = "command"
+        else:
+            self.suggestion = ""
 
     # --- Key handling ---
 
@@ -128,6 +151,11 @@ class PromptTextArea(TextArea):
             event.prevent_default()
             event.stop()
             self.insert("\n")
+            return
+        if event.key == "escape" and self.suggestion:
+            self.suggestion = ""
+            event.prevent_default()
+            event.stop()
             return
         super()._on_key(event)
 
