@@ -60,6 +60,7 @@ class DynamicAgentInfo(NamedTuple):
 
     parent: str | None
     task: str
+    harness: str
 
 
 class SynthApp(App):
@@ -177,7 +178,8 @@ class SynthApp(App):
             self._agent_states[event.agent_id] = event.new_state
             if event.agent_id not in self._dynamic_agents and event.agent_id not in {a.agent_id for a in self.config.agents}:
                 parent = self.broker.get_agent_parent(event.agent_id)
-                self._dynamic_agents[event.agent_id] = DynamicAgentInfo(parent=parent, task="")
+                harness = self.broker.get_agent_harness(event.agent_id)
+                self._dynamic_agents[event.agent_id] = DynamicAgentInfo(parent=parent, task="", harness=harness)
                 self._event_buffers[event.agent_id] = []
                 try:
                     agent_list = self.query_one(AgentList)
@@ -270,6 +272,8 @@ class SynthApp(App):
         elif isinstance(event, BrokerError):
             self.notify(event.message, severity=event.severity)
         elif isinstance(event, AgentStateChanged):
+            if feed.input_bar is None:
+                return
             if event.new_state in {AgentState.IDLE, AgentState.TERMINATED}:
                 feed.input_bar.set_busy(False)
             elif event.new_state in {AgentState.INITIALIZING, AgentState.BUSY, AgentState.CONFIGURING}:
@@ -457,6 +461,10 @@ class SynthApp(App):
             agent_cfg = next((a for a in self.config.agents if a.agent_id == agent_id), None)
             agent_name = agent_cfg.display_name if agent_cfg else agent_id
             harness = agent_cfg.harness if agent_cfg else ""
+            if not harness:
+                dyn = self._dynamic_agents.get(agent_id)
+                if dyn:
+                    harness = dyn.harness
             feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, id=f"feed-{agent_id}")
             self._panels[agent_id] = feed
             await self.query_one("#right").mount(feed)
@@ -547,14 +555,16 @@ class SynthApp(App):
 
     async def _do_launch(self) -> None:
         """Launch modal logic, separated for testability."""
-        agents: list[tuple[str, str, AgentState | None]] = [
-            (a.agent_id, a.display_name, self._agent_states.get(a.agent_id)) for a in self.config.agents
-        ]
-        for agent_id in self._dynamic_agents:
-            agents.append((agent_id, agent_id, self._agent_states.get(agent_id)))
-        result = await self.push_screen_wait(LaunchAgentScreen(agents))
+        result = await self.push_screen_wait(LaunchAgentScreen())
         if result is not None:
-            await self.broker.handle(LaunchAgent(agent_id=result))
+            self._dynamic_agents[result.agent_id] = DynamicAgentInfo(parent=None, task="", harness=result.harness)
+            self._event_buffers[result.agent_id] = []
+            try:
+                self.query_one(AgentList).add_agent_tile(result.agent_id)
+            except Exception:
+                log.debug("Failed to add tile for %s", result.agent_id, exc_info=True)
+            await self.select_agent(result.agent_id)
+            await self.broker.handle(LaunchAgent(agent_id=result.agent_id, config=result))
 
     async def action_help(self) -> None:
         """Open the help modal showing key bindings and usage."""

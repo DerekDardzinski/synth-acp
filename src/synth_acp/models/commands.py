@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
+from synth_acp.models.agent import AgentConfig
+
 
 class BrokerCommand(BaseModel, frozen=True):
     """Base for all commands the frontend sends to the broker."""
 
 
 class LaunchAgent(BrokerCommand):
-    """Launch an agent by ID."""
+    """Launch an agent by ID, or by ad-hoc config."""
 
     agent_id: str
+    config: AgentConfig | None = None
 
 
 class TerminateAgent(BrokerCommand):

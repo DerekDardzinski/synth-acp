@@ -125,11 +125,11 @@ class LaunchButton(Static):
     """'+ launch agent' button with dashed border."""
 
     def __init__(self) -> None:
-        super().__init__("[dim]+ launch agent[/dim]", id="launch-btn")
+        super().__init__("+ launch agent", id="launch-btn")
 
     def on_click(self) -> None:
         """Open the launch agent modal."""
-        self.app.run_action("launch")
+        self.app.action_launch()
 
 
 class MCPButton(Static):

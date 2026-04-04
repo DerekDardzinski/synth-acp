@@ -315,7 +315,9 @@ PromptTextArea {
 /* ── Launch button ── */
 LaunchButton {
     height: 3;
-    border: dashed $surface-lighten-1;
+    width: 1fr;
+    margin: 1 0 0 0;
+    border: tall $surface-lighten-1;
     color: $text-muted;
     text-align: center;
     content-align: center middle;
@@ -323,8 +325,8 @@ LaunchButton {
     transition: color 0.15s in_out_cubic;
 }
 LaunchButton:hover {
-    border: dashed $surface-lighten-3;
-    color: $foreground;
+    border: tall $surface-lighten-3;
+    color: $text;
 }
 
 /* ── Messages panel ── */
@@ -405,14 +407,30 @@ LaunchAgentScreen, HelpScreen {
     overflow-y: auto;
 }
 
-#launch-container Button {
-    width: 1fr;
+#launch-title {
+    text-style: bold;
+    color: $primary;
     margin: 0 0 1 0;
+    text-align: center;
+    width: 1fr;
 }
 
-#launch-container Button:disabled {
+#launch-container .field-label {
+    margin: 1 0 0 0;
     color: $text-muted;
-    opacity: 50%;
+}
+
+#launch-container Select {
+    width: 1fr;
+}
+
+#launch-container Input {
+    width: 1fr;
+}
+
+#launch-submit {
+    width: 1fr;
+    margin: 1 0 0 0;
 }
 
 #help-bindings, #help-routing, #help-layout {

@@ -4,67 +4,112 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from textual.app import App, ComposeResult
-from textual.widgets import Button
+from textual.widgets import Input, Select
 
-from synth_acp.models.agent import AgentState
-from synth_acp.ui.screens.launch import _RUNNING_STATES, LaunchAgentScreen
+from synth_acp.models.agent import AgentConfig
+from synth_acp.ui.screens.launch import LaunchAgentScreen, _detect_harnesses
 
 
 class TestLaunchScreen:
-    def test_launch_screen_when_agent_selected_dismisses_with_id(self) -> None:
-        """Pressing a terminated agent's button dismisses with that agent's ID."""
-        agents = [
-            ("agent-1", "Agent 1", AgentState.TERMINATED),
-            ("agent-2", "Agent 2", AgentState.BUSY),
-        ]
-        screen = LaunchAgentScreen(agents)
-
-        event = MagicMock()
-        event.button.id = "launch-agent-1"
-
-        with patch.object(screen, "dismiss") as mock_dismiss:
-            screen.on_button_pressed(event)
-
-        mock_dismiss.assert_called_once_with("agent-1")
-
-    def test_launch_screen_when_running_agent_shown_disabled(self) -> None:
-        """Running states are classified correctly — all active states disabled, others not."""
-        assert {
-            AgentState.INITIALIZING,
-            AgentState.IDLE,
-            AgentState.BUSY,
-            AgentState.AWAITING_PERMISSION,
-        } == _RUNNING_STATES
-        assert AgentState.TERMINATED not in _RUNNING_STATES
-        assert AgentState.UNSTARTED not in _RUNNING_STATES
-
     def test_launch_screen_when_escape_pressed_dismisses_none(self) -> None:
         """Escape action dismisses with None."""
-        agents = [("agent-1", "Agent 1", AgentState.IDLE)]
-        screen = LaunchAgentScreen(agents)
-
+        screen = LaunchAgentScreen()
         with patch.object(screen, "dismiss") as mock_dismiss:
             screen.action_dismiss_none()
-
         mock_dismiss.assert_called_once_with(None)
 
+    def test_launch_screen_when_missing_agent_id_notifies_warning(self) -> None:
+        """Submit with empty agent_id shows a warning notification."""
+        screen = LaunchAgentScreen()
 
-class TestLaunchScreenDynamicAgents:
-    async def test_launch_screen_when_dynamic_agents_exist_shows_them(self) -> None:
-        """Both config-defined and dynamic agents appear as buttons."""
-        agents = [
-            ("config-agent", "Config Agent", AgentState.TERMINATED),
-            ("dynamic-agent", "dynamic-agent", AgentState.TERMINATED),
-        ]
+        mock_select = MagicMock(spec=Select)
+        mock_select.value = "kiro"
+        mock_id_input = MagicMock(spec=Input)
+        mock_id_input.value = "  "
+        mock_mode_input = MagicMock(spec=Input)
+        mock_mode_input.value = ""
 
-        class ShellApp(App):
-            def compose(self) -> ComposeResult:
-                yield Button("open", id="open-btn")
+        with (
+            patch.object(
+                screen,
+                "query_one",
+                side_effect=[mock_select, mock_id_input, mock_mode_input],
+            ),
+            patch.object(screen, "notify") as mock_notify,
+            patch.object(screen, "dismiss") as mock_dismiss,
+        ):
+            event = MagicMock()
+            event.button.id = "launch-submit"
+            screen.on_button_pressed(event)
 
-        app = ShellApp()
-        async with app.run_test(headless=True, size=(120, 40)):
-            screen = LaunchAgentScreen(agents)
-            await app.push_screen(screen)
-            assert screen.query_one("#launch-config-agent", Button)
-            assert screen.query_one("#launch-dynamic-agent", Button)
+        mock_notify.assert_called_once()
+        assert "required" in mock_notify.call_args[0][0].lower()
+        mock_dismiss.assert_not_called()
+
+    def test_launch_screen_when_no_harness_selected_notifies_warning(self) -> None:
+        """Submit with blank harness shows a warning notification."""
+        screen = LaunchAgentScreen()
+
+        mock_select = MagicMock(spec=Select)
+        mock_select.value = Select.BLANK
+        mock_id_input = MagicMock(spec=Input)
+        mock_id_input.value = "my-agent"
+        mock_mode_input = MagicMock(spec=Input)
+        mock_mode_input.value = ""
+
+        with (
+            patch.object(
+                screen,
+                "query_one",
+                side_effect=[mock_select, mock_id_input, mock_mode_input],
+            ),
+            patch.object(screen, "notify") as mock_notify,
+            patch.object(screen, "dismiss") as mock_dismiss,
+        ):
+            event = MagicMock()
+            event.button.id = "launch-submit"
+            screen.on_button_pressed(event)
+
+        mock_notify.assert_called_once()
+        mock_dismiss.assert_not_called()
+
+    def test_launch_screen_when_valid_form_dismisses_with_config(self) -> None:
+        """Valid form submission dismisses with an AgentConfig."""
+        screen = LaunchAgentScreen()
+
+        mock_select = MagicMock(spec=Select)
+        mock_select.value = "kiro"
+        mock_id_input = MagicMock(spec=Input)
+        mock_id_input.value = "my-agent"
+        mock_mode_input = MagicMock(spec=Input)
+        mock_mode_input.value = "code"
+
+        with (
+            patch.object(
+                screen,
+                "query_one",
+                side_effect=[mock_select, mock_id_input, mock_mode_input],
+            ),
+            patch.object(screen, "dismiss") as mock_dismiss,
+        ):
+            event = MagicMock()
+            event.button.id = "launch-submit"
+            screen.on_button_pressed(event)
+
+        mock_dismiss.assert_called_once()
+        config = mock_dismiss.call_args[0][0]
+        assert isinstance(config, AgentConfig)
+        assert config.agent_id == "my-agent"
+        assert config.harness == "kiro"
+        assert config.agent_mode == "code"
+
+
+class TestDetectHarnesses:
+    def test_detect_harnesses_filters_by_path(self) -> None:
+        """Only harnesses with binaries in PATH are returned."""
+        with patch("synth_acp.ui.screens.launch.shutil.which") as mock_which:
+            mock_which.side_effect = lambda b: "/usr/bin/kiro-cli" if b == "kiro-cli" else None
+            result = _detect_harnesses()
+        names = [h.short_name for h in result]
+        assert "kiro" in names
+        assert "claude" not in names

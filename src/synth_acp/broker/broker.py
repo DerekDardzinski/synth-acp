@@ -73,6 +73,7 @@ class ACPBroker:
         self._poller: MessagePoller | None = None
         self._pending_initial_prompts: dict[str, str] = {}
         self._agent_parents: dict[str, str | None] = {a.agent_id: None for a in config.agents}
+        self._agent_harnesses: dict[str, str] = {a.agent_id: a.harness for a in config.agents}
         self._db: aiosqlite.Connection | None = None
         self._harness_registry: list = load_harness_registry()
 
@@ -87,8 +88,8 @@ class ACPBroker:
             command: The broker command to dispatch.
         """
         match command:
-            case LaunchAgent(agent_id=aid):
-                await self._launch(aid)
+            case LaunchAgent(agent_id=aid, config=cfg):
+                await self._launch(aid, adhoc_config=cfg)
             case TerminateAgent(agent_id=aid):
                 await self._terminate(aid)
             case SendPrompt(agent_id=aid, text=text):
@@ -131,6 +132,10 @@ class ACPBroker:
     def get_agent_parent(self, agent_id: str) -> str | None:
         """Return the parent agent ID, or None if no parent."""
         return self._agent_parents.get(agent_id)
+
+    def get_agent_harness(self, agent_id: str) -> str:
+        """Return the harness short_name for an agent, or empty string."""
+        return self._agent_harnesses.get(agent_id, "")
 
     def get_agent_modes(self, agent_id: str) -> list[AgentMode]:
         """Return available modes for an agent, or [] if not yet received."""
@@ -241,9 +246,12 @@ class ACPBroker:
     # Internal handlers
     # ------------------------------------------------------------------
 
-    async def _launch(self, agent_id: str) -> None:
-        """Launch an agent by ID from the config."""
-        agent_cfg = next((a for a in self._config.agents if a.agent_id == agent_id), None)
+    async def _launch(self, agent_id: str, *, adhoc_config: AgentConfig | None = None) -> None:
+        """Launch an agent by ID from the config, or from an ad-hoc config."""
+        if adhoc_config is not None:
+            agent_cfg = adhoc_config
+        else:
+            agent_cfg = next((a for a in self._config.agents if a.agent_id == agent_id), None)
         if not agent_cfg:
             await self._sink(
                 BrokerError(agent_id=agent_id, message=f"No config for agent '{agent_id}'")
@@ -295,7 +303,20 @@ class ACPBroker:
             agent_mode=agent_cfg.agent_mode,
         )
         self._sessions[agent_id] = session
+        self._agent_harnesses[agent_id] = agent_cfg.harness
         self._tasks[agent_id] = asyncio.create_task(session.run())
+
+        if adhoc_config is not None:
+            db = await self._ensure_db()
+            await ensure_schema_async(db)
+            now = int(time.time() * 1000)
+            await db.execute(
+                "INSERT OR REPLACE INTO agents (agent_id, session_id, status, registered) "
+                "VALUES (?, ?, 'active', ?)",
+                (agent_id, self._session_id, now),
+            )
+            await db.commit()
+
         await self._start_poller()
 
     async def _prompt(self, agent_id: str, text: str) -> None:
@@ -566,6 +587,7 @@ class ACPBroker:
 
         # Track parentage
         self._agent_parents[agent_id] = from_agent
+        self._agent_harnesses[agent_id] = harness
 
         # Spawn session
         mcp_servers = [

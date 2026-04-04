@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from textual.worker import WorkerState
 
-from synth_acp.models.agent import AgentState
+from synth_acp.models.agent import AgentConfig, AgentState
 from synth_acp.models.commands import LaunchAgent
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
@@ -263,14 +263,19 @@ class TestShowMessagesContentSwitcher:
 
 
 class TestActionLaunchModal:
-    async def test_action_launch_when_modal_returns_id_sends_launch_command(self) -> None:
+    async def test_action_launch_when_modal_returns_config_sends_launch_command(self) -> None:
         """Selecting an agent in the modal triggers broker.handle(LaunchAgent(...))."""
         app = _make_app("agent-1")
+        config = AgentConfig(agent_id="new-agent", harness="kiro")
 
-        with patch.object(app, "push_screen_wait", new_callable=AsyncMock, return_value="agent-1"):
+        with (
+            patch.object(app, "push_screen_wait", new_callable=AsyncMock, return_value=config),
+            patch.object(app, "select_agent", new_callable=AsyncMock) as mock_select,
+        ):
             await app._do_launch()
 
-        app.broker.handle.assert_called_once_with(LaunchAgent(agent_id="agent-1"))
+        app.broker.handle.assert_called_once_with(LaunchAgent(agent_id="new-agent", config=config))
+        mock_select.assert_called_once_with("new-agent")
 
     async def test_action_launch_when_modal_returns_none_skips_launch(self) -> None:
         """Escape from modal (None result) does not call broker.handle."""
