@@ -173,10 +173,9 @@ ToolCallBlock.tool-permission {
 
 /* ── ToolCallBlock content ── */
 #tc-location { color: $text-muted; text-style: italic; padding-left: 2; }
-#tc-raw-input { background: $background; padding: 0 1; margin: 0 0 0 2; }
-#tc-raw-output { background: $background; padding: 0 1; margin: 0 0 0 2; height: auto; max-height: 20; }
+#tc-raw-input { background: $background; padding: 0 1; }
+#tc-raw-output { background: $background; padding: 0 1; height: auto; max-height: 20; }
 #tc-raw-output-label { width: 1fr; }
-#tc-exit-status { margin: 0 0 0 2; }
 #tc-text { padding-left: 2; }
 
 /* ── Diff view ── */
@@ -447,6 +446,14 @@ LaunchAgentScreen, HelpScreen {
     padding: 0 1;
     color: $text-muted;
 }
+
+/* ── Shell / tool call separator ── */
+ShellResultBlock Rule, ToolCallBlock Rule {
+    color: $surface 30%;
+    margin: 0;
+}
+.shell-exit-success { color: $success 30%; }
+.shell-exit-error { color: $error 30%; }
 
 /* ── Terminal widget ── */
 Terminal {

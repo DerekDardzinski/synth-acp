@@ -15,6 +15,7 @@ from synth_acp.ui.widgets.agent_message import AgentMessage
 from synth_acp.ui.widgets.input_bar import InputBar
 from synth_acp.ui.widgets.plan_block import PlanBlock
 from synth_acp.ui.widgets.prompt_bubble import PromptBubble
+from synth_acp.ui.widgets.shell_result import ShellResultBlock
 from synth_acp.ui.widgets.thought_block import ThoughtBlock
 from synth_acp.ui.widgets.tool_call import ToolCallBlock
 
@@ -38,12 +39,13 @@ class ConversationFeed(Vertical):
         agent_name: Display name for the agent.
     """
 
-    def __init__(self, agent_id: str, agent_name: str, project: str = "", harness: str = "", **kwargs: object) -> None:
+    def __init__(self, agent_id: str, agent_name: str, project: str = "", harness: str = "", cwd: str = "", **kwargs: object) -> None:
         super().__init__(**kwargs)
         self._agent_id = agent_id
         self._agent_name = agent_name
         self._project = project
         self._harness = harness
+        self._cwd = cwd
         self._current_message: AgentMessage | None = None
         self._current_thought: ThoughtBlock | None = None
         self._current_turn: TurnContainer | None = None
@@ -56,7 +58,7 @@ class ConversationFeed(Vertical):
         """Yield the scrollable container and input bar."""
         with ScrollableContainer(classes="conv-scroll"):
             pass
-        yield InputBar(self._agent_id, self._agent_name, self._harness)
+        yield InputBar(self._agent_id, self._agent_name, self._harness, cwd=self._cwd)
 
     def on_mount(self) -> None:
         """Cache the scroll container and input bar references."""
@@ -265,3 +267,30 @@ class ConversationFeed(Vertical):
                 await block.mount(Terminal(terminal_process))
                 return
         self._pending_terminals[terminal_id] = terminal_process
+
+    async def run_shell_command(self, command: str) -> None:
+        """Run a shell command and display the output in the feed.
+
+        Args:
+            command: Shell command string to execute.
+        """
+        import asyncio
+
+        if self._scroll is None:
+            return
+        turn = self._start_turn()
+        if turn is None:
+            return
+        block = ShellResultBlock(command)
+        turn.mount(block)
+        self._scroll.scroll_end(animate=False)
+
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        output = stdout.decode(errors="replace") if stdout else ""
+        block.set_output(output, proc.returncode or 0)
+        self._current_turn = None

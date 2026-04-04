@@ -465,7 +465,7 @@ class SynthApp(App):
                 dyn = self._dynamic_agents.get(agent_id)
                 if dyn:
                     harness = dyn.harness
-            feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, id=f"feed-{agent_id}")
+            feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, cwd=agent_cfg.cwd if agent_cfg else "", id=f"feed-{agent_id}")
             self._panels[agent_id] = feed
             await self.query_one("#right").mount(feed)
             for event in self._event_buffers.get(agent_id, []):

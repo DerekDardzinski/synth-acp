@@ -6,7 +6,7 @@ from typing import Any
 
 from textual.containers import Vertical, VerticalScroll
 from textual.highlight import highlight
-from textual.widgets import Label, Markdown, Static
+from textual.widgets import Label, Markdown, Rule, Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.widgets.diff_view import DiffView
@@ -183,7 +183,7 @@ class ToolCallBlock(Vertical):
             for d in diffs
         ]
 
-    def _raw_output_widgets(self, raw_output: Any) -> list[Static | Label | VerticalScroll]:
+    def _raw_output_widgets(self, raw_output: Any) -> list[Static | Label | VerticalScroll | Rule]:
         """Build raw output widget for execute/search/fetch kinds."""
         if self._kind not in {"execute", "search", "fetch"}:
             return []
@@ -193,7 +193,8 @@ class ToolCallBlock(Vertical):
         if not text:
             return []
         self._raw_output_rendered = True
-        widgets: list[Static | Label | VerticalScroll] = []
+        widgets: list[Static | Label | VerticalScroll | Rule] = []
+        widgets.append(Rule(line_style="dashed", id="tc-output-sep"))
         lang = "bash" if self._kind == "execute" else None
         content = highlight(text, language=lang)
         label = Label(content, id="tc-raw-output-label")
@@ -201,10 +202,9 @@ class ToolCallBlock(Vertical):
         widgets.append(scroll)
         exit_status = _extract_exit_status(raw_output)
         if exit_status is not None:
-            style = "green" if exit_status == 0 else "red"
-            widgets.append(
-                Static(f"[{style}]exit {exit_status}[/{style}]", id="tc-exit-status")
-            )
+            exit_style = "success" if exit_status == 0 else "error"
+            widgets.append(Rule(line_style="dashed", classes=f"shell-exit-{exit_style}"))
+            self._exit_style = exit_style
         return widgets
 
     def update_status(self, status: str) -> None:
@@ -233,7 +233,7 @@ class ToolCallBlock(Vertical):
             diffs: File edit diffs extracted from the tool call.
             text_content: Extracted text content from the tool call.
         """
-        widgets: list[Static | Label | Markdown | DiffView | VerticalScroll] = []
+        widgets: list[Static | Label | Markdown | DiffView | VerticalScroll | Rule] = []
         widgets.extend(self._location_widgets(locations))
         widgets.extend(self._raw_input_widgets(raw_input))
         widgets.extend(self._text_widgets(text_content))
@@ -244,3 +244,8 @@ class ToolCallBlock(Vertical):
         widgets.extend(self._raw_output_widgets(raw_output))
         for w in widgets:
             await self.mount(w)
+        if hasattr(self, "_exit_style"):
+            try:
+                self.query_one("#tc-output-sep").add_class(f"shell-exit-{self._exit_style}")
+            except Exception:
+                pass

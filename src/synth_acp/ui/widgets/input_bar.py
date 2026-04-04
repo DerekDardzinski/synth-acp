@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
+from pathlib import Path
 
 from rich.text import Text
 from textual import events, on
@@ -20,6 +22,32 @@ from synth_acp.models.commands import CancelTurn, SendPrompt, SetAgentMode, SetA
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
 
 log = logging.getLogger(__name__)
+
+def _short_path(cwd: str) -> str:
+    """Collapse a cwd to use ~ for the home directory."""
+    try:
+        return "~/" + str(Path(cwd).relative_to(Path.home()))
+    except ValueError:
+        return cwd
+
+
+def _git_branch(cwd: str) -> str | None:
+    """Return the current git branch for cwd, or None."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
 
 # Matches @agent-id and @"agent id with spaces"
 RE_AGENT_MENTION = re.compile(r'(@\S+)|@"(.*?)"')
@@ -51,6 +79,11 @@ class PromptTextArea(TextArea):
         # Slash command: entire single line goes green
         if text.startswith("/") and "\n" not in text:
             self._highlight_cache = [Content.styled(text, "$text-success")]
+            return self._highlight_cache
+
+        # Shell command: entire single line goes warning color
+        if text.startswith("!") and "\n" not in text:
+            self._highlight_cache = [Content.styled(text, "$text-warning")]
             return self._highlight_cache
 
         # Markdown highlighting + @mention overlay
@@ -190,12 +223,30 @@ class InputBar(Vertical):
         harness: Harness name for display.
     """
 
-    def __init__(self, agent_id: str, agent_name: str, harness: str = "", **kwargs: object) -> None:
+    def __init__(self, agent_id: str, agent_name: str, harness: str = "", cwd: str = "", **kwargs: object) -> None:
         super().__init__(classes="input-bar", **kwargs)
         self._agent_id = agent_id
         self._agent_name = agent_name
         self._harness = harness
+        self._cwd = cwd
+        self._cwd_display = _short_path(cwd) if cwd else ""
+        self._git_branch = _git_branch(cwd) if cwd else None
         self._slash_commands: list[object] = []
+
+    def on_mount(self) -> None:
+        """Start polling git branch if cwd is set."""
+        if self._cwd:
+            self.set_interval(5, self._poll_git_branch)
+
+    def _poll_git_branch(self) -> None:
+        """Check for branch changes and update the info label."""
+        branch = _git_branch(self._cwd)
+        if branch != self._git_branch:
+            self._git_branch = branch
+            try:
+                self.query_one("#info-label", Static).update(self._build_info_label())
+            except Exception:
+                pass
 
     def compose(self) -> ComposeResult:
         """Yield the text area and info bar."""
@@ -214,10 +265,15 @@ class InputBar(Vertical):
 
     def _build_info_label(self) -> str:
         """Build the static info label text."""
-        return (
-            f"[dim]agent:[/] [$primary]{self._agent_id}[/]"
-            f" · [dim]harness:[/] {self._harness}"
-        )
+        parts = [
+            f"[dim]agent:[/] [$primary]{self._agent_id}[/]",
+            f"[dim]harness:[/] {self._harness}",
+        ]
+        if self._cwd_display:
+            parts.append(f"[dim]cwd:[/] {self._cwd_display}")
+        if self._git_branch:
+            parts.append(f"[dim]branch:[/] [$accent]{self._git_branch}[/]")
+        return " · ".join(parts)
 
     # --- Mode / model updates ---
 
@@ -322,6 +378,14 @@ class InputBar(Vertical):
         app = self.app
         if not isinstance(app, SynthApp):
                     return
+
+        # Shell command: !<command>
+        if text.startswith("!"):
+            command = text[1:].strip()
+            if command and self._agent_id in app._panels:
+                feed = app._panels[self._agent_id]
+                app.run_worker(feed.run_shell_command(command))
+            return
 
         target = self._agent_id
         if text.startswith("@"):
