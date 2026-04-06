@@ -112,8 +112,8 @@ def _print_event(
             print(f"\n[tool] {aid}: {kind} — {title} [{status}]")
         case BrokerError(agent_id=aid, message=msg, severity=sev):
             print(f"[{sev}] {aid}: {msg}", file=sys.stderr)
-        case PermissionRequested(agent_id=aid, title=title, kind=kind, options=opts):
-            pending_permissions.append({"agent_id": aid, "options": opts})
+        case PermissionRequested(agent_id=aid, request_id=rid, title=title, kind=kind, options=opts):
+            pending_permissions.append({"agent_id": aid, "request_id": rid, "options": opts})
             print(f"\n[permission] {aid} requests permission:")
             print(f"  Title: {title}")
             print(f"  Kind: {kind}")
@@ -377,6 +377,7 @@ async def _run(config: SessionConfig) -> None:
                     await broker.handle(
                         RespondPermission(
                             agent_id=perm["agent_id"],
+                            request_id=perm["request_id"],
                             option_id=option_id,
                         )
                     )

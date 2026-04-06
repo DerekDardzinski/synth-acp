@@ -51,10 +51,9 @@ class TestSessionPermissionFlow:
         session._sm._state = AgentState.BUSY
 
         async def resolve_later() -> None:
-            # Wait for the future to be created
-            while session._permission_future is None:
+            while "tc-1" not in session._permission_futures:
                 await asyncio.sleep(0.01)
-            session.resolve_permission("opt-allow")
+            session.resolve_permission("tc-1", "opt-allow")
 
         task = asyncio.create_task(resolve_later())
         response = await session.request_permission(options, "sess-1", tool_call)
@@ -75,9 +74,9 @@ class TestSessionPermissionFlow:
         session._sm._state = AgentState.BUSY
 
         async def cancel_later() -> None:
-            while session._permission_future is None:
+            while "tc-1" not in session._permission_futures:
                 await asyncio.sleep(0.01)
-            session._permission_future.cancel()
+            session._permission_futures["tc-1"].cancel()
 
         task = asyncio.create_task(cancel_later())
         response = await session.request_permission(options, "sess-1", tool_call)
@@ -85,7 +84,7 @@ class TestSessionPermissionFlow:
 
         assert isinstance(response.outcome, DeniedOutcome)
         assert response.outcome.outcome == "cancelled"
-        assert session._permission_future is None
+        assert "tc-1" not in session._permission_futures
 
     async def test_request_permission_when_called_transitions_and_emits_event(
         self,
@@ -97,11 +96,11 @@ class TestSessionPermissionFlow:
         session._sm._state = AgentState.BUSY
 
         async def resolve_later() -> None:
-            while session._permission_future is None:
+            while "tc-1" not in session._permission_futures:
                 await asyncio.sleep(0.01)
             # Check state before resolving
             assert session.state == AgentState.AWAITING_PERMISSION
-            session.resolve_permission("opt-allow")
+            session.resolve_permission("tc-1", "opt-allow")
 
         task = asyncio.create_task(resolve_later())
         await session.request_permission(options, "sess-1", tool_call)

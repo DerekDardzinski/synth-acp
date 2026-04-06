@@ -161,7 +161,7 @@ class ACPSession:
         self._conn: Any = None
         self._proc: Any = None
         self._session_id: str | None = None
-        self._permission_future: asyncio.Future[str] | None = None
+        self._permission_futures: dict[str, asyncio.Future[str]] = {}
         self._capabilities: Any = None
         self._agent_mode = agent_mode
         self._available_modes: list[AgentMode] = []
@@ -315,8 +315,10 @@ class ACPSession:
         finally:
             for t in self._terminals.values():
                 t.kill()
-            if self._permission_future and not self._permission_future.done():
-                self._permission_future.cancel()
+            for fut in self._permission_futures.values():
+                if not fut.done():
+                    fut.cancel()
+            self._permission_futures.clear()
             self._unsubscribe()
             await self._sm.force_terminal()
 
@@ -444,8 +446,10 @@ class ACPSession:
         then escalates to SIGKILL.  Safe because _spawn_isolated_agent
         creates each agent in its own process group (process_group=0).
         """
-        if self._permission_future and not self._permission_future.done():
-            self._permission_future.cancel()
+        for fut in self._permission_futures.values():
+            if not fut.done():
+                fut.cancel()
+        self._permission_futures.clear()
         for t in self._terminals.values():
             t.kill()
         if self._proc is None:
@@ -606,13 +610,15 @@ class ACPSession:
         else:
             log.debug("Unhandled update type: %s", type(update).__name__)
 
-    def resolve_permission(self, option_id: str) -> None:
-        """Resolve the pending permission Future with the selected option_id.
+    def resolve_permission(self, request_id: str, option_id: str) -> None:
+        """Resolve the pending permission Future for the given request_id.
 
-        No-op if no Future is pending or Future is already done.
+        No-op if no Future is pending for that request or Future is already done.
+        When the last pending permission is resolved, transitions back to BUSY.
         """
-        if self._permission_future and not self._permission_future.done():
-            self._permission_future.set_result(option_id)
+        future = self._permission_futures.pop(request_id, None)
+        if future and not future.done():
+            future.set_result(option_id)
 
     async def request_permission(
         self,
@@ -623,18 +629,21 @@ class ACPSession:
     ) -> RequestPermissionResponse:
         """Called by ACP SDK when agent requests permission.
 
-        Creates a Future, transitions to AWAITING_PERMISSION, emits
-        PermissionRequested, and awaits resolution.
+        Creates a Future keyed by tool_call_id, transitions to
+        AWAITING_PERMISSION (idempotent for parallel calls), emits
+        PermissionRequested, and awaits resolution. Transitions back
+        to BUSY only when this is the last pending permission.
         """
         if session_id != self._session_id:
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        request_id = tool_call.tool_call_id or ""
         await self._sm.transition(AgentState.AWAITING_PERMISSION)
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._permission_future = future
+        self._permission_futures[request_id] = future
         await self._event_sink(
             PermissionRequested(
                 agent_id=self.agent_id,
-                request_id=tool_call.tool_call_id,
+                request_id=request_id,
                 title=tool_call.title or "",
                 kind=tool_call.kind or "other",
                 options=list(options),
@@ -645,8 +654,9 @@ class ACPSession:
         except asyncio.CancelledError:
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         finally:
-            self._permission_future = None
-        await self._sm.transition(AgentState.BUSY)
+            self._permission_futures.pop(request_id, None)
+        if not self._permission_futures:
+            await self._sm.transition(AgentState.BUSY)
         return RequestPermissionResponse(
             outcome=AllowedOutcome(option_id=option_id, outcome="selected")
         )

@@ -199,14 +199,14 @@ DiffCode { width: 1fr; height: auto; }
 
 /* ── Permission modal ── */
 /* ── Permission bar ── */
-#perm-bar {
+PermissionBar {
     height: auto;
     background: transparent;
     border-top: tall $warning;
     padding: 0 1;
     margin: 0 3;
 }
-#perm-bar:blur {
+PermissionBar:blur {
     #index { opacity: 0.3; }
     #caret { opacity: 0.3; }
 }

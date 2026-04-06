@@ -286,7 +286,8 @@ class SynthApp(App):
             feed: Target conversation feed.
             event: The permission request event.
         """
-        bar = PermissionBar(event.agent_id, event.title, event.options)
+        position = self.broker.permission_position(event.agent_id)
+        bar = PermissionBar(event.agent_id, event.request_id, event.title, event.options, position=position)
         if feed.input_bar is not None:
             feed.input_bar.mount(bar, before=0)
         else:
@@ -300,7 +301,7 @@ class SynthApp(App):
         """
         if message.option_id:
             await self.broker.handle(
-                RespondPermission(agent_id=message.agent_id, option_id=message.option_id)
+                RespondPermission(agent_id=message.agent_id, request_id=message.request_id, option_id=message.option_id)
             )
 
     async def on_agent_tile_terminate_clicked(self, message: AgentTile.TerminateClicked) -> None:

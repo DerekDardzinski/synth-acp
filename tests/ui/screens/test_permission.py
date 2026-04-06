@@ -25,7 +25,7 @@ class TestPermissionBarHotkey:
             _opt("o1", "Allow once", "allow_once"),
             _opt("o2", "Reject once", "reject_once"),
         ]
-        bar = PermissionBar("agent-1", "Test", options)
+        bar = PermissionBar("agent-1", "req-1", "Test", options)
         bar._rows = [MagicMock(), MagicMock()]
         bar._confirmed = False
 
@@ -42,7 +42,7 @@ class TestPermissionBarEscape:
             _opt("o1", "Allow once", "allow_once"),
             _opt("o2", "Reject once", "reject_once"),
         ]
-        bar = PermissionBar("agent-1", "Test", options)
+        bar = PermissionBar("agent-1", "req-1", "Test", options)
         bar._rows = [MagicMock(), MagicMock()]
         bar._confirmed = False
 
@@ -57,7 +57,7 @@ class TestPermissionBarEscape:
             _opt("o1", "Allow once", "allow_once"),
             _opt("o2", "Allow always", "allow_always"),
         ]
-        bar = PermissionBar("agent-1", "Test", options)
+        bar = PermissionBar("agent-1", "req-1", "Test", options)
         bar._rows = [MagicMock(), MagicMock()]
 
         with patch.object(bar, "_resolve") as mock_resolve:
@@ -134,9 +134,9 @@ class TestRoutePermissionMount:
         mock_mount.assert_called_once_with(feed, event)
 
         # Test the Resolved message handler dispatches to broker
-        message = PermissionBar.Resolved("a", "o1")
+        message = PermissionBar.Resolved("a", "r1", "o1")
         await app.on_permission_bar_resolved(message)
 
         app.broker.handle.assert_called_once_with(
-            RespondPermission(agent_id="a", option_id="o1")
+            RespondPermission(agent_id="a", request_id="r1", option_id="o1")
         )

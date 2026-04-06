@@ -24,6 +24,7 @@ class SettingsConfig(BaseModel, frozen=True):
     """Global session settings."""
 
     communication_mode: CommunicationMode = CommunicationMode.MESH
+    auto_approve_tools: list[str] = []
 
 
 class HarnessEntry(BaseModel, frozen=True):

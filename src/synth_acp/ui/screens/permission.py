@@ -90,22 +90,26 @@ class PermissionBar(VerticalGroup, can_focus=True):
     class Resolved(Message):
         """Posted when the user selects a permission option."""
 
-        def __init__(self, agent_id: str, option_id: str) -> None:
+        def __init__(self, agent_id: str, request_id: str, option_id: str) -> None:
             super().__init__()
             self.agent_id = agent_id
+            self.request_id = request_id
             self.option_id = option_id
 
-    def __init__(self, agent_id: str, title: str, options: list[PermissionOption]) -> None:
-        super().__init__(id="perm-bar")
+    def __init__(self, agent_id: str, request_id: str, title: str, options: list[PermissionOption], *, position: str = "") -> None:
+        super().__init__(id=f"perm-{request_id}")
         self._agent_id = agent_id
+        self._request_id = request_id
         self._title = title
+        self._position = position
         self._options = options
         self._blink_timer = None
 
     def compose(self):
         """Yield the permission bar layout."""
+        display_title = f"({self._position}) {self._title}" if self._position else self._title
         with VerticalGroup(id="perm-contents"):
-            yield Label(self._title, id="perm-title", markup=False)
+            yield Label(display_title, id="perm-title", markup=False)
         seen_kinds: set[str] = set()
         with VerticalGroup(id="perm-option-container"):
             for i, opt in enumerate(self._options):
@@ -213,5 +217,5 @@ class PermissionBar(VerticalGroup, can_focus=True):
 
     def _resolve(self, option_id: str) -> None:
         """Post the resolved message and remove self."""
-        self.post_message(PermissionBar.Resolved(self._agent_id, option_id))
+        self.post_message(PermissionBar.Resolved(self._agent_id, self._request_id, option_id))
         self.remove()

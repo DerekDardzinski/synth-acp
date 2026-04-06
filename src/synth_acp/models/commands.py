@@ -35,6 +35,7 @@ class RespondPermission(BrokerCommand):
     """Resolve a pending permission request on an agent."""
 
     agent_id: str
+    request_id: str
     option_id: str
 
 

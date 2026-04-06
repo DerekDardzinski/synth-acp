@@ -60,11 +60,11 @@ class TestBrokerDispatch:
         session._sm._state = AgentState.BUSY
 
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        session._permission_future = future
+        session._permission_futures["req-1"] = future
 
         broker._registry._sessions["agent-1"] = session
 
-        await broker.handle(RespondPermission(agent_id="agent-1", option_id="opt-allow"))
+        await broker.handle(RespondPermission(agent_id="agent-1", request_id="req-1", option_id="opt-allow"))
 
         assert future.done()
         assert future.result() == "opt-allow"
@@ -122,11 +122,11 @@ class TestBrokerDispatch:
         )
         session._sm._state = AgentState.BUSY
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        session._permission_future = future
+        session._permission_futures["req-1"] = future
         broker._registry._sessions["agent-1"] = session
 
         # Store a pending permission event
-        broker._pending_permissions["agent-1"] = PermissionRequested(
+        broker._pending_permissions["req-1"] = PermissionRequested(
             agent_id="agent-1",
             request_id="req-1",
             title="Run command",
@@ -138,7 +138,7 @@ class TestBrokerDispatch:
         )
 
         with patch.object(broker._permission_engine, "persist") as mock_persist:
-            broker._resolve_permission("agent-1", "opt-1")
+            await broker._resolve_permission("agent-1", "req-1", "opt-1")
 
         mock_persist.assert_called_once()
         rule = mock_persist.call_args[0][0]

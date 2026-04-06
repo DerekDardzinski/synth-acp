@@ -32,7 +32,7 @@ TRANSITIONS: dict[AgentState, set[AgentState]] = {
         AgentState.AWAITING_PERMISSION,
         AgentState.TERMINATED,
     },
-    AgentState.AWAITING_PERMISSION: {AgentState.BUSY, AgentState.TERMINATED},
+    AgentState.AWAITING_PERMISSION: {AgentState.AWAITING_PERMISSION, AgentState.BUSY, AgentState.TERMINATED},
     AgentState.TERMINATED: {AgentState.INITIALIZING},
 }
 

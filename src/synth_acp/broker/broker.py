@@ -58,7 +58,10 @@ class ACPBroker:
             db_path=self._db_path,
             session_id=self._session_id,
         )
-        self._pending_permissions: dict[str, PermissionRequested] = {}
+        self._pending_permissions: dict[str, PermissionRequested] = {}  # keyed by request_id
+        self._active_permission: dict[str, str] = {}  # agent_id → active request_id
+        self._permission_queue: dict[str, list[PermissionRequested]] = {}  # agent_id → queued events
+        self._permission_counter: dict[str, tuple[int, int]] = {}  # agent_id → (current, total)
         self._registry = AgentRegistry(config)
         self._message_bus: MessageBus | None = None
         self._lifecycle: AgentLifecycle | None = None
@@ -78,8 +81,8 @@ class ACPBroker:
                 await lifecycle.terminate(aid)
             case SendPrompt(agent_id=aid, text=text):
                 await lifecycle.prompt(aid, text)
-            case RespondPermission(agent_id=aid, option_id=oid):
-                self._resolve_permission(aid, oid)
+            case RespondPermission(agent_id=aid, request_id=rid, option_id=oid):
+                await self._resolve_permission(aid, rid, oid)
             case CancelTurn(agent_id=aid):
                 await lifecycle.cancel(aid)
             case SetAgentMode(agent_id=aid, mode_id=mid):
@@ -119,7 +122,14 @@ class ACPBroker:
         return self._registry.get_current_model(agent_id)
 
     def is_permission_pending(self, agent_id: str) -> bool:
-        return agent_id in self._pending_permissions
+        return any(p.agent_id == agent_id for p in self._pending_permissions.values())
+
+    def permission_position(self, agent_id: str) -> str:
+        """Return a position string like '1 of 3' for the active permission, or ''."""
+        counter = self._permission_counter.get(agent_id)
+        if not counter or counter[1] <= 1:
+            return ""
+        return f"{counter[0]} of {counter[1]}"
 
     # ------------------------------------------------------------------
     # Event sink with permission interception + backpressure
@@ -128,14 +138,32 @@ class ACPBroker:
     async def _sink(self, event: BrokerEvent) -> None:
         """Event sink passed to sessions. Intercepts permissions, applies backpressure."""
         if isinstance(event, PermissionRequested):
-            self._pending_permissions[event.agent_id] = event
+            self._pending_permissions[event.request_id] = event
+            # Auto-approve if the tool matches a configured pattern
+            if self._should_auto_approve(event):
+                session = self._registry.get_session(event.agent_id)
+                if session:
+                    option_id = self._find_allow_once(event.options)
+                    if option_id:
+                        session.resolve_permission(event.request_id, option_id)
+                        self._pending_permissions.pop(event.request_id, None)
+                        await self._event_queue.put(
+                            PermissionAutoResolved(
+                                agent_id=event.agent_id,
+                                request_id=event.request_id,
+                                decision=PermissionDecision.allow_once,
+                            )
+                        )
+                        return
+            # Auto-resolve if a persisted rule matches
             decision = self._permission_engine.check(event.agent_id, event.kind, self._session_id)
             if decision is not None:
                 session = self._registry.get_session(event.agent_id)
                 if session:
                     option_id = self._find_option_id(event.options, decision)
                     if option_id:
-                        session.resolve_permission(option_id)
+                        session.resolve_permission(event.request_id, option_id)
+                        self._pending_permissions.pop(event.request_id, None)
                         await self._event_queue.put(
                             PermissionAutoResolved(
                                 agent_id=event.agent_id,
@@ -144,6 +172,15 @@ class ACPBroker:
                             )
                         )
                         return
+            # Show one permission bar at a time per agent; queue the rest
+            aid = event.agent_id
+            cur, total = self._permission_counter.get(aid, (0, 0))
+            if aid in self._active_permission:
+                self._permission_queue.setdefault(aid, []).append(event)
+                self._permission_counter[aid] = (cur, total + 1)
+                return
+            self._active_permission[aid] = event.request_id
+            self._permission_counter[aid] = (1, total + 1)
         elif isinstance(event, UsageUpdated):
             self._registry.update_usage(event)
 
@@ -168,17 +205,32 @@ class ACPBroker:
                 return opt.option_id
         return None
 
+    def _should_auto_approve(self, event: PermissionRequested) -> bool:
+        """Check if the tool in the permission title matches an auto-approve pattern."""
+        patterns = self._config.settings.auto_approve_tools
+        if not patterns:
+            return False
+        title = event.title
+        return any(pattern in title for pattern in patterns)
+
+    @staticmethod
+    def _find_allow_once(options: list) -> str | None:
+        for opt in options:
+            if opt.kind == "allow_once":
+                return opt.option_id
+        return None
+
     # ------------------------------------------------------------------
     # Permission resolution
     # ------------------------------------------------------------------
 
-    def _resolve_permission(self, agent_id: str, option_id: str) -> None:
-        """Resolve a pending permission Future on a session."""
+    async def _resolve_permission(self, agent_id: str, request_id: str, option_id: str) -> None:
+        """Resolve a pending permission Future on a session, then show the next queued one."""
         session = self._registry.get_session(agent_id)
         if session:
-            session.resolve_permission(option_id)
+            session.resolve_permission(request_id, option_id)
 
-        pending = self._pending_permissions.pop(agent_id, None)
+        pending = self._pending_permissions.pop(request_id, None)
         if not pending:
             return
 
@@ -190,6 +242,8 @@ class ACPBroker:
 
         if selected_kind is None:
             log.warning("option_id %r not found for agent %r", option_id, agent_id)
+            self._active_permission.pop(agent_id, None)
+            await self._flush_permission_queue(agent_id)
             return
 
         if selected_kind in ("allow_always", "reject_always"):
@@ -201,6 +255,67 @@ class ACPBroker:
                     decision=PermissionDecision(selected_kind),
                 )
             )
+
+        # Release the active slot and show the next queued permission
+        self._active_permission.pop(agent_id, None)
+        await self._flush_permission_queue(agent_id)
+
+    async def _flush_permission_queue(self, agent_id: str) -> None:
+        """Forward the next queued permission for this agent to the UI.
+
+        Auto-resolves queued permissions that match persisted rules,
+        draining until one needs manual resolution or the queue is empty.
+        """
+        queue = self._permission_queue.get(agent_id)
+        while queue:
+            nxt = queue.pop(0)
+            if not queue:
+                del self._permission_queue[agent_id]
+            # Try auto-approve by tool pattern
+            if self._should_auto_approve(nxt):
+                session = self._registry.get_session(nxt.agent_id)
+                if session:
+                    option_id = self._find_allow_once(nxt.options)
+                    if option_id:
+                        session.resolve_permission(nxt.request_id, option_id)
+                        self._pending_permissions.pop(nxt.request_id, None)
+                        await self._event_queue.put(
+                            PermissionAutoResolved(
+                                agent_id=nxt.agent_id,
+                                request_id=nxt.request_id,
+                                decision=PermissionDecision.allow_once,
+                            )
+                        )
+                        cur, total = self._permission_counter.get(agent_id, (1, 1))
+                        self._permission_counter[agent_id] = (cur + 1, total)
+                        continue
+            # Try auto-resolve by persisted rule
+            decision = self._permission_engine.check(nxt.agent_id, nxt.kind, self._session_id)
+            if decision is not None:
+                session = self._registry.get_session(nxt.agent_id)
+                if session:
+                    option_id = self._find_option_id(nxt.options, decision)
+                    if option_id:
+                        session.resolve_permission(nxt.request_id, option_id)
+                        self._pending_permissions.pop(nxt.request_id, None)
+                        await self._event_queue.put(
+                            PermissionAutoResolved(
+                                agent_id=nxt.agent_id,
+                                request_id=nxt.request_id,
+                                decision=decision,
+                            )
+                        )
+                        cur, total = self._permission_counter.get(agent_id, (1, 1))
+                        self._permission_counter[agent_id] = (cur + 1, total)
+                        continue
+            # Needs manual resolution — forward to UI
+            self._active_permission[agent_id] = nxt.request_id
+            cur, total = self._permission_counter.get(agent_id, (1, 1))
+            self._permission_counter[agent_id] = (cur + 1, total)
+            await self._event_queue.put(nxt)
+            return
+        # Queue fully drained
+        self._permission_counter.pop(agent_id, None)
 
     # ------------------------------------------------------------------
     # Lifecycle + message bus wiring
@@ -256,6 +371,7 @@ class ACPBroker:
         await lifecycle.update_command_status(cmd_id, "processed")
 
     async def _deliver_message(self, agent_id: str, text: str, from_agents: list[str]) -> bool:
+        """Deliver a message to an agent. Non-blocking — dispatches prompt as a task."""
         session = self._registry.get_session(agent_id)
         if not session or session.state != AgentState.IDLE:
             return False
@@ -264,7 +380,8 @@ class ACPBroker:
                 await self._event_queue.put(
                     McpMessageDelivered(agent_id=agent_id, from_agent=sender, to_agent=agent_id, preview=text)
                 )
-            await session.prompt(text)
+            if self._lifecycle:
+                await self._lifecycle.prompt(agent_id, text)
             return True
         except Exception:
             return False
