@@ -62,7 +62,7 @@ class TestConsumeEvents:
         app = SynthApp(broker, _make_config("a"))
 
         posted: list[BrokerEventMessage] = []
-        app.post_message = MagicMock(side_effect=lambda m: posted.append(m))  # type: ignore[method-assign]
+        app.post_message = MagicMock(side_effect=posted.append)  # type: ignore[method-assign]
 
         await app._consume_broker_events()
 

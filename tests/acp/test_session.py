@@ -74,7 +74,7 @@ class TestSessionStateMachine:
     async def test_valid_transition_emits_event(
         self, session: ACPSession, events: list[BrokerEvent]
     ):
-        await session._set_state(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.INITIALIZING)
         assert session.state == AgentState.INITIALIZING
         assert len(events) == 1
         assert isinstance(events[0], AgentStateChanged)
@@ -83,7 +83,7 @@ class TestSessionStateMachine:
 
     async def test_invalid_transition_raises(self, session: ACPSession):
         with pytest.raises(InvalidTransitionError):
-            await session._set_state(AgentState.BUSY)  # UNSTARTED → BUSY is invalid
+            await session._sm.transition(AgentState.BUSY)  # UNSTARTED → BUSY is invalid
 
 
 class TestSessionUpdate:
@@ -517,8 +517,8 @@ class TestSessionModes:
 
         session._conn = StubConn()
         session._mcp_servers = []
-        await session._set_state(AgentState.INITIALIZING)
-        await session._set_state(AgentState.IDLE)
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
         events.clear()
         observed_states.clear()
 
@@ -544,8 +544,8 @@ class TestSessionModes:
                 raise RuntimeError("RPC failed")
 
         session._conn = FailingConn()
-        await session._set_state(AgentState.INITIALIZING)
-        await session._set_state(AgentState.IDLE)
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
         events.clear()
 
         with pytest.raises(RuntimeError, match="RPC failed"):
@@ -555,6 +555,103 @@ class TestSessionModes:
             "set_mode must restore IDLE after an RPC failure — "
             "the finally block must not skip the transition"
         )
+
+
+class TestSetModel:
+    """Tests for set_model CONFIGURING guard."""
+
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def session(self, events: list[BrokerEvent]) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        return ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+        )
+
+    async def test_set_model_transitions_through_configuring(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        observed_states: list[AgentState] = []
+        original_sink = session._event_sink
+
+        async def tracking_sink(event: BrokerEvent) -> None:
+            if isinstance(event, AgentStateChanged):
+                observed_states.append(event.new_state)
+            await original_sink(event)
+
+        session._event_sink = tracking_sink
+
+        class StubConn:
+            async def set_session_model(self, **kwargs: Any) -> None:
+                pass
+
+        session._conn = StubConn()
+        session._session_id = "s1"
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+        events.clear()
+        observed_states.clear()
+
+        await session.set_model("new-model")
+
+        assert AgentState.CONFIGURING in observed_states
+        assert session.state == AgentState.IDLE
+
+    async def test_set_model_restores_idle_on_rpc_failure(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        class FailingConn:
+            async def set_session_model(self, **kwargs: Any) -> None:
+                raise RuntimeError("RPC failed")
+
+        session._conn = FailingConn()
+        session._session_id = "s1"
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+
+        with pytest.raises(RuntimeError, match="RPC failed"):
+            await session.set_model("new-model")
+
+        assert session.state == AgentState.IDLE
+
+
+class TestSessionPublicAPI:
+    """Tests for session_id property and force_terminate."""
+
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def session(self, events: list[BrokerEvent]) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        return ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+        )
+
+    async def test_session_id_property(self, session: ACPSession) -> None:
+        assert session.session_id is None
+        session._session_id = "abc-123"
+        assert session.session_id == "abc-123"
+
+    async def test_force_terminate_public_method(self, session: ACPSession) -> None:
+        await session.force_terminate()
+        assert session.state == AgentState.TERMINATED
 
 
 class TestMcpRestore:
@@ -728,3 +825,89 @@ class TestTerminalCallbacks:
         evt = events[0]
         assert isinstance(evt, ToolCallUpdated)
         assert evt.terminal_id == "t-1"
+
+
+class TestSessionRunLifecycle:
+    """Tests for run() exception handling and cleanup (Phase 2)."""
+
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def session(self, events: list[BrokerEvent]) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        return ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+        )
+
+    async def test_cancelled_error_not_emitted_as_broker_error(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Cancelling run() must re-raise CancelledError, not emit BrokerError.
+        A BrokerError on cancel would show a spurious error notification in the TUI."""
+
+        async def fake_spawn(*_args: Any, **_kwargs: Any) -> Any:
+            """Context manager that simulates a long-running agent."""
+
+            class _Ctx:
+                async def __aenter__(self) -> tuple:
+                    await asyncio.sleep(100)
+                    return (None, None)  # unreachable
+
+                async def __aexit__(self, *args: Any) -> None:
+                    pass
+
+            return _Ctx()
+
+        with patch("synth_acp.acp.session._spawn_isolated_agent", side_effect=asyncio.CancelledError):
+            task = asyncio.create_task(session.run())
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        from synth_acp.models.events import BrokerError as BErr
+
+        assert not any(isinstance(e, BErr) for e in events)
+
+    async def test_finally_uses_force_terminal(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """The finally block must use force_terminal() so that reaching TERMINATED
+        from any state (including already-TERMINATED) never raises."""
+        # Simulate an error path that leaves session in TERMINATED
+        await session._sm.force_terminal()
+        assert session.state == AgentState.TERMINATED
+        events.clear()
+
+        # Calling force_terminal again (as the finally block does) must not raise
+        await session._sm.force_terminal()
+        assert session.state == AgentState.TERMINATED
+        # No duplicate AgentStateChanged emitted
+        assert len(events) == 0
+
+    async def test_unsubscribe_called_on_session_exit(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """The accumulator subscription must be cleaned up when run() exits.
+        Without this, the accumulator holds a reference preventing GC."""
+        from unittest.mock import MagicMock
+
+        mock_unsub = MagicMock()
+        session._unsubscribe = mock_unsub
+
+        # Trigger run() with a spawn that immediately fails
+        with patch(
+            "synth_acp.acp.session._spawn_isolated_agent",
+            side_effect=RuntimeError("spawn failed"),
+        ):
+            await session.run()
+
+        mock_unsub.assert_called_once()

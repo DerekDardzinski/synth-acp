@@ -57,12 +57,12 @@ class TestBrokerDispatch:
             cwd=".",
             event_sink=noop_sink,
         )
-        session.state = AgentState.BUSY
+        session._sm._state = AgentState.BUSY
 
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         session._permission_future = future
 
-        broker._sessions["agent-1"] = session
+        broker._registry._sessions["agent-1"] = session
 
         await broker.handle(RespondPermission(agent_id="agent-1", option_id="opt-allow"))
 
@@ -81,7 +81,7 @@ class TestBrokerDispatch:
             cwd=".",
             event_sink=broker._sink,
         )
-        idle_session.state = AgentState.IDLE
+        idle_session._sm._state = AgentState.IDLE
         idle_session.prompt = AsyncMock()  # type: ignore[method-assign]
 
         busy_session = ACPSession(
@@ -91,10 +91,10 @@ class TestBrokerDispatch:
             cwd=".",
             event_sink=broker._sink,
         )
-        busy_session.state = AgentState.BUSY
+        busy_session._sm._state = AgentState.BUSY
 
-        broker._sessions["agent-1"] = idle_session
-        broker._sessions["agent-2"] = busy_session
+        broker._registry._sessions["agent-1"] = idle_session
+        broker._registry._sessions["agent-2"] = busy_session
 
         await broker.handle(SendPrompt(agent_id="agent-1", text="hello"))
         await asyncio.sleep(0)
@@ -120,10 +120,10 @@ class TestBrokerDispatch:
             cwd=".",
             event_sink=broker._sink,
         )
-        session.state = AgentState.BUSY
+        session._sm._state = AgentState.BUSY
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         session._permission_future = future
-        broker._sessions["agent-1"] = session
+        broker._registry._sessions["agent-1"] = session
 
         # Store a pending permission event
         broker._pending_permissions["agent-1"] = PermissionRequested(
@@ -160,9 +160,9 @@ class TestBrokerDispatch:
             cwd=".",
             event_sink=broker._sink,
         )
-        session.state = AgentState.IDLE
+        session._sm._state = AgentState.IDLE
         session.set_mode = AsyncMock()  # type: ignore[method-assign]
-        broker._sessions["agent-1"] = session
+        broker._registry._sessions["agent-1"] = session
 
         await broker.handle(SetAgentMode(agent_id="agent-1", mode_id="architect"))
 
@@ -174,14 +174,14 @@ class TestBrokerDispatch:
         """SetAgentMode on a non-idle agent must emit BrokerError and not call set_mode."""
         broker = _make_broker("agent-1", tmp_path=tmp_path)
         events: list[BrokerEvent] = []
-        broker._sink = AsyncMock(side_effect=lambda e: events.append(e))  # type: ignore[method-assign]
+        broker._sink = AsyncMock(side_effect=events.append)  # type: ignore[method-assign]
 
         session = ACPSession(
             agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
         )
-        session.state = AgentState.TERMINATED
+        session._sm._state = AgentState.TERMINATED
         session.set_mode = AsyncMock()  # type: ignore[method-assign]
-        broker._sessions["agent-1"] = session
+        broker._registry._sessions["agent-1"] = session
 
         await broker.handle(SetAgentMode(agent_id="agent-1", mode_id="code"))
 
@@ -197,9 +197,9 @@ class TestBrokerDispatch:
         session = ACPSession(
             agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
         )
-        session.state = AgentState.IDLE
+        session._sm._state = AgentState.IDLE
         session.set_model = AsyncMock()  # type: ignore[method-assign]
-        broker._sessions["agent-1"] = session
+        broker._registry._sessions["agent-1"] = session
 
         await broker.handle(SetAgentModel(agent_id="agent-1", model_id="claude-sonnet-4-5"))
 
@@ -211,14 +211,14 @@ class TestBrokerDispatch:
         """SetAgentModel on a non-idle agent must emit BrokerError and not call set_model."""
         broker = _make_broker("agent-1", tmp_path=tmp_path)
         events: list[BrokerEvent] = []
-        broker._sink = AsyncMock(side_effect=lambda e: events.append(e))  # type: ignore[method-assign]
+        broker._sink = AsyncMock(side_effect=events.append)  # type: ignore[method-assign]
 
         session = ACPSession(
             agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
         )
-        session.state = AgentState.BUSY
+        session._sm._state = AgentState.BUSY
         session.set_model = AsyncMock()  # type: ignore[method-assign]
-        broker._sessions["agent-1"] = session
+        broker._registry._sessions["agent-1"] = session
 
         await broker.handle(SetAgentModel(agent_id="agent-1", model_id="claude-opus-4-5"))
 
@@ -240,8 +240,8 @@ class TestBrokerUsageAccumulation:
             agent_id="agent-1", size=128000, used=32000, cost_amount=0.15, cost_currency="USD"
         )
 
-        broker._accumulate_usage(event1)
-        broker._accumulate_usage(event2)
+        broker._registry.update_usage(event1)
+        broker._registry.update_usage(event2)
 
         result = broker.get_usage("agent-1")
         assert result is not None
@@ -256,7 +256,8 @@ class TestProcessCommands:
 
     async def _init_broker_db(self, broker: ACPBroker) -> None:
         """Initialize the broker DB with schema."""
-        await broker._register_agents()
+        lifecycle = await broker._ensure_lifecycle()
+        await lifecycle.register_agents()
 
     def _insert_command(
         self,
@@ -320,20 +321,22 @@ class TestProcessCommands:
             )
             cmd_id = self._insert_command(broker, "orchestrator", "launch", payload)
 
-            with patch("synth_acp.broker.broker.ACPSession", return_value=mock_session):
+            with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_session):
                 await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
 
             # Session created
-            assert "worker-1" in broker._sessions
+            assert "worker-1" in broker._registry._sessions
             # Command processed
             status, error = self._get_command_status(broker, cmd_id)
             assert status == "processed"
             assert error is None
             # Parentage tracked
-            assert broker._agent_parents["worker-1"] == "orchestrator"
+            assert broker._registry._parents["worker-1"] == "orchestrator"
         finally:
-            if broker._db:
-                await broker._db.close()
+            if broker._message_bus:
+                await broker._message_bus.stop()
+            if broker._lifecycle:
+                await broker._lifecycle.close_db()
 
     async def test_process_commands_when_launch_with_unknown_harness_rejects(
         self, tmp_path: Path
@@ -362,8 +365,10 @@ class TestProcessCommands:
             assert status == "rejected"
             assert "Unknown harness" in (error or "")
         finally:
-            if broker._db:
-                await broker._db.close()
+            if broker._message_bus:
+                await broker._message_bus.stop()
+            if broker._lifecycle:
+                await broker._lifecycle.close_db()
 
     async def test_process_commands_when_terminate_by_non_parent_rejects(
         self, tmp_path: Path
@@ -375,8 +380,8 @@ class TestProcessCommands:
             # Set up child agent with parent
             mock_session = AsyncMock()
             mock_session.state = AgentState.IDLE
-            broker._sessions["child"] = mock_session
-            broker._agent_parents["child"] = "orchestrator"
+            broker._registry._sessions["child"] = mock_session
+            broker._registry._parents["child"] = "orchestrator"
 
             import json
 
@@ -389,10 +394,12 @@ class TestProcessCommands:
             assert status == "rejected"
             assert "Not authorized" in (error or "")
             # Session still alive
-            assert "child" in broker._sessions
+            assert "child" in broker._registry._sessions
         finally:
-            if broker._db:
-                await broker._db.close()
+            if broker._message_bus:
+                await broker._message_bus.stop()
+            if broker._lifecycle:
+                await broker._lifecycle.close_db()
 
     async def test_process_commands_when_slot_opens_processes_queued_launch(
         self, tmp_path: Path
@@ -404,7 +411,7 @@ class TestProcessCommands:
             # Set up 1 active agent at capacity
             mock_active = AsyncMock()
             mock_active.state = AgentState.IDLE
-            broker._sessions["orchestrator"] = mock_active
+            broker._registry._sessions["orchestrator"] = mock_active
 
             import json
 
@@ -436,16 +443,18 @@ class TestProcessCommands:
 
             with (
                 patch.dict("os.environ", {"SYNTH_MAX_AGENTS": "1"}),
-                patch("synth_acp.broker.broker.ACPSession", return_value=mock_new),
+                patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_new),
             ):
                 await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
 
-            assert "worker-1" in broker._sessions
+            assert "worker-1" in broker._registry._sessions
             status, _ = self._get_command_status(broker, cmd_id)
             assert status == "processed"
         finally:
-            if broker._db:
-                await broker._db.close()
+            if broker._message_bus:
+                await broker._message_bus.stop()
+            if broker._lifecycle:
+                await broker._lifecycle.close_db()
 
     async def test_process_commands_when_agent_reaches_idle_sends_initial_message(
         self, tmp_path: Path
@@ -453,6 +462,8 @@ class TestProcessCommands:
         broker = _make_broker("orchestrator", tmp_path=tmp_path)
         await self._init_broker_db(broker)
         try:
+            await broker._start_message_bus()
+            await broker._ensure_lifecycle()
 
             mock_session = AsyncMock()
             mock_session.state = AgentState.IDLE
@@ -473,15 +484,15 @@ class TestProcessCommands:
             )
             cmd_id = self._insert_command(broker, "orchestrator", "launch", payload)
 
-            with patch("synth_acp.broker.broker.ACPSession", return_value=mock_session):
+            with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_session):
                 await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
 
-            # Pending initial prompt stored
-            assert "worker-1" in broker._pending_initial_prompts
+            assert broker._message_bus is not None
+            assert broker._message_bus._pending.get("worker-1") is not None
 
-            # Simulate IDLE transition
             from synth_acp.models.events import AgentStateChanged
 
+            broker._registry._sessions["worker-1"] = mock_session
             await broker._sink(
                 AgentStateChanged(
                     agent_id="worker-1",
@@ -489,13 +500,15 @@ class TestProcessCommands:
                     new_state=AgentState.IDLE,
                 )
             )
-            await asyncio.sleep(0)  # Let create_task fire
+            await asyncio.sleep(0)
 
-            mock_session.prompt.assert_awaited_once_with("Start working on auth")
-            assert "worker-1" not in broker._pending_initial_prompts
+            mock_session.prompt.assert_awaited_once()
+            assert broker._message_bus._pending.get("worker-1") is None
         finally:
-            if broker._db:
-                await broker._db.close()
+            if broker._message_bus:
+                await broker._message_bus.stop()
+            if broker._lifecycle:
+                await broker._lifecycle.close_db()
 
     async def test_join_broadcast_when_agent_registered_sends_to_visible_agents(
         self, tmp_path: Path
@@ -514,7 +527,7 @@ class TestProcessCommands:
             # Set up orchestrator as active
             mock_orch = AsyncMock()
             mock_orch.state = AgentState.IDLE
-            broker._sessions["orchestrator"] = mock_orch
+            broker._registry._sessions["orchestrator"] = mock_orch
 
             mock_worker = AsyncMock()
             mock_worker.state = AgentState.IDLE
@@ -535,7 +548,7 @@ class TestProcessCommands:
             )
             cmd_id = self._insert_command(broker, "orchestrator", "launch", payload)
 
-            with patch("synth_acp.broker.broker.ACPSession", return_value=mock_worker):
+            with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_worker):
                 await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
 
             # Check messages table for join broadcast
@@ -551,8 +564,10 @@ class TestProcessCommands:
             assert rows[0][1] == "orchestrator"
             assert rows[0][2] == '[System] Agent "worker" has joined. Task: Fix auth.'
         finally:
-            if broker._db:
-                await broker._db.close()
+            if broker._message_bus:
+                await broker._message_bus.stop()
+            if broker._lifecycle:
+                await broker._lifecycle.close_db()
 
 
 class TestRelaunchTerminatedAgent:
@@ -570,18 +585,220 @@ class TestRelaunchTerminatedAgent:
             cwd=".",
             event_sink=broker._sink,
         )
-        old_session.state = AgentState.TERMINATED
-        broker._sessions["agent-1"] = old_session
+        old_session._sm._state = AgentState.TERMINATED
+        broker._registry._sessions["agent-1"] = old_session
 
         # Re-launch should clean up old session and create a new one
         mock_session = AsyncMock()
         mock_session.state = AgentState.INITIALIZING
         mock_session.run = AsyncMock()
 
-        with patch("synth_acp.broker.broker.ACPSession", return_value=mock_session):
+        with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_session):
             await broker.handle(LaunchAgent(agent_id="agent-1"))
 
         # New session replaced the old one
-        assert broker._sessions["agent-1"] is mock_session
+        assert broker._registry._sessions["agent-1"] is mock_session
         # No BrokerError emitted
         assert broker._event_queue.empty()
+
+
+class TestSelfTerminate:
+    async def test_self_terminate_emits_terminated_event(self, tmp_path: Path) -> None:
+        """self_terminate command must transition agent to TERMINATED and emit
+        AgentStateChanged. Without this, the TUI never learns the agent left."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+
+        session = ACPSession(
+            agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
+        )
+        session._sm._state = AgentState.IDLE
+        broker._registry._sessions["agent-1"] = session
+
+        # Ensure lifecycle + schema exist so update_command_status works
+        lifecycle = await broker._ensure_lifecycle()
+        await lifecycle.register_agents()
+
+        try:
+            await broker._handle_self_terminate_command(cmd_id=1, from_agent="agent-1")
+
+            assert session.state == AgentState.TERMINATED
+            events = []
+            while not broker._event_queue.empty():
+                events.append(broker._event_queue.get_nowait())
+            from synth_acp.models.events import AgentStateChanged
+
+            assert any(
+                isinstance(e, AgentStateChanged) and e.new_state == AgentState.TERMINATED
+                for e in events
+            )
+        finally:
+            await lifecycle.close_db()
+
+    async def test_self_terminate_does_not_call_session_terminate(self, tmp_path: Path) -> None:
+        """self_terminate must use force_terminate(), not terminate().
+        terminate() kills the process — wrong for an agent voluntarily leaving."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+
+        session = ACPSession(
+            agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
+        )
+        session._sm._state = AgentState.IDLE
+        session.terminate = AsyncMock()  # type: ignore[method-assign]
+        broker._registry._sessions["agent-1"] = session
+
+        lifecycle = await broker._ensure_lifecycle()
+        await lifecycle.register_agents()
+        try:
+            await broker._handle_self_terminate_command(cmd_id=1, from_agent="agent-1")
+            session.terminate.assert_not_awaited()
+            assert session.state == AgentState.TERMINATED
+        finally:
+            await lifecycle.close_db()
+
+    async def test_two_pending_messages_before_idle_both_delivered(self, tmp_path: Path) -> None:
+        """Two messages enqueued before IDLE must both appear in the prompt.
+        Catches the old dict-overwrite bug where only the last message survived."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        await broker._start_message_bus()
+        lifecycle = await broker._ensure_lifecycle()
+
+        session = ACPSession(
+            agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
+        )
+        session._sm._state = AgentState.IDLE
+        session.prompt = AsyncMock()  # type: ignore[method-assign]
+        broker._registry._sessions["agent-1"] = session
+
+        assert broker._message_bus is not None
+        broker._message_bus.enqueue_pending("agent-1", "sender-a", "msg1")
+        broker._message_bus.enqueue_pending("agent-1", "sender-b", "msg2")
+
+        from synth_acp.models.events import AgentStateChanged
+
+        try:
+            await broker._sink(
+                AgentStateChanged(
+                    agent_id="agent-1",
+                    old_state=AgentState.INITIALIZING,
+                    new_state=AgentState.IDLE,
+                )
+            )
+            await asyncio.sleep(0)
+
+            session.prompt.assert_awaited_once()
+            prompt_text = session.prompt.call_args[0][0]
+            assert "msg1" in prompt_text
+            assert "msg2" in prompt_text
+        finally:
+            await broker._message_bus.stop()
+            await lifecycle.close_db()
+
+
+class TestShutdownOrdering:
+    async def test_shutdown_phases_in_order(self, tmp_path: Path) -> None:
+        """Shutdown must call lifecycle.shutdown() → message_bus.stop() → lifecycle.close_db().
+        Wrong ordering causes zombie DB connections or writes after close."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        call_log: list[str] = []
+
+        mock_lifecycle = AsyncMock()
+        mock_lifecycle.shutdown = AsyncMock(side_effect=lambda: call_log.append("lifecycle.shutdown"))
+        mock_lifecycle.close_db = AsyncMock(side_effect=lambda: call_log.append("lifecycle.close_db"))
+        broker._lifecycle = mock_lifecycle
+
+        mock_bus = AsyncMock()
+        mock_bus.stop = AsyncMock(side_effect=lambda: call_log.append("bus.stop"))
+        broker._message_bus = mock_bus
+
+        await broker.shutdown()
+
+        assert call_log == ["lifecycle.shutdown", "bus.stop", "lifecycle.close_db"]
+
+    async def test_shutdown_completes_within_timeout(self, tmp_path: Path) -> None:
+        """Shutdown with slow components must still complete in bounded time."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+
+        mock_lifecycle = AsyncMock()
+
+        async def slow_shutdown() -> None:
+            await asyncio.sleep(0.1)
+
+        mock_lifecycle.shutdown = slow_shutdown
+        mock_lifecycle.close_db = AsyncMock()
+        broker._lifecycle = mock_lifecycle
+
+        mock_bus = AsyncMock()
+        mock_bus.stop = AsyncMock()
+        broker._message_bus = mock_bus
+
+        t0 = asyncio.get_event_loop().time()
+        await broker.shutdown()
+        elapsed = asyncio.get_event_loop().time() - t0
+        assert elapsed < 5.0
+
+
+class TestEventQueueBackpressure:
+    async def test_queue_full_drops_chunk_events_not_state_events(self, tmp_path: Path) -> None:
+        """When the event queue is full, MessageChunkReceived must be dropped
+        but AgentStateChanged must block until space is available.
+        Without this, state events are silently lost."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        broker._event_queue = asyncio.Queue(maxsize=2)
+
+        from synth_acp.models.events import AgentStateChanged, MessageChunkReceived
+
+        # Fill the queue
+        await broker._event_queue.put(
+            AgentStateChanged(agent_id="agent-1", old_state=AgentState.UNSTARTED, new_state=AgentState.INITIALIZING)
+        )
+        await broker._event_queue.put(
+            AgentStateChanged(agent_id="agent-1", old_state=AgentState.INITIALIZING, new_state=AgentState.IDLE)
+        )
+        assert broker._event_queue.full()
+
+        # Chunk should be silently dropped
+        await broker._sink(MessageChunkReceived(agent_id="agent-1", chunk="hello"))
+        assert broker._event_queue.qsize() == 2  # unchanged
+
+        # State event should block — drain one first to make room
+        broker._event_queue.get_nowait()
+        await broker._sink(
+            AgentStateChanged(agent_id="agent-1", old_state=AgentState.IDLE, new_state=AgentState.BUSY)
+        )
+        assert broker._event_queue.qsize() == 2  # filled back up
+
+
+class TestSinkPendingPrompts:
+    async def test_sink_pending_prompts_delivered_on_idle(self, tmp_path: Path) -> None:
+        """When an agent transitions to IDLE and has pending messages in the bus,
+        the broker must call lifecycle.prompt() to deliver them."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        await broker._start_message_bus()
+        lifecycle = await broker._ensure_lifecycle()
+
+        session = ACPSession(
+            agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
+        )
+        session._sm._state = AgentState.IDLE
+        session.prompt = AsyncMock()  # type: ignore[method-assign]
+        broker._registry._sessions["agent-1"] = session
+
+        assert broker._message_bus is not None
+        broker._message_bus.enqueue_pending("agent-1", "other", "do stuff")
+
+        from synth_acp.models.events import AgentStateChanged
+
+        try:
+            await broker._sink(
+                AgentStateChanged(
+                    agent_id="agent-1",
+                    old_state=AgentState.INITIALIZING,
+                    new_state=AgentState.IDLE,
+                )
+            )
+            await asyncio.sleep(0)
+
+            session.prompt.assert_awaited_once()
+        finally:
+            await broker._message_bus.stop()
+            await lifecycle.close_db()

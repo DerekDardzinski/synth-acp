@@ -48,7 +48,7 @@ class TestSessionPermissionFlow:
         options: list[PermissionOption],
     ) -> None:
         # Get session into BUSY state (bypass state machine — no real subprocess)
-        session.state = AgentState.BUSY
+        session._sm._state = AgentState.BUSY
 
         async def resolve_later() -> None:
             # Wait for the future to be created
@@ -72,7 +72,7 @@ class TestSessionPermissionFlow:
         tool_call: ToolCallUpdate,
         options: list[PermissionOption],
     ) -> None:
-        session.state = AgentState.BUSY
+        session._sm._state = AgentState.BUSY
 
         async def cancel_later() -> None:
             while session._permission_future is None:
@@ -94,7 +94,7 @@ class TestSessionPermissionFlow:
         tool_call: ToolCallUpdate,
         options: list[PermissionOption],
     ) -> None:
-        session.state = AgentState.BUSY
+        session._sm._state = AgentState.BUSY
 
         async def resolve_later() -> None:
             while session._permission_future is None:

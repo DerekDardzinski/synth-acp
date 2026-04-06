@@ -11,7 +11,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import ContentSwitcher, Footer, Static
-from textual.worker import WorkerState
+from textual.worker import Worker, WorkerState
 
 from synth_acp.broker.broker import ACPBroker
 from synth_acp.models.agent import AgentMode, AgentModel, AgentState
@@ -436,7 +436,7 @@ class SynthApp(App):
         except Exception:
             log.debug("Topbar usage update failed", exc_info=True)
 
-    def on_worker_state_changed(self, event: SynthApp.WorkerStateChanged) -> None:
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """Handle worker state changes — notify and restart on error.
 
         Args:

@@ -204,3 +204,20 @@ class TerminalCreated(BrokerEvent):
     terminal_id: str
     command: str
     terminal_process: Any
+
+
+type AgentEvent = (
+    AgentStateChanged | MessageChunkReceived | ToolCallUpdated | TurnComplete
+    | AgentThoughtReceived | PlanReceived | AvailableCommandsReceived | TerminalCreated
+)
+
+type ConfigEvent = (
+    AgentModesReceived | AgentModeChanged | AgentModelsReceived | AgentModelChanged
+)
+
+type SystemEvent = (
+    BrokerError | PermissionRequested | PermissionAutoResolved
+    | UsageUpdated | McpMessageDelivered
+)
+
+type BrokerEventUnion = AgentEvent | ConfigEvent | SystemEvent

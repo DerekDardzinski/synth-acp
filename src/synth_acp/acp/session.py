@@ -44,8 +44,8 @@ from acp.schema import (
 from acp.transports import default_environment
 
 from acp import text_block
+from synth_acp.acp.state_machine import AgentStateMachine
 from synth_acp.models.agent import (
-    TRANSITIONS,
     AgentMode,
     AgentModel,
     AgentState,
@@ -152,7 +152,7 @@ class ACPSession:
         agent_mode: str | None = None,
     ) -> None:
         self.agent_id = agent_id
-        self.state = AgentState.UNSTARTED
+        self._sm = AgentStateMachine(agent_id, self._on_state_transition)
         self._binary = binary
         self._args = args
         self._cwd = cwd
@@ -170,24 +170,37 @@ class ACPSession:
         self._current_model_id: str | None = None
         self._suppress_history_replay: bool = False
         self._accumulator = SessionAccumulator()
-        self._accumulator.subscribe(self._on_snapshot)
+        self._unsubscribe: Callable[[], None] = self._accumulator.subscribe(self._on_snapshot)
         self._terminals: dict[str, TerminalProcess] = {}
         self._terminal_count: int = 0
 
-    async def _set_state(self, new_state: AgentState) -> None:
-        """Transition state and notify broker. Awaited to prevent races."""
-        old = self.state
-        if new_state not in TRANSITIONS[old]:
-            raise InvalidTransitionError(f"{self.agent_id}: {old} → {new_state}")
-        self.state = new_state
+    @property
+    def state(self) -> AgentState:
+        return self._sm.state
+
+    @property
+    def session_id(self) -> str | None:
+        """The ACP session ID, or None if not yet initialized."""
+        return self._session_id
+
+    async def force_terminate(self) -> None:
+        """Force transition to TERMINATED. Safe for cleanup paths and voluntary exit.
+
+        Other components (broker, lifecycle) call this instead of accessing
+        _sm directly to maintain encapsulation.
+        """
+        await self._sm.force_terminal()
+
+    async def _on_state_transition(self, old: AgentState, new: AgentState) -> None:
+        """Callback fired by the state machine after every transition."""
         await self._event_sink(
-            AgentStateChanged(agent_id=self.agent_id, old_state=old, new_state=new_state)
+            AgentStateChanged(agent_id=self.agent_id, old_state=old, new_state=new)
         )
 
     async def run(self) -> None:
         """Main lifecycle — spawns agent, handshakes, waits for exit."""
         try:
-            await self._set_state(AgentState.INITIALIZING)
+            await self._sm.transition(AgentState.INITIALIZING)
             async with _spawn_isolated_agent(self, self._binary, *self._args, cwd=self._cwd) as (
                 conn,
                 proc,
@@ -285,9 +298,18 @@ class ACPSession:
                             self.agent_id,
                         )
 
-                await self._set_state(AgentState.IDLE)
+                await self._sm.transition(AgentState.IDLE)
                 await proc.wait()
+        except InvalidTransitionError as e:
+            log.error("Invalid state transition in session %s: %s", self.agent_id, e, exc_info=True)
+            await self._event_sink(
+                BrokerError(agent_id=self.agent_id, message=f"Internal state error: {e}", severity="error")
+            )
+        except asyncio.CancelledError:
+            log.debug("Session %s cancelled", self.agent_id)
+            raise
         except Exception as e:
+            log.error("Session %s raised unexpectedly", self.agent_id, exc_info=True)
             await self._event_sink(BrokerError(agent_id=self.agent_id, message=f"Agent error: {e}"))
 
         finally:
@@ -295,14 +317,14 @@ class ACPSession:
                 t.kill()
             if self._permission_future and not self._permission_future.done():
                 self._permission_future.cancel()
-            if self.state != AgentState.TERMINATED:
-                await self._set_state(AgentState.TERMINATED)
+            self._unsubscribe()
+            await self._sm.force_terminal()
 
     async def prompt(self, text: str) -> None:
         """Send a prompt to the agent."""
         if not self._conn or not self._session_id:
             return
-        await self._set_state(AgentState.BUSY)
+        await self._sm.transition(AgentState.BUSY)
         try:
             response = await self._conn.prompt(
                 session_id=self._session_id, prompt=[text_block(text)]
@@ -315,7 +337,7 @@ class ACPSession:
             )
         finally:
             if self.state == AgentState.BUSY:
-                await self._set_state(AgentState.IDLE)
+                await self._sm.transition(AgentState.IDLE)
 
     async def set_mode(self, mode_id: str) -> None:
         """Switch the agent's mode, preserving the current model.
@@ -329,7 +351,7 @@ class ACPSession:
         restored even if an RPC fails mid-switch.
         """
         if self._conn and self._session_id and self.state == AgentState.IDLE:
-            await self._set_state(AgentState.CONFIGURING)
+            await self._sm.transition(AgentState.CONFIGURING)
             try:
                 await self._conn.set_session_mode(mode_id=mode_id, session_id=self._session_id)
                 if self._current_model_id:
@@ -341,7 +363,7 @@ class ACPSession:
                 await self._event_sink(AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id))
             finally:
                 if self.state == AgentState.CONFIGURING:
-                    await self._set_state(AgentState.IDLE)
+                    await self._sm.transition(AgentState.IDLE)
 
     async def _restore_mcp_servers(self) -> None:
         """Re-establish MCP server connections after a mode switch.
@@ -379,11 +401,16 @@ class ACPSession:
             self._suppress_history_replay = False
 
     async def set_model(self, model_id: str) -> None:
-        """Switch the agent's model."""
+        """Switch the agent's model, transitioning through CONFIGURING."""
         if self._conn and self._session_id and self.state == AgentState.IDLE:
-            await self._conn.set_session_model(model_id=model_id, session_id=self._session_id)
-            self._current_model_id = model_id
-            await self._event_sink(AgentModelChanged(agent_id=self.agent_id, model_id=model_id))
+            await self._sm.transition(AgentState.CONFIGURING)
+            try:
+                await self._conn.set_session_model(model_id=model_id, session_id=self._session_id)
+                self._current_model_id = model_id
+                await self._event_sink(AgentModelChanged(agent_id=self.agent_id, model_id=model_id))
+            finally:
+                if self.state == AgentState.CONFIGURING:
+                    await self._sm.transition(AgentState.IDLE)
 
     @property
     def available_modes(self) -> list[AgentMode]:
@@ -601,7 +628,7 @@ class ACPSession:
         """
         if session_id != self._session_id:
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
-        await self._set_state(AgentState.AWAITING_PERMISSION)
+        await self._sm.transition(AgentState.AWAITING_PERMISSION)
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._permission_future = future
         await self._event_sink(
@@ -619,7 +646,7 @@ class ACPSession:
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         finally:
             self._permission_future = None
-        await self._set_state(AgentState.BUSY)
+        await self._sm.transition(AgentState.BUSY)
         return RequestPermissionResponse(
             outcome=AllowedOutcome(option_id=option_id, outcome="selected")
         )
