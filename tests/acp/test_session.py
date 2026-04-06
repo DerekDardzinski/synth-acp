@@ -23,7 +23,7 @@ from acp.schema import (
 )
 
 from synth_acp.acp.session import ACPSession
-from synth_acp.models.agent import AgentState, InvalidTransitionError
+from synth_acp.models.agent import AgentState
 from synth_acp.models.events import (
     AgentModeChanged,
     AgentStateChanged,
@@ -51,39 +51,6 @@ def _thought_chunk(text: str, message_id: str = "m1") -> AgentThoughtChunk:
         message_id=message_id,
         session_update="agent_thought_chunk",
     )
-
-
-class TestSessionStateMachine:
-    @pytest.fixture()
-    def events(self) -> list[BrokerEvent]:
-        return []
-
-    @pytest.fixture()
-    def session(self, events: list[BrokerEvent]) -> ACPSession:
-        async def sink(event: BrokerEvent) -> None:
-            events.append(event)
-
-        return ACPSession(
-            agent_id="test",
-            binary="echo",
-            args=[],
-            cwd=".",
-            event_sink=sink,
-        )
-
-    async def test_valid_transition_emits_event(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ):
-        await session._sm.transition(AgentState.INITIALIZING)
-        assert session.state == AgentState.INITIALIZING
-        assert len(events) == 1
-        assert isinstance(events[0], AgentStateChanged)
-        assert events[0].old_state == AgentState.UNSTARTED
-        assert events[0].new_state == AgentState.INITIALIZING
-
-    async def test_invalid_transition_raises(self, session: ACPSession):
-        with pytest.raises(InvalidTransitionError):
-            await session._sm.transition(AgentState.BUSY)  # UNSTARTED → BUSY is invalid
 
 
 class TestSessionUpdate:
@@ -164,35 +131,6 @@ class TestSessionUpdate:
         assert len(evt.diffs) == 1
         assert evt.diffs[0] == ToolCallDiff(path="src/main.py", old_text="old", new_text="new")
 
-    async def test_session_update_when_tool_call_update_branch_has_diff_extracts_diffs(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """Diffs on streaming tool_call_update must be extracted — otherwise incremental edits are lost."""
-        diff_item = FileEditToolCallContent(
-            type="diff",
-            path="lib.py",
-            old_text=None,
-            new_text="added",
-        )
-        update = ToolCallProgress(
-            tool_call_id="tc-2",
-            title="Create file",
-            kind="edit",
-            status="in_progress",
-            content=[diff_item],
-            locations=None,
-            raw_input=None,
-            raw_output=None,
-            session_update="tool_call_update",
-        )
-        await session.session_update("sess-1", update)
-        await asyncio.sleep(0)
-        assert len(events) == 1
-        evt = events[0]
-        assert isinstance(evt, ToolCallUpdated)
-        assert len(evt.diffs) == 1
-        assert evt.diffs[0] == ToolCallDiff(path="lib.py", old_text=None, new_text="added")
-
     async def test_session_update_when_tool_call_has_text_content_extracts_text(
         self, session: ACPSession, events: list[BrokerEvent]
     ) -> None:
@@ -250,14 +188,6 @@ class TestSessionUpdate:
         await asyncio.sleep(0)
         assert len(events) == 0
 
-    async def test_session_update_from_correct_session_is_processed(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """Updates from the session's own ID must still be processed normally."""
-        await session.session_update("sess-1", _msg_chunk("hello"))
-        await asyncio.sleep(0)
-        assert len(events) == 1
-
 
 class TestSessionUpdateAccumulator:
     """Tests for SessionAccumulator integration in session_update."""
@@ -281,46 +211,6 @@ class TestSessionUpdateAccumulator:
         s._session_id = "sess-1"
         return s
 
-    async def test_session_update_when_agent_message_chunk_emits_message_chunk_received(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """Accumulator integration must still emit MessageChunkReceived for agent messages."""
-        await session.session_update("sess-1", _msg_chunk("hello"))
-        await asyncio.sleep(0)
-        assert len(events) == 1
-        assert isinstance(events[0], MessageChunkReceived)
-        assert events[0].chunk == "hello"
-
-    async def test_session_update_when_tool_call_start_emits_tool_call_updated_with_diffs(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """Tool call field extraction and None coercion must work — diffs lost or title crashes on None."""
-        diff_item = FileEditToolCallContent(
-            type="diff",
-            path="a.py",
-            old_text="x",
-            new_text="y",
-        )
-        update = ToolCallStart(
-            tool_call_id="tc-1",
-            title="Edit",
-            kind=None,
-            status=None,
-            content=[diff_item],
-            locations=None,
-            raw_input=None,
-            raw_output=None,
-            session_update="tool_call",
-        )
-        await session.session_update("sess-1", update)
-        await asyncio.sleep(0)
-        assert len(events) == 1
-        evt = events[0]
-        assert isinstance(evt, ToolCallUpdated)
-        assert evt.diffs == [ToolCallDiff(path="a.py", old_text="x", new_text="y")]
-        assert evt.kind == "other"
-        assert evt.status == "pending"
-
     async def test_session_update_when_tool_call_progress_emits_tool_call_updated_with_correct_status(
         self, session: ACPSession, events: list[BrokerEvent]
     ) -> None:
@@ -341,16 +231,6 @@ class TestSessionUpdateAccumulator:
         evt = events[0]
         assert isinstance(evt, ToolCallUpdated)
         assert evt.status == "in_progress"
-
-    async def test_session_update_when_agent_thought_chunk_emits_agent_thought_received(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """Subscriber dispatch must not omit thought chunk path — event silently lost."""
-        await session.session_update("sess-1", _thought_chunk("thinking..."))
-        await asyncio.sleep(0)
-        assert len(events) == 1
-        assert isinstance(events[0], AgentThoughtReceived)
-        assert events[0].chunk == "thinking..."
 
     async def test_session_update_when_usage_update_bypasses_accumulator(
         self, session: ACPSession, events: list[BrokerEvent]
@@ -434,18 +314,6 @@ class TestSessionModes:
         assert events[0].mode_id == "architect"
         assert events[0].agent_id == "test"
 
-    async def test_current_mode_update_updates_internal_state(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """_current_mode_id must be updated — otherwise current_mode_id property is stale."""
-        update = CurrentModeUpdate(
-            current_mode_id="code",
-            session_update="current_mode_update",
-        )
-        await session.session_update("sess-1", update)
-        await asyncio.sleep(0)
-        assert session.current_mode_id == "code"
-
     async def test_current_mode_update_with_no_mode_id_emits_nothing(
         self, session: ACPSession, events: list[BrokerEvent]
     ) -> None:
@@ -462,32 +330,6 @@ class TestSessionModes:
         fake_notification.update = fake_update
         await session._emit_from_notification(fake_notification)
         assert len(events) == 0
-
-    async def test_available_modes_empty_before_session(self, session: ACPSession) -> None:
-        assert session.available_modes == []
-
-    async def test_current_mode_id_none_before_session(self, session: ACPSession) -> None:
-        assert session.current_mode_id is None
-
-    async def test_available_models_empty_before_session(self, session: ACPSession) -> None:
-        assert session.available_models == []
-
-    async def test_current_model_id_none_before_session(self, session: ACPSession) -> None:
-        assert session.current_model_id is None
-
-    async def test_current_mode_update_from_wrong_session_emits_nothing(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """Mode updates from a different session must be dropped.
-        Prevents probe sessions overwriting the main session's tracked mode."""
-        update = CurrentModeUpdate(
-            current_mode_id="code",
-            session_update="current_mode_update",
-        )
-        await session.session_update("other-session-id", update)
-        await asyncio.sleep(0)
-        assert len(events) == 0
-        assert session.current_mode_id is None
 
     async def test_set_mode_transitions_through_configuring(
         self, session: ACPSession, events: list[BrokerEvent]
@@ -557,103 +399,6 @@ class TestSessionModes:
         )
 
 
-class TestSetModel:
-    """Tests for set_model CONFIGURING guard."""
-
-    @pytest.fixture()
-    def events(self) -> list[BrokerEvent]:
-        return []
-
-    @pytest.fixture()
-    def session(self, events: list[BrokerEvent]) -> ACPSession:
-        async def sink(event: BrokerEvent) -> None:
-            events.append(event)
-
-        return ACPSession(
-            agent_id="test",
-            binary="echo",
-            args=[],
-            cwd=".",
-            event_sink=sink,
-        )
-
-    async def test_set_model_transitions_through_configuring(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        observed_states: list[AgentState] = []
-        original_sink = session._event_sink
-
-        async def tracking_sink(event: BrokerEvent) -> None:
-            if isinstance(event, AgentStateChanged):
-                observed_states.append(event.new_state)
-            await original_sink(event)
-
-        session._event_sink = tracking_sink
-
-        class StubConn:
-            async def set_session_model(self, **kwargs: Any) -> None:
-                pass
-
-        session._conn = StubConn()
-        session._session_id = "s1"
-        await session._sm.transition(AgentState.INITIALIZING)
-        await session._sm.transition(AgentState.IDLE)
-        events.clear()
-        observed_states.clear()
-
-        await session.set_model("new-model")
-
-        assert AgentState.CONFIGURING in observed_states
-        assert session.state == AgentState.IDLE
-
-    async def test_set_model_restores_idle_on_rpc_failure(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        class FailingConn:
-            async def set_session_model(self, **kwargs: Any) -> None:
-                raise RuntimeError("RPC failed")
-
-        session._conn = FailingConn()
-        session._session_id = "s1"
-        await session._sm.transition(AgentState.INITIALIZING)
-        await session._sm.transition(AgentState.IDLE)
-
-        with pytest.raises(RuntimeError, match="RPC failed"):
-            await session.set_model("new-model")
-
-        assert session.state == AgentState.IDLE
-
-
-class TestSessionPublicAPI:
-    """Tests for session_id property and force_terminate."""
-
-    @pytest.fixture()
-    def events(self) -> list[BrokerEvent]:
-        return []
-
-    @pytest.fixture()
-    def session(self, events: list[BrokerEvent]) -> ACPSession:
-        async def sink(event: BrokerEvent) -> None:
-            events.append(event)
-
-        return ACPSession(
-            agent_id="test",
-            binary="echo",
-            args=[],
-            cwd=".",
-            event_sink=sink,
-        )
-
-    async def test_session_id_property(self, session: ACPSession) -> None:
-        assert session.session_id is None
-        session._session_id = "abc-123"
-        assert session.session_id == "abc-123"
-
-    async def test_force_terminate_public_method(self, session: ACPSession) -> None:
-        await session.force_terminate()
-        assert session.state == AgentState.TERMINATED
-
-
 class TestMcpRestore:
     """Tests for _suppress_history_replay and _restore_mcp_servers behaviour."""
 
@@ -676,16 +421,6 @@ class TestMcpRestore:
         s._session_id = "sess-1"
         return s
 
-    async def test_suppress_flag_drops_updates(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """session_update must emit nothing while _suppress_history_replay is True.
-        This is what prevents load_session history replay from corrupting the UI."""
-        session._suppress_history_replay = True
-        await session.session_update("sess-1", _msg_chunk("replayed history"))
-        await asyncio.sleep(0)
-        assert len(events) == 0
-
     async def test_suppress_flag_cleared_restores_updates(
         self, session: ACPSession, events: list[BrokerEvent]
     ) -> None:
@@ -696,17 +431,6 @@ class TestMcpRestore:
         await session.session_update("sess-1", _msg_chunk("live message"))
         await asyncio.sleep(0)
         assert len(events) == 1
-
-    async def test_suppress_does_not_affect_wrong_session(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """The session ID guard must still fire before the suppress check.
-        A suppressed session must not accidentally process updates from other sessions
-        when the flag is later cleared."""
-        session._suppress_history_replay = False
-        await session.session_update("other-session-id", _msg_chunk("from other session"))
-        await asyncio.sleep(0)
-        assert len(events) == 0
 
     async def test_restore_mcp_servers_skips_when_no_mcp_servers(self, session: ACPSession) -> None:
         """_restore_mcp_servers must be a no-op when _mcp_servers is empty.

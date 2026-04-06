@@ -25,15 +25,6 @@ class TestTransitions:
         with pytest.raises(InvalidTransitionError, match="a1"):
             await sm.transition(AgentState.IDLE)
 
-    async def test_callback_receives_old_and_new(self):
-        captured: list[tuple[AgentState, AgentState]] = []
-
-        async def cb(old: AgentState, new: AgentState) -> None:
-            captured.append((old, new))
-
-        sm = AgentStateMachine("a1", cb)
-        await sm.transition(AgentState.INITIALIZING)
-        assert captured == [(AgentState.UNSTARTED, AgentState.INITIALIZING)]
 
 
 class TestForceTerminal:

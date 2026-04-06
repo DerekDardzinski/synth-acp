@@ -37,7 +37,7 @@ class TestTerminalProcess:
         assert proc.kill() is True
         rc, _ = await proc.wait_for_exit()
         # Killed process has non-None return code (negative on signal)
-        assert rc is not None or _ is not None
+        assert rc is not None
         # Second kill returns False — process already dead
         assert proc.kill() is False
 

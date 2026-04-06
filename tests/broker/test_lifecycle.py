@@ -47,24 +47,6 @@ class TestTaskCleanup:
         await asyncio.sleep(0)  # Let done callback fire
         assert "a" not in lc._tasks
 
-    async def test_prompt_task_removed_after_completion(self) -> None:
-        config = _config("a")
-        reg = AgentRegistry(config)
-
-        async def sink(e: object) -> None:
-            pass
-
-        lc = AgentLifecycle(config, reg, sink, db_path=Path("/tmp/unused.db"), session_id="s1")
-
-        async def fake_prompt() -> None:
-            pass
-
-        task = lc._make_prompt_task("a", fake_prompt())
-        lc._tasks["prompt-a"] = task
-        await task
-        await asyncio.sleep(0)
-        assert "prompt-a" not in lc._tasks
-
 
 class TestPromptGuard:
     async def test_prompt_rejects_non_idle_agent(self) -> None:

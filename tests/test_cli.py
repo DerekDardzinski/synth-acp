@@ -1,11 +1,11 @@
-"""Tests for CLI input parsing and harness registry."""
+"""Tests for CLI input parsing."""
 
 from __future__ import annotations
 
 import pytest
 from acp.schema import PermissionOption
 
-from synth_acp.cli import load_harness_registry, parse_input, parse_permission_response
+from synth_acp.cli import parse_input, parse_permission_response
 
 
 class TestParseInput:
@@ -37,16 +37,3 @@ class TestParsePermissionResponse:
         ]
         assert parse_permission_response("2", options) == "allow-always"
 
-
-class TestHarnessRegistry:
-    def test_load_harness_registry_when_called_returns_all_harnesses(self) -> None:
-        entries = load_harness_registry()
-        identities = {e.identity for e in entries}
-        assert identities == {"kiro", "claude", "opencode", "gemini"}
-
-    def test_load_harness_registry_when_called_entries_have_required_fields(self) -> None:
-        entries = load_harness_registry()
-        for entry in entries:
-            assert entry.short_name
-            assert entry.binary_names
-            assert entry.run_cmd

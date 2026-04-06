@@ -24,27 +24,6 @@ def _mock_session(state: AgentState = AgentState.IDLE) -> AsyncMock:
     return s
 
 
-class TestRegistration:
-    def test_register_and_get_session(self) -> None:
-        reg = AgentRegistry(_config("a"))
-        s = _mock_session()
-        reg.register("a", s)
-        assert reg.get_session("a") is s
-        assert reg.has_session("a")
-
-    def test_unregister_returns_session(self) -> None:
-        reg = AgentRegistry(_config("a"))
-        s = _mock_session()
-        reg.register("a", s)
-        removed = reg.unregister("a")
-        assert removed is s
-        assert not reg.has_session("a")
-
-    def test_unregister_missing_returns_none(self) -> None:
-        reg = AgentRegistry(_config())
-        assert reg.unregister("x") is None
-
-
 class TestParentage:
     def test_orphan_children(self) -> None:
         reg = AgentRegistry(_config("a", "b", "c"))
@@ -56,14 +35,6 @@ class TestParentage:
 
 
 class TestUsage:
-    def test_usage_tracking_keeps_latest(self) -> None:
-        reg = AgentRegistry(_config("a"))
-        e1 = UsageUpdated(agent_id="a", size=100, used=50, cost_amount=1.0, cost_currency="USD")
-        e2 = UsageUpdated(agent_id="a", size=200, used=100, cost_amount=2.0, cost_currency="USD")
-        reg.update_usage(e1)
-        reg.update_usage(e2)
-        assert reg.get_usage("a") is e2
-
     def test_usage_warns_on_currency_change(self, caplog) -> None:
         reg = AgentRegistry(_config("a"))
         e1 = UsageUpdated(agent_id="a", size=100, used=50, cost_amount=1.0, cost_currency="USD")

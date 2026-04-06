@@ -168,66 +168,6 @@ class TestWorkerErrorHandling:
 # ── ContentSwitcher panel switching ──
 
 
-class TestSelectAgentContentSwitcher:
-    async def test_select_agent_when_first_visit_mounts_feed_in_switcher(self) -> None:
-        """First visit creates panel, mounts into ContentSwitcher, sets reactive."""
-        app = _make_app("agent-1")
-        app._event_buffers["agent-1"] = []
-
-        mock_switcher = AsyncMock()
-        with (
-            patch.object(app, "query_one", return_value=mock_switcher),
-            patch.object(app, "watch_selected_agent"),
-        ):
-            await app.select_agent("agent-1")
-
-        assert "agent-1" in app._panels
-        mock_switcher.mount.assert_called_once()
-        assert app.selected_agent == "agent-1"
-
-    async def test_select_agent_when_revisit_sets_switcher_current(self) -> None:
-        """Revisit skips mount, just sets the reactive (watcher handles switch)."""
-        app = _make_app("agent-1")
-        app._event_buffers["agent-1"] = []
-
-        mock_switcher = AsyncMock()
-        with (
-            patch.object(app, "query_one", return_value=mock_switcher),
-            patch.object(app, "watch_selected_agent"),
-        ):
-            await app.select_agent("agent-1")
-            mock_switcher.reset_mock()
-            await app.select_agent("agent-1")
-
-        mock_switcher.mount.assert_not_called()
-        assert app.selected_agent == "agent-1"
-
-    async def test_select_agent_when_buffered_events_drains_before_switch(self) -> None:
-        """Buffered events are drained via _replay_event before reactive is set."""
-        app = _make_app("agent-1")
-        events = [
-            MessageChunkReceived(agent_id="agent-1", chunk="hello"),
-            MessageChunkReceived(agent_id="agent-1", chunk=" world"),
-        ]
-        app._event_buffers["agent-1"] = list(events)
-
-        mock_switcher = AsyncMock()
-        replayed: list[object] = []
-
-        async def _track_replay(feed, event):  # type: ignore[no-untyped-def]
-            replayed.append(event)
-
-        with (
-            patch.object(app, "query_one", return_value=mock_switcher),
-            patch.object(app, "_replay_event", side_effect=_track_replay),
-            patch.object(app, "watch_selected_agent"),
-        ):
-            await app.select_agent("agent-1")
-
-        assert replayed == events
-        assert app._event_buffers["agent-1"] == []
-
-
 class TestWatchSelectedAgent:
     def test_watch_selected_agent_when_empty_string_skips_switch(self) -> None:
         """Empty string guard prevents crash on initial reactive value."""

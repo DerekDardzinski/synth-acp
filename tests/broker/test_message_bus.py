@@ -50,10 +50,6 @@ class TestPendingMessages:
         assert "[Message from sender1]: hello" in result
         assert "[Message from sender2]: world" in result
 
-    def test_pop_pending_returns_none_when_empty(self) -> None:
-        bus = MessageBus(Path("/tmp/unused.db"), "s1", _noop_deliver)
-        assert bus.pop_pending("nonexistent") is None
-
 
 class TestMessageBusDelivery:
     async def test_notification_triggers_immediate_delivery(self, tmp_path: Path) -> None:

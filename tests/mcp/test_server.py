@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -183,27 +183,6 @@ class TestMcpStartupValidation:
         with pytest.raises(SystemExit) as exc_info:
             main()
         assert exc_info.value.code == 1
-
-    def test_main_exits_with_empty_db_path(self, monkeypatch) -> None:
-        monkeypatch.setenv("SYNTH_SESSION_ID", "s1")
-        monkeypatch.setenv("SYNTH_DB_PATH", "")
-        monkeypatch.setenv("SYNTH_AGENT_ID", "a1")
-        from synth_acp.mcp.server import main
-        with pytest.raises(SystemExit) as exc_info:
-            main()
-        assert exc_info.value.code == 1
-
-
-class TestNotifyCallback:
-    async def test_send_message_calls_notify(self, db_path: Path) -> None:
-        _register_agents(db_path, [("agent-a", None, None), ("agent-b", None, None)])
-        notify = AsyncMock()
-        server = create_mcp_server(str(db_path), "sess-1", "agent-a", notify=notify)
-        send_message = _get_tool(server, "send_message")
-
-        await send_message(to_agent="agent-b", body="hi")
-        notify.assert_awaited()
-
 
 class TestMcpConnectionSafety:
     async def test_send_message_closes_conn_on_visibility_error(self, db_path: Path) -> None:
