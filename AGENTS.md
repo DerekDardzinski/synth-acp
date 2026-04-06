@@ -95,28 +95,35 @@ uv run pytest -k "test_foo"        # Run matching tests
 
 ### Conventions
 
-- **File structure**: Test files mirror the source tree. `src/synth_acp/acp/session.py` → `tests/acp/test_session.py`. One test file per source module — don't split a module's tests across multiple files (e.g. `test_app_loading.py`, `test_app_modals.py`). Use test classes within the file to organize by feature.
-- **Async**: Tests use `pytest-asyncio` with `asyncio_mode = "auto"`. All async tests are plain `async def` functions.
-- **Fixtures**: Shared fixtures in `tests/conftest.py`.
-- **Textual UI tests**: Use `app.run_test(headless=True, size=(120, 40))` when tests need a live widget tree (querying DOM, checking classes, mounting widgets). Use direct method calls with mocks for pure logic/routing tests that don't need a widget tree.
+- **File structure**: Test files mirror the source tree. `src/synth_acp/acp/session.py` →
+  `tests/acp/test_session.py`. One test file per source module — don't split a module's
+  tests across multiple files. Use test classes within the file to organize by feature.
+  A test file may only import from one source module — crossing into another module's
+  territory is a structure violation.
+- **Async**: `pytest-asyncio` with `asyncio_mode = "auto"`. All async tests are plain
+  `async def` — no decorator needed.
+- **Fixtures**: Shared helpers used across 3+ test files belong in `tests/conftest.py`,
+  not duplicated per file.
 
-### What to Test
+### Textual UI tests
 
-Every test must answer: **"What real bug does this catch that would otherwise fail silently?"**
+Two modes — choose the right one:
 
-- A test earns its place if removing the code it covers would cause a **silent** failure — wrong data, dropped events, missing side effects — with no crash or error message.
-- A test does NOT earn its place if it merely confirms a framework/library works (Pydantic stores fields, Textual's `Collapsible.collapsed` toggles), or if the failure mode is a loud crash that any integration would catch.
+- **Live widget tree** (`app.run_test(headless=True, size=(120, 40))`): required when
+  the test needs to query the DOM, check CSS classes, simulate clicks or keypresses,
+  or mount widgets. Use `pilot.click(selector)`, `pilot.press(key)`, and
+  `pilot.pause()` to let pending messages settle before asserting.
+- **Direct method calls with mocks**: sufficient for pure logic and routing tests that
+  don't need a rendered widget tree. Prefer this — it's faster and less brittle.
 
-**Max 5 tests per source function.** If you can't articulate a distinct silent-failure bug for each test, you have too many.
+`run_test` is expensive. Don't reach for it to test something that can be verified
+by calling a method directly. Do reach for it when the contract is "this event causes
+this DOM change" — that's exactly what it's for.
 
-**Priority**: error handling > boundary conditions > invalid inputs > happy path.
+What does not earn a Textual test: confirming that a Textual widget property works
+(`Collapsible.collapsed` toggles, `Static.content` stores text). Test your logic,
+not the framework.
 
-**Kill criteria — cut the test if any of these are true:**
-- It tests that a framework feature works (Pydantic validation, Textual widget properties)
-- The bug it catches would produce a loud crash, not a silent wrong result
-- Another test in the same file already exercises the same code path with different input values
-- It's a smoke test that just confirms construction/initialization succeeds
-- It would break on a refactor that doesn't change the function's contract
 
 ### Running Tests
 
