@@ -16,7 +16,6 @@ from synth_acp.models.events import (
     AgentStateChanged,
     AgentThoughtReceived,
     BrokerEvent,
-    MessageChunkReceived,
     UsageUpdated,
 )
 from synth_acp.ui.app import SynthApp
@@ -74,8 +73,8 @@ class TestConsumeEvents:
 class TestCLIModeSelection:
     @pytest.mark.filterwarnings("ignore::RuntimeWarning")
     def test_main_when_headless_flag_calls_async_run(self, tmp_path: Path) -> None:
-        config_file = tmp_path / ".synth.toml"
-        config_file.write_text('project = "s"\n\n[[agents]]\nagent_id = "a"\nharness = "kiro"\n')
+        config_file = tmp_path / ".synth.json"
+        config_file.write_text('{"project": "s", "agents": [{"agent_id": "a", "harness": "kiro"}]}')
 
         with (
             patch("synth_acp.cli.asyncio.run") as mock_run,
@@ -93,8 +92,8 @@ class TestCLIModeSelection:
         mock_run.call_args[0][0].close()
 
     def test_main_when_default_calls_tui(self, tmp_path: Path) -> None:
-        config_file = tmp_path / ".synth.toml"
-        config_file.write_text('project = "s"\n\n[[agents]]\nagent_id = "a"\nharness = "kiro"\n')
+        config_file = tmp_path / ".synth.json"
+        config_file.write_text('{"project": "s", "agents": [{"agent_id": "a", "harness": "kiro"}]}')
 
         with (
             patch("synth_acp.cli._run_tui") as mock_tui,

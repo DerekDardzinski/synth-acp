@@ -19,6 +19,17 @@ type DeliverFn = Callable[[str, str, list[str]], Awaitable[bool]]
 type CommandFn = Callable[[list[tuple[int, str, str, str]]], Awaitable[None]]
 
 
+def _format_message(from_agent: str, body: str, kind: str) -> str:
+    """Format a message based on its kind for delivery to an agent."""
+    if kind == "system":
+        return f"[System notification — no action required]: {body}"
+    if kind == "response":
+        return f"[Response from {from_agent}]: {body}"
+    if kind == "request":
+        return f"[Request from {from_agent}]: {body}"
+    return f"[Message from {from_agent}]: {body}"
+
+
 class MessageBus:
     """Notification-driven message delivery with fallback polling."""
 
@@ -36,6 +47,7 @@ class MessageBus:
         self._process_commands = process_commands
         self._fallback_interval = fallback_interval
         self._pending: dict[str, list[tuple[str, str]]] = {}
+        self._pending_raw: dict[str, str] = {}
         self._stopped = False
         self._tasks: list[asyncio.Task[None]] = []
         self._server: asyncio.Server | None = None
@@ -74,12 +86,22 @@ class MessageBus:
         """Queue a message for an agent that isn't IDLE yet."""
         self._pending.setdefault(agent_id, []).append((from_agent, body))
 
+    def enqueue_raw(self, agent_id: str, text: str) -> None:
+        """Queue a raw prompt for an agent, delivered without formatting."""
+        self._pending_raw[agent_id] = text
+
     def pop_pending(self, agent_id: str) -> str | None:
         """Pop and return combined pending messages, or None if empty."""
+        raw = self._pending_raw.pop(agent_id, None)
         messages = self._pending.pop(agent_id, None)
+        if raw and messages:
+            formatted = "\n\n".join(_format_message(sender, body, "chat") for sender, body in messages)
+            return raw + "\n\n" + formatted
+        if raw:
+            return raw
         if not messages:
             return None
-        return "\n\n".join(f"[Message from {sender}]: {body}" for sender, body in messages)
+        return "\n\n".join(_format_message(sender, body, "chat") for sender, body in messages)
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -124,13 +146,13 @@ class MessageBus:
             log.exception("MessageBus connection error")
 
     async def _deliver_pending(self, db: aiosqlite.Connection) -> None:
-        """Query pending messages, group by recipient, deliver."""
+        """Query pending messages, group by recipient, deliver with kind-aware formatting."""
         rows = await db.execute_fetchall(
-            "SELECT id, from_agent, to_agent, body FROM messages "
+            "SELECT id, from_agent, to_agent, body, kind FROM messages "
             "WHERE status = 'pending' AND session_id = ? ORDER BY created_at",
             [self._session_id],
         )
-        by_agent: dict[str, list[tuple[int, str, str, str]]] = {}
+        by_agent: dict[str, list[tuple[int, str, str, str, str]]] = {}
         for row in rows:
             by_agent.setdefault(row[2], []).append(row)  # type: ignore[arg-type]
         for agent_id, messages in by_agent.items():
@@ -143,8 +165,8 @@ class MessageBus:
             )
             await db.commit()
 
-            combined = "\n\n".join(f"[Message from {m[1]}]: {m[3]}" for m in messages)
-            senders = list({m[1] for m in messages})
+            combined = "\n\n".join(_format_message(m[1], m[3], m[4]) for m in messages)
+            senders = list({m[1] for m in messages if m[4] != "system"})
             success = await self._deliver(agent_id, combined, senders)
             if not success:
                 await db.execute(

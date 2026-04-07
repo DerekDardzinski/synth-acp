@@ -455,6 +455,15 @@ LaunchAgentScreen, HelpScreen {
     color: $text-muted;
 }
 
+/* ── Hook notification in conversation ── */
+.hook-notification {
+    height: auto;
+    background: $background;
+    border-left: wide $surface-lighten-2;
+    padding: 0 1;
+    color: $text-muted;
+}
+
 /* ── Shell / tool call separator ── */
 ShellResultBlock Rule, ToolCallBlock Rule {
     color: $surface 30%;

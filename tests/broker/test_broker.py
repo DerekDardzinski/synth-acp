@@ -97,12 +97,19 @@ class TestBrokerDispatch:
 
         await broker.handle(SendPrompt(agent_id="agent-1", text="hello"))
         await asyncio.sleep(0)
-        idle_session.prompt.assert_awaited_once_with("hello")
+        idle_session.prompt.assert_awaited_once()
+        prompt_text = idle_session.prompt.call_args[0][0]
+        assert "hello" in prompt_text
+        assert "orchestration_context" in prompt_text
 
         await broker.handle(SendPrompt(agent_id="agent-2", text="hello"))
-        event = broker._event_queue.get_nowait()
-        assert isinstance(event, BrokerError)
-        assert "agent-2" in event.message
+        # Drain any HookFired events to find the BrokerError
+        events = []
+        while not broker._event_queue.empty():
+            events.append(broker._event_queue.get_nowait())
+        errors = [e for e in events if isinstance(e, BrokerError)]
+        assert len(errors) == 1
+        assert "agent-2" in errors[0].message
 
     async def test_resolve_permission_when_always_option_persists_rule(
         self, tmp_path: Path
@@ -452,7 +459,7 @@ class TestProcessCommands:
                 await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
 
             assert broker._message_bus is not None
-            assert broker._message_bus._pending.get("worker-1") is not None
+            assert broker._message_bus._pending_raw.get("worker-1") is not None
 
             from synth_acp.models.events import AgentStateChanged
 
@@ -467,7 +474,7 @@ class TestProcessCommands:
             await asyncio.sleep(0)
 
             mock_session.prompt.assert_awaited_once()
-            assert broker._message_bus._pending.get("worker-1") is None
+            assert broker._message_bus._pending_raw.get("worker-1") is None
         finally:
             if broker._message_bus:
                 await broker._message_bus.stop()
@@ -477,7 +484,10 @@ class TestProcessCommands:
     async def test_join_broadcast_when_agent_registered_sends_to_visible_agents(
         self, tmp_path: Path
     ) -> None:
-        from synth_acp.models.config import CommunicationMode, SettingsConfig
+        from synth_acp.models.config import (
+            CommunicationMode,
+            SettingsConfig,
+        )
 
         config = SessionConfig(
             project="test-session",
@@ -515,7 +525,7 @@ class TestProcessCommands:
             with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_worker):
                 await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
 
-            # Check messages table for join broadcast
+            # Default recipients is "none" — no join broadcast messages
             conn = sqlite3.connect(str(broker._db_path))
             rows = conn.execute(
                 "SELECT from_agent, to_agent, body FROM messages WHERE session_id = ?",
@@ -523,10 +533,7 @@ class TestProcessCommands:
             ).fetchall()
             conn.close()
 
-            assert len(rows) == 1
-            assert rows[0][0] == "system"
-            assert rows[0][1] == "orchestrator"
-            assert rows[0][2] == '[System] Agent "worker" has joined. Task: Fix auth.'
+            assert len(rows) == 0
         finally:
             if broker._message_bus:
                 await broker._message_bus.stop()
@@ -567,58 +574,6 @@ class TestRelaunchTerminatedAgent:
 
 
 class TestSelfTerminate:
-    async def test_self_terminate_emits_terminated_event(self, tmp_path: Path) -> None:
-        """self_terminate command must transition agent to TERMINATED and emit
-        AgentStateChanged. Without this, the TUI never learns the agent left."""
-        broker = _make_broker("agent-1", tmp_path=tmp_path)
-
-        session = ACPSession(
-            agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
-        )
-        session._sm._state = AgentState.IDLE
-        broker._registry._sessions["agent-1"] = session
-
-        # Ensure lifecycle + schema exist so update_command_status works
-        lifecycle = await broker._ensure_lifecycle()
-        await lifecycle.register_agents()
-
-        try:
-            await broker._handle_self_terminate_command(cmd_id=1, from_agent="agent-1")
-
-            assert session.state == AgentState.TERMINATED
-            events = []
-            while not broker._event_queue.empty():
-                events.append(broker._event_queue.get_nowait())
-            from synth_acp.models.events import AgentStateChanged
-
-            assert any(
-                isinstance(e, AgentStateChanged) and e.new_state == AgentState.TERMINATED
-                for e in events
-            )
-        finally:
-            await lifecycle.close_db()
-
-    async def test_self_terminate_does_not_call_session_terminate(self, tmp_path: Path) -> None:
-        """self_terminate must use force_terminate(), not terminate().
-        terminate() kills the process — wrong for an agent voluntarily leaving."""
-        broker = _make_broker("agent-1", tmp_path=tmp_path)
-
-        session = ACPSession(
-            agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
-        )
-        session._sm._state = AgentState.IDLE
-        session.terminate = AsyncMock()  # type: ignore[method-assign]
-        broker._registry._sessions["agent-1"] = session
-
-        lifecycle = await broker._ensure_lifecycle()
-        await lifecycle.register_agents()
-        try:
-            await broker._handle_self_terminate_command(cmd_id=1, from_agent="agent-1")
-            session.terminate.assert_not_awaited()
-            assert session.state == AgentState.TERMINATED
-        finally:
-            await lifecycle.close_db()
-
     async def test_two_pending_messages_before_idle_both_delivered(self, tmp_path: Path) -> None:
         """Two messages enqueued before IDLE must both appear in the prompt.
         Catches the old dict-overwrite bug where only the last message survived."""

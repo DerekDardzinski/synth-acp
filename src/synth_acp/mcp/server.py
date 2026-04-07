@@ -75,24 +75,25 @@ def create_mcp_server(
 
     @mcp.tool()
     async def send_message(to_agent: str, body: str, kind: str = "chat", reply_to: int | None = None) -> str:
-        """Send a message to another agent. Call list_agents first to discover valid agent IDs.
+        """The ONLY mechanism for inter-agent communication. Your text responses are
+        streamed to the orchestration UI — they are NOT delivered to other agents.
 
-        Use '*' as to_agent to broadcast to all visible agents. Messages are
-        asynchronous — the recipient processes them on their next poll cycle.
-        Use check_delivery to confirm receipt.
+        Call this whenever you need to share results, request work, or report completion.
+        Use '*' as to_agent to broadcast to all visible agents.
 
         Args:
             to_agent: Agent ID from list_agents, or '*' to broadcast.
-            body: Message content. Be specific — the recipient has no shared context with you.
+            body: Full, self-contained message. The recipient cannot see your
+                previous text output or tool call history.
             kind: 'chat' for conversation (default), 'request' to ask for work,
-                'response' to answer a request, 'system' for coordination signals.
+                'response' to return results to the requesting agent.
             reply_to: Message ID from a previous send_message result to create a thread.
 
         Returns:
             {"message_id": int} for single sends, {"message_ids": [int, ...]} for broadcasts.
             {"error": str} if the target agent is not visible or reply_to is invalid.
         """
-        valid_kinds = {"chat", "system", "request", "response"}
+        valid_kinds = {"chat", "request", "response"}
         if kind not in valid_kinds:
             return json.dumps({"error": f"Invalid kind: {kind}. Must be one of: {', '.join(sorted(valid_kinds))}"})
 
@@ -151,24 +152,29 @@ def create_mcp_server(
             return json.dumps({"message_id": message_id, "status": row[0]})
         return json.dumps({"message_id": message_id, "status": "not_found"})
 
+    _caller_id = agent_id  # capture closure before parameter shadows it
+
     @mcp.tool()
     async def launch_agent(
-        agent_id_param: str,
+        agent_id: str,
         harness: str,
+        message: str,
         cwd: str = ".",
         agent_mode: str = "",
         task: str = "",
-        message: str = "",
     ) -> str:
         """Launch a new child agent.
 
         Args:
-            agent_id_param: Unique name for the new agent.
+            agent_id: Unique name for the new agent.
             harness: Runtime to use: 'kiro', 'claude', 'opencode', etc.
+            message: Initial prompt sent to the agent once it becomes idle. Include
+                explicit instructions to report back using send_message. Example:
+                "...When complete, call send_message(to_agent='YOUR_ID', kind='response')
+                with your findings."
             cwd: Working directory.
             agent_mode: Optional ACP mode ID.
-            task: Short description of what this agent should do.
-            message: Initial message sent to the agent once it becomes idle.
+            task: Short description shown in list_agents.
 
         Returns:
             {"ok": true, "agent_id": str}.
@@ -178,7 +184,7 @@ def create_mcp_server(
             now = int(time.time() * 1000)
             payload = json.dumps(
                 {
-                    "agent_id": agent_id_param,
+                    "agent_id": agent_id,
                     "harness": harness,
                     "agent_mode": agent_mode,
                     "cwd": cwd,
@@ -188,7 +194,7 @@ def create_mcp_server(
             )
             await conn.execute(
                 "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) VALUES (?, ?, 'launch', ?, 'pending', ?)",
-                (session_id, agent_id, payload, now),
+                (session_id, _caller_id, payload, now),
             )
             await conn.commit()
 
@@ -201,8 +207,8 @@ def create_mcp_server(
         await notify()
         active = row[0] if row else 0
         if active >= max_agents:
-            return json.dumps({"ok": True, "agent_id": agent_id_param, "queued": True})
-        return json.dumps({"ok": True, "agent_id": agent_id_param})
+            return json.dumps({"ok": True, "agent_id": agent_id, "queued": True})
+        return json.dumps({"ok": True, "agent_id": agent_id})
 
     @mcp.tool()
     async def terminate_agent(target_agent_id: str) -> str:
@@ -257,26 +263,38 @@ def create_mcp_server(
         return json.dumps(agents)
 
     @mcp.tool()
-    async def deregister_agent() -> str:
-        """Permanently mark yourself as inactive and leave the session.
+    async def get_my_context() -> str:
+        """Get your identity and communication rules for this session.
+
+        Call this at the start of a task or whenever you need to confirm who you are,
+        who launched you, and how to send results back.
+
+        To see all active agents and their tasks, use list_agents instead.
 
         Returns:
-            {"status": "inactive", "agent_id": str}.
+            {"agent_id": str, "parent_agent": str|null, "task": str|null,
+             "communication_rules": [str]}
         """
         async with _db_conn() as conn:
-            await conn.execute(
-                "UPDATE agents SET status = 'inactive' WHERE agent_id = ? AND session_id = ?",
+            await _ensure_registered(conn)
+            cursor = await conn.execute(
+                "SELECT parent, task FROM agents WHERE agent_id = ? AND session_id = ?",
                 (agent_id, session_id),
             )
-            now = int(time.time() * 1000)
-            await conn.execute(
-                "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) "
-                "VALUES (?, ?, 'self_terminate', '{}', 'pending', ?)",
-                (session_id, agent_id, now),
-            )
-            await conn.commit()
-        await notify()
-        return json.dumps({"status": "inactive", "agent_id": agent_id})
+            row = await cursor.fetchone()
+        parent = row[0] if row else None
+        task = row[1] if row else None
+        rules = [
+            "Your text output is visible in the UI only — not to other agents.",
+            "Use send_message() to communicate. Use kind='response' for results to your parent.",
+            "Use list_agents() to discover other agents and their tasks.",
+        ]
+        return json.dumps({
+            "agent_id": agent_id,
+            "parent_agent": parent,
+            "task": task,
+            "communication_rules": rules,
+        })
 
     return mcp
 

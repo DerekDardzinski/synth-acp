@@ -551,6 +551,25 @@ class ACPSession:
                 if text:
                     await self._event_sink(AgentThoughtReceived(agent_id=self.agent_id, chunk=text))
         elif isinstance(update, (ToolCallStart, ToolCallProgress)):
+            log.debug(
+                "Tool call %s [%s] agent=%s id=%s title=%r kind=%s status=%s "
+                "locations=%s raw_input=%s raw_output=%s content_types=%s field_meta=%s",
+                type(update).__name__,
+                "start" if isinstance(update, ToolCallStart) else "progress",
+                self.agent_id,
+                update.tool_call_id,
+                update.title,
+                update.kind,
+                update.status,
+                [
+                    {"path": loc.path, "line": loc.line}
+                    for loc in (update.locations or [])
+                ],
+                update.raw_input,
+                update.raw_output,
+                [item.type for item in (update.content or [])],
+                update.field_meta,
+            )
             default_status = "pending" if isinstance(update, ToolCallStart) else "in_progress"
             diffs: list[ToolCallDiff] = []
             text_parts: list[str] = []

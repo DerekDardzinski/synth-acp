@@ -28,30 +28,36 @@ src/synth_acp/
 ├── cli.py              # argparse CLI, entry point
 ├── models/
 │   ├── agent.py        # AgentState enum, AgentConfig
-│   ├── config.py       # SessionConfig (parsed from .synth.json)
+│   ├── config.py       # SessionConfig, HooksConfig (parsed from .synth.json)
 │   ├── events.py       # BrokerEvent and subclasses (broker → frontend)
 │   ├── commands.py     # BrokerCommand and subclasses (frontend → broker)
+│   ├── visibility.py   # Agent visibility rules (MESH/LOCAL)
 │   └── permissions.py  # PermissionRule, PermissionDecision
 ├── acp/
-│   └── session.py      # ACPSession — wraps acp SDK Client interface
+│   ├── session.py      # ACPSession — wraps acp SDK Client interface
+│   └── state_machine.py # AgentStateMachine — typed state transitions
 ├── broker/
-│   ├── broker.py       # ACPBroker — owns sessions, routes events
-│   ├── permissions.py  # PermissionEngine — rule persistence + auto-resolve
-│   └── poller.py       # MessagePoller — SQLite PRAGMA data_version watcher
+│   ├── broker.py       # ACPBroker — thin coordinator, event sink, command dispatch
+│   ├── lifecycle.py    # AgentLifecycle — launch, terminate, prompt, hooks
+│   ├── registry.py     # AgentRegistry — sessions, parentage, metadata
+│   ├── message_bus.py  # MessageBus — notification-driven message delivery
+│   └── permissions.py  # PermissionEngine — rule persistence + auto-resolve
 ├── mcp/
-│   └── server.py       # synth-mcp entrypoint (FastMCP, agent-to-agent messaging)
+│   ├── server.py       # synth-mcp entrypoint (FastMCP, agent-to-agent messaging)
+│   └── notifier.py     # BrokerNotifier — Unix socket notification to message bus
 └── ui/
     ├── app.py          # SynthApp — bridges broker ↔ Textual messages
     ├── messages.py     # Textual Message subclasses wrapping BrokerEvent
     ├── screens/
-    │   └── dashboard.py
+    │   ├── launch.py
+    │   ├── permission.py
+    │   └── help.py
     ├── widgets/
     │   ├── agent_list.py
     │   ├── conversation.py
     │   ├── prompt_bubble.py
     │   ├── agent_message.py
     │   ├── tool_call.py
-    │   ├── permission.py
     │   ├── message_queue.py
     │   └── input_bar.py
     └── css/
@@ -63,11 +69,12 @@ src/synth_acp/
 - `agent-client-protocol` — ACP Python SDK (Pydantic models, `spawn_agent_process`, `SessionAccumulator`)
 - `mcp>=1.0.0` — MCP server via `mcp.server.fastmcp.FastMCP` (agent-to-agent messaging)
 - `textual` — TUI framework
-- `aiosqlite` — async SQLite for message poller
+- `aiosqlite` — async SQLite for message bus
 
 ### Reference Docs
 
-- `docs/DESIGN.md` — full design document with architectural decisions and rationale
+- `README.md` — configuration reference, lifecycle hooks, MCP tools
+- `examples/synth.example.json` — complete config with all available options
 - `docs/references/acp_sdk.md` — ACP SDK imports, Client interface, spawn_agent_process
 - `docs/references/acp_protocol.md` — ACP types quick reference
 - `docs/references/toad_agent.md` — Toad's ACP client patterns (annotated)

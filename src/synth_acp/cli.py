@@ -19,7 +19,7 @@ from synth_acp.models.config import (
     SessionConfig,
     find_config,
     load_config,
-    write_toml_config,
+    write_json_config,
 )
 from synth_acp.models.events import (
     AgentStateChanged,
@@ -304,8 +304,8 @@ def _first_run_picker() -> SessionConfig:
         agents=[{"agent_id": agent_name, "harness": selected_harness.short_name}],
     )
 
-    config_path = Path.cwd() / ".synth.toml"
-    write_toml_config(config_path, config)
+    config_path = Path.cwd() / ".synth.json"
+    write_json_config(config_path, config)
     print(f"\nWrote {config_path}\n")
 
     return load_config(config_path)

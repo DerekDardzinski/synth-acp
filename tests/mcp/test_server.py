@@ -75,7 +75,7 @@ class TestLaunchAgent:
 
         result = json.loads(
             await launch_agent(
-                agent_id_param="worker-1",
+                agent_id="worker-1",
                 harness="kiro",
                 cwd="/tmp",
                 agent_mode="kiro_planner",
@@ -106,7 +106,7 @@ class TestLaunchAgent:
 
         with patch.dict("os.environ", {"SYNTH_MAX_AGENTS": "1"}):
             result = json.loads(
-                await launch_agent(agent_id_param="worker-1", harness="kiro")
+                await launch_agent(agent_id="worker-1", harness="kiro", message="Start working")
             )
         assert result["ok"] is True
         assert result["queued"] is True
@@ -132,46 +132,6 @@ class TestListAgents:
         by_id = {a["agent_id"]: a for a in result}
         assert by_id["worker-1"]["parent"] == "orchestrator"
         assert by_id["worker-1"]["task"] == "Fix auth"
-
-
-class TestDeregisterAgent:
-    async def test_deregister_inserts_self_terminate_command(self, db_path: Path) -> None:
-        _register_agents(db_path, [("agent-a", None, None)])
-        server = create_mcp_server(str(db_path), "sess-1", "agent-a")
-        deregister_agent = _get_tool(server, "deregister_agent")
-
-        result = json.loads(await deregister_agent())
-        assert result["status"] == "inactive"
-
-        conn = sqlite3.connect(str(db_path))
-        row = conn.execute(
-            "SELECT command, from_agent FROM agent_commands WHERE session_id = 'sess-1'"
-        ).fetchone()
-        conn.close()
-        assert row is not None
-        assert row[0] == "self_terminate"
-        assert row[1] == "agent-a"
-
-    async def test_deregister_filters_by_session_id(self, db_path: Path) -> None:
-        _register_agents(db_path, [("agent-a", None, None)])
-        # Insert agent-a in a different session
-        conn = sqlite3.connect(str(db_path))
-        conn.execute(
-            "INSERT INTO agents (agent_id, session_id, status, registered) VALUES ('agent-a-other', 'other-sess', 'active', 1000)"
-        )
-        conn.commit()
-        conn.close()
-
-        server = create_mcp_server(str(db_path), "sess-1", "agent-a")
-        deregister_agent = _get_tool(server, "deregister_agent")
-        await deregister_agent()
-
-        conn = sqlite3.connect(str(db_path))
-        row = conn.execute(
-            "SELECT status FROM agents WHERE agent_id = 'agent-a-other' AND session_id = 'other-sess'"
-        ).fetchone()
-        conn.close()
-        assert row[0] == "active"  # Other session's agent unaffected
 
 
 class TestMcpStartupValidation:

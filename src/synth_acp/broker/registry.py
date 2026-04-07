@@ -23,6 +23,7 @@ class AgentRegistry:
         self._sessions: dict[str, ACPSession] = {}
         self._parents: dict[str, str | None] = {a.agent_id: None for a in config.agents}
         self._harnesses: dict[str, str] = {a.agent_id: a.harness for a in config.agents}
+        self._initial_messages: dict[str, str] = {}
         self._usage: dict[str, UsageUpdated] = {}
 
     def register(self, agent_id: str, session: ACPSession) -> None:
@@ -56,6 +57,12 @@ class AgentRegistry:
         for aid, p in self._parents.items():
             if p == parent_id:
                 self._parents[aid] = None
+
+    def set_initial_message(self, agent_id: str, message: str) -> None:
+        self._initial_messages[agent_id] = message
+
+    def pop_initial_message(self, agent_id: str) -> str | None:
+        return self._initial_messages.pop(agent_id, None)
 
     def update_usage(self, event: UsageUpdated) -> None:
         prev = self._usage.get(event.agent_id)

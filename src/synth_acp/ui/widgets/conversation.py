@@ -250,6 +250,20 @@ class ConversationFeed(Vertical):
         turn.mount(widget)
         self._scroll.scroll_end(animate=False)
 
+    def add_hook_notification(self, hook_name: str) -> None:
+        """Mount a dim system line indicating a lifecycle hook fired."""
+        target = self._mount_target
+        if target is None:
+            return
+        ts = datetime.now(UTC).strftime("%H:%M")
+        widget = Static(
+            f"[dim]synth: {hook_name} hook fired  {ts}[/dim]",
+            classes="hook-notification",
+        )
+        target.mount(widget)
+        if self._scroll is not None:
+            self._scroll.scroll_end(animate=False)
+
     async def mount_terminal(self, terminal_id: str, terminal_process: TerminalProcess) -> None:
         """Mount a Terminal widget inside the matching ToolCallBlock.
 

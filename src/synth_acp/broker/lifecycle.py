@@ -19,14 +19,26 @@ from synth_acp.broker.registry import AgentRegistry
 from synth_acp.db import ensure_schema_async
 from synth_acp.harnesses import load_harness_registry
 from synth_acp.models.agent import AgentConfig, AgentState
-from synth_acp.models.config import SessionConfig
-from synth_acp.models.events import BrokerError, BrokerEvent
+from synth_acp.models.config import MessageHook, SessionConfig, render_template
+from synth_acp.models.events import BrokerError, BrokerEvent, HookFired
 from synth_acp.models.visibility import get_visible_agents
 
 log = logging.getLogger(__name__)
 
 type EventSink = Callable[[BrokerEvent], Awaitable[None]]
 type EnqueuePendingFn = Callable[[str, str, str], None]
+type EnqueueRawFn = Callable[[str, str], None]
+
+
+def _natural_list(items: list[str]) -> str:
+    """Render a list as natural language: 'a, b, and c'."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
 
 
 class AgentLifecycle:
@@ -51,15 +63,18 @@ class AgentLifecycle:
         self._session_id = session_id
         self._notify_socket_path: str = ""
         self._enqueue_pending: EnqueuePendingFn | None = None
+        self._enqueue_raw: EnqueueRawFn | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._first_prompted: set[str] = set()
         self._harness_registry = load_harness_registry()
         self._db: aiosqlite.Connection | None = None
         self._terminate_timeout: float = 5.0
 
-    def set_message_bus(self, socket_path: str, enqueue: EnqueuePendingFn) -> None:
+    def set_message_bus(self, socket_path: str, enqueue: EnqueuePendingFn, enqueue_raw: EnqueueRawFn) -> None:
         """Wire the message bus after construction. Must be called before launching agents."""
         self._notify_socket_path = socket_path
         self._enqueue_pending = enqueue
+        self._enqueue_raw = enqueue_raw
 
     def _make_run_task(self, agent_id: str, session: ACPSession) -> asyncio.Task[None]:
         task = asyncio.create_task(session.run(), name=f"run-{agent_id}")
@@ -183,6 +198,11 @@ class AgentLifecycle:
             (agent_id, self._session_id),
         )
         await db.commit()
+        task = await self._get_agent_task(agent_id)
+        parent = self._registry.get_parent(agent_id)
+        await self._fire_message_hook(
+            self._config.settings.hooks.on_agent_exit, agent_id, task, parent, "on_agent_exit",
+        )
         self._registry.orphan_children(agent_id)
 
     async def prompt(self, agent_id: str, text: str) -> None:
@@ -200,6 +220,14 @@ class AgentLifecycle:
                 )
             )
             return
+        if agent_id not in self._first_prompted:
+            self._first_prompted.add(agent_id)
+            hook = self._config.settings.hooks.on_agent_startup
+            if hook.prepend:
+                rendered = render_template(hook.prepend, {"agent_id": agent_id})
+                log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)
+                text = rendered + text
+                await self._sink(HookFired(agent_id=agent_id, hook_name="on_agent_startup"))
         self._tasks[f"prompt-{agent_id}"] = self._make_prompt_task(agent_id, session.prompt(text))
 
     async def cancel(self, agent_id: str) -> None:
@@ -306,12 +334,30 @@ class AgentLifecycle:
         )
         self._registry.register(agent_id, session)
         self._tasks[agent_id] = self._make_run_task(agent_id, session)
+        self._first_prompted.add(agent_id)
 
         if message and self._enqueue_pending:
-            self._enqueue_pending(agent_id, from_agent, message)
+            self._registry.set_initial_message(agent_id, message)
+            prompt_hook = self._config.settings.hooks.on_agent_prompt
+            if prompt_hook.prepend:
+                slots = {
+                    "agent_id": agent_id,
+                    "task": task,
+                    "parent_id": from_agent,
+                    "message": message,
+                }
+                rendered = render_template(prompt_hook.prepend, slots)
+                log.debug("on_agent_prompt hook fired for %s:\n%s", agent_id, rendered)
+                message = rendered + message
+            if self._enqueue_raw:
+                self._enqueue_raw(agent_id, message)
+            else:
+                self._enqueue_pending(agent_id, from_agent, message)
 
         await self.update_command_status(cmd_id, "processed")
-        await self._send_join_broadcast(agent_id, task)
+        await self._fire_message_hook(
+            self._config.settings.hooks.on_agent_join, agent_id, task, from_agent, "on_agent_join",
+        )
 
     async def handle_terminate_command(
         self, cmd_id: int, from_agent: str, data: dict[str, str]
@@ -411,17 +457,74 @@ class AgentLifecycle:
                 conn.close()
         return await asyncio.to_thread(_query)
 
-    async def _send_join_broadcast(self, agent_id: str, task: str) -> None:
-        recipients = await self._get_visible_agents_for(agent_id)
+    async def _fire_message_hook(
+        self,
+        hook: MessageHook,
+        agent_id: str,
+        task: str,
+        parent_id: str | None,
+        hook_name: str,
+    ) -> None:
+        """Send a templated message to the configured recipients."""
+        if hook.recipients == "none" or not hook.template:
+            return
+        recipients = await self._resolve_recipients(hook.recipients, agent_id, parent_id)
         if not recipients:
             return
-        body = f'[System] Agent "{agent_id}" has joined. Task: {task}.' if task else f'[System] Agent "{agent_id}" has joined.'
+        siblings = await self._get_siblings(agent_id, parent_id)
+        slots = {
+            "agent_id": agent_id,
+            "task": task or "",
+            "parent_id": parent_id or "",
+            "sibling_ids": _natural_list(siblings),
+        }
+        body = render_template(hook.template, slots)
+        log.debug("%s hook fired for %s → %s:\n%s", hook_name, agent_id, recipients, body)
         db = await self._ensure_db()
         now = int(time.time() * 1000)
         for recipient in recipients:
             await db.execute(
                 "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at, kind) "
-                "VALUES (?, 'system', ?, ?, 'pending', ?, 'system')",
-                (self._session_id, recipient, body, now),
+                "VALUES (?, 'system', ?, ?, 'pending', ?, ?)",
+                (self._session_id, recipient, body, now, hook.kind),
             )
         await db.commit()
+        for recipient in recipients:
+            await self._sink(HookFired(agent_id=recipient, hook_name=hook_name))
+
+    async def _resolve_recipients(
+        self, mode: str, agent_id: str, parent_id: str | None,
+    ) -> list[str]:
+        """Resolve recipient list based on the configured mode."""
+        if mode == "parent":
+            return [parent_id] if parent_id else []
+        if mode == "family":
+            family = await self._get_siblings(agent_id, parent_id)
+            if parent_id:
+                family = [parent_id, *family]
+            return family
+        if mode == "mesh":
+            return await self._get_visible_agents_for(agent_id)
+        return []
+
+    async def _get_siblings(self, agent_id: str, parent_id: str | None) -> list[str]:
+        """Get sibling agent IDs (agents sharing the same parent, excluding self)."""
+        if not parent_id:
+            return []
+        db = await self._ensure_db()
+        cursor = await db.execute(
+            "SELECT agent_id FROM agents WHERE session_id = ? AND parent = ? AND agent_id != ? AND status = 'active'",
+            (self._session_id, parent_id, agent_id),
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
+
+    async def _get_agent_task(self, agent_id: str) -> str:
+        """Look up the task description for an agent from SQLite."""
+        db = await self._ensure_db()
+        cursor = await db.execute(
+            "SELECT task FROM agents WHERE agent_id = ? AND session_id = ?",
+            (agent_id, self._session_id),
+        )
+        row = await cursor.fetchone()
+        return row[0] or "" if row else ""

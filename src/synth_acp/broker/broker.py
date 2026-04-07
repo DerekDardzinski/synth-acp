@@ -28,6 +28,8 @@ from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
     AgentStateChanged,
     BrokerEvent,
+    HookFired,
+    InitialPromptDelivered,
     McpMessageDelivered,
     MessageChunkReceived,
     PermissionAutoResolved,
@@ -196,6 +198,19 @@ class ACPBroker:
             if self._message_bus and self._lifecycle:
                 pending = self._message_bus.pop_pending(event.agent_id)
                 if pending:
+                    original = self._registry.pop_initial_message(event.agent_id)
+                    if original:
+                        parent = self._registry.get_parent(event.agent_id)
+                        await self._event_queue.put(
+                            InitialPromptDelivered(
+                                agent_id=event.agent_id,
+                                from_agent=parent or "system",
+                                text=original,
+                            )
+                        )
+                        await self._event_queue.put(
+                            HookFired(agent_id=event.agent_id, hook_name="on_agent_prompt")
+                        )
                     await self._lifecycle.prompt(event.agent_id, pending)
 
     @staticmethod
@@ -341,7 +356,7 @@ class ACPBroker:
                 self._db_path, self._session_id, self._deliver_message, self._process_commands
             )
             await self._message_bus.start()
-            lifecycle.set_message_bus(self._message_bus.socket_path, self._message_bus.enqueue_pending)
+            lifecycle.set_message_bus(self._message_bus.socket_path, self._message_bus.enqueue_pending, self._message_bus.enqueue_raw)
 
     # ------------------------------------------------------------------
     # Command processing
@@ -356,19 +371,10 @@ class ACPBroker:
                     await lifecycle.handle_launch_command(cmd_id, from_agent, data)
                 elif command == "terminate":
                     await lifecycle.handle_terminate_command(cmd_id, from_agent, data)
-                elif command == "self_terminate":
-                    await self._handle_self_terminate_command(cmd_id, from_agent)
                 else:
                     await lifecycle.update_command_status(cmd_id, "rejected", f"Unknown command: {command}")
             except Exception as exc:
                 await lifecycle.update_command_status(cmd_id, "rejected", str(exc))
-
-    async def _handle_self_terminate_command(self, cmd_id: int, from_agent: str) -> None:
-        session = self._registry.get_session(from_agent)
-        if session and session.state != AgentState.TERMINATED:
-            await session.force_terminate()
-        lifecycle = await self._ensure_lifecycle()
-        await lifecycle.update_command_status(cmd_id, "processed")
 
     async def _deliver_message(self, agent_id: str, text: str, from_agents: list[str]) -> bool:
         """Deliver a message to an agent. Non-blocking — dispatches prompt as a task."""

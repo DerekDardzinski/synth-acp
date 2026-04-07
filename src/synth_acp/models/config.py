@@ -1,16 +1,35 @@
-"""Session configuration parsed from .synth.toml or .synth.json."""
+"""Session configuration parsed from .synth.json."""
 
 from __future__ import annotations
 
 import json
-import tomllib
+import os
+from collections import defaultdict
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, model_validator
 
 from synth_acp.models.agent import AgentConfig
+
+DEFAULT_ROUTING_CONTEXT = (
+    "<orchestration_context>\n"
+    "agent_id: {agent_id}\n"
+    "parent_agent: {parent_id}\n"
+    "reply_tool: send_message(to_agent='{parent_id}', kind='response')\n"
+    "visibility: Your text output goes to the UI only. Other agents cannot see it.\n"
+    "recovery: Call get_my_context() if you lose track of this information.\n"
+    "</orchestration_context>\n\n"
+)
+
+DEFAULT_STARTUP_CONTEXT = (
+    "<orchestration_context>\n"
+    "agent_id: {agent_id}\n"
+    "session: You are in a multi-agent session. Use list_agents() to see other agents.\n"
+    "communication: Use send_message() to talk to other agents. Your text output goes to the user only.\n"
+    "</orchestration_context>\n\n"
+)
 
 
 class CommunicationMode(StrEnum):
@@ -20,11 +39,35 @@ class CommunicationMode(StrEnum):
     LOCAL = "LOCAL"
 
 
+class MessageHook(BaseModel, frozen=True):
+    """Hook that sends a templated message to a set of recipients."""
+
+    recipients: Literal["none", "parent", "family", "mesh"] = "none"
+    template: str = ""
+    kind: Literal["system", "chat"] = "system"
+
+
+class PromptHook(BaseModel, frozen=True):
+    """Hook that prepends context to a launched agent's initial prompt."""
+
+    prepend: str = DEFAULT_ROUTING_CONTEXT
+
+
+class HooksConfig(BaseModel, frozen=True):
+    """Lifecycle hooks for agent events."""
+
+    on_agent_join: MessageHook = MessageHook()
+    on_agent_exit: MessageHook = MessageHook()
+    on_agent_prompt: PromptHook = PromptHook()
+    on_agent_startup: PromptHook = PromptHook(prepend=DEFAULT_STARTUP_CONTEXT)
+
+
 class SettingsConfig(BaseModel, frozen=True):
     """Global session settings."""
 
     communication_mode: CommunicationMode = CommunicationMode.MESH
     auto_approve_tools: list[str] = []
+    hooks: HooksConfig = HooksConfig()
 
 
 class HarnessEntry(BaseModel, frozen=True):
@@ -53,10 +96,7 @@ class UIConfig(BaseModel, frozen=True):
 
 
 class SessionConfig(BaseModel, frozen=True):
-    """Top-level session configuration.
-
-    Supports both ``project`` (new) and ``session`` (legacy) keys.
-    """
+    """Top-level session configuration."""
 
     project: str
     agents: list[AgentConfig]
@@ -66,11 +106,33 @@ class SessionConfig(BaseModel, frozen=True):
     @model_validator(mode="before")
     @classmethod
     def _coerce_session_to_project(cls, data: Any) -> Any:
-        """Rename legacy ``session`` key to ``project``."""
+        """Rename legacy ``session`` key to ``project`` and apply env overrides."""
         if isinstance(data, dict):
             data = dict(data)
             if "session" in data and "project" not in data:
                 data["project"] = data.pop("session")
+            # Apply env var overrides into settings.hooks
+            settings = dict(data.get("settings") or {})
+            hooks = dict(settings.get("hooks") or {})
+
+            if val := os.environ.get("SYNTH_JOIN_RECIPIENTS"):
+                join = dict(hooks.get("on_agent_join") or {})
+                join["recipients"] = val
+                hooks["on_agent_join"] = join
+
+            if val := os.environ.get("SYNTH_JOIN_TEMPLATE"):
+                join = dict(hooks.get("on_agent_join") or {})
+                join["template"] = val
+                hooks["on_agent_join"] = join
+
+            if val := os.environ.get("SYNTH_ROUTING_TEMPLATE"):
+                prompt = dict(hooks.get("on_agent_prompt") or {})
+                prompt["prepend"] = val
+                hooks["on_agent_prompt"] = prompt
+
+            if hooks:
+                settings["hooks"] = hooks
+                data["settings"] = settings
         return data
 
     @model_validator(mode="after")
@@ -83,42 +145,26 @@ class SessionConfig(BaseModel, frozen=True):
         return self
 
 
-def find_config(cwd: Path) -> Path | None:
-    """Find a config file in the given directory.
+def render_template(template: str, slots: dict[str, str]) -> str:
+    """Render a template string with named slots.
 
-    Checks ``.synth.toml`` first, then ``.synth.json``.
-
-    Args:
-        cwd: Directory to search in.
-
-    Returns:
-        Path to the config file, or None if not found.
+    Unknown slots are left as empty strings rather than raising KeyError.
     """
-    toml_path = cwd / ".synth.toml"
-    if toml_path.exists():
-        return toml_path
-    json_path = cwd / ".synth.json"
-    if json_path.exists():
-        return json_path
-    return None
+    return template.format_map(defaultdict(str, slots))
+
+
+def find_config(cwd: Path) -> Path | None:
+    """Find a .synth.json config file in the given directory."""
+    path = cwd / ".synth.json"
+    return path if path.exists() else None
 
 
 def load_config(path: Path) -> SessionConfig:
-    """Load and validate a config file (.toml or .json).
+    """Load and validate a .synth.json config file.
 
     Relative agent CWD paths are resolved against the config file's parent directory.
-
-    Args:
-        path: Path to the config file.
-
-    Returns:
-        Validated SessionConfig.
     """
-    if path.suffix == ".toml":
-        raw = tomllib.loads(path.read_text())
-    else:
-        raw = json.loads(path.read_text())
-
+    raw = json.loads(path.read_text())
     config = SessionConfig.model_validate(raw)
 
     config_dir = path.parent.resolve()
@@ -130,21 +176,19 @@ def load_config(path: Path) -> SessionConfig:
     return config.model_copy(update={"agents": resolved_agents})
 
 
-def write_toml_config(path: Path, config: SessionConfig) -> None:
-    """Write a SessionConfig as TOML.
+def write_json_config(path: Path, config: SessionConfig) -> None:
+    """Write a SessionConfig as JSON.
 
-    Args:
-        path: Destination file path.
-        config: The configuration to write.
+    Only writes non-default fields for agents to keep the output minimal.
     """
-    lines = [f'project = "{config.project}"', ""]
+    agents = []
     for agent in config.agents:
-        lines.append("[[agents]]")
-        lines.append(f'agent_id = "{agent.agent_id}"')
-        lines.append(f'harness = "{agent.harness}"')
+        entry: dict[str, Any] = {"agent_id": agent.agent_id, "harness": agent.harness}
         if agent.agent_mode:
-            lines.append(f'agent_mode = "{agent.agent_mode}"')
+            entry["agent_mode"] = agent.agent_mode
         if agent.cwd != ".":
-            lines.append(f'cwd = "{agent.cwd}"')
-        lines.append("")
-    path.write_text("\n".join(lines))
+            entry["cwd"] = agent.cwd
+        agents.append(entry)
+
+    data: dict[str, Any] = {"project": config.project, "agents": agents}
+    path.write_text(json.dumps(data, indent=2) + "\n")

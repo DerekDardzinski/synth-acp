@@ -140,6 +140,19 @@ class McpMessageDelivered(BrokerEvent):
     reply_to: int | None = None
 
 
+class HookFired(BrokerEvent):
+    """A lifecycle hook was executed. UI renders as a dim system line."""
+
+    hook_name: str
+
+
+class InitialPromptDelivered(BrokerEvent):
+    """The initial message from a parent was delivered to a launched agent."""
+
+    from_agent: str
+    text: str
+
+
 class AgentModesReceived(BrokerEvent):
     """Agent advertised available modes after session creation.
 
@@ -217,7 +230,7 @@ type ConfigEvent = (
 
 type SystemEvent = (
     BrokerError | PermissionRequested | PermissionAutoResolved
-    | UsageUpdated | McpMessageDelivered
+    | UsageUpdated | McpMessageDelivered | HookFired | InitialPromptDelivered
 )
 
 type BrokerEventUnion = AgentEvent | ConfigEvent | SystemEvent

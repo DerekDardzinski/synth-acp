@@ -1,0 +1,57 @@
+{
+  "project": "my-project",
+
+  "agents": [
+    {
+      "agent_id": "lead",
+      "harness": "kiro",
+      "agent_mode": "coder",
+      "cwd": ".",
+      "env": {
+        "CUSTOM_VAR": "value"
+      }
+    },
+    {
+      "agent_id": "worker",
+      "harness": "claude",
+      "cwd": "./subdir"
+    }
+  ],
+
+  "settings": {
+    "communication_mode": "MESH",
+    "auto_approve_tools": [
+      "synth-mcp/send_message",
+      "synth-mcp/check_delivery",
+      "synth-mcp/launch_agent",
+      "synth-mcp/list_agents"
+    ],
+
+    "hooks": {
+      "on_agent_startup": {
+        "prepend": "<orchestration_context>\nYour agent_id: {agent_id}\nsession: You are in a multi-agent session. Use list_agents() to see other agents.\ncommunication: Use send_message() to talk to other agents. Your text output goes to the user only.\nchild_agents: When launching child agents, instruct them to send_message(to_agent='{agent_id}', kind='response').\n</orchestration_context>\n\n"
+      },
+
+      "on_agent_prompt": {
+        "prepend": "<orchestration_context>\nagent_id: {agent_id}\nparent_agent: {parent_id}\nreply_tool: send_message(to_agent='{parent_id}', kind='response')\nvisibility: Your text output goes to the UI only. Other agents cannot see it.\nrecovery: Call get_my_context() if you lose track of this information.\n</orchestration_context>\n\n"
+      },
+
+      "on_agent_join": {
+        "recipients": "parent",
+        "template": "Agent \"{agent_id}\" is now active. Task: \"{task}\".",
+        "kind": "system"
+      },
+
+      "on_agent_exit": {
+        "recipients": "parent",
+        "template": "Agent \"{agent_id}\" has left the session.",
+        "kind": "system"
+      }
+    }
+  },
+
+  "ui": {
+    "web_port": 8000,
+    "theme": "dark"
+  }
+}

@@ -27,6 +27,8 @@ from synth_acp.models.events import (
     AvailableCommandsReceived,
     BrokerError,
     BrokerEvent,
+    HookFired,
+    InitialPromptDelivered,
     McpMessageDelivered,
     MessageChunkReceived,
     PermissionRequested,
@@ -171,7 +173,9 @@ class SynthApp(App):
             return
 
         # Buffer events for agents without panels
-        if event.agent_id in self._event_buffers and event.agent_id not in self._panels:
+        if event.agent_id not in self._panels:
+            if event.agent_id not in self._event_buffers:
+                self._event_buffers[event.agent_id] = []
             self._event_buffers[event.agent_id].append(event)
 
         if isinstance(event, AgentStateChanged):
@@ -180,7 +184,7 @@ class SynthApp(App):
                 parent = self.broker.get_agent_parent(event.agent_id)
                 harness = self.broker.get_agent_harness(event.agent_id)
                 self._dynamic_agents[event.agent_id] = DynamicAgentInfo(parent=parent, task="", harness=harness)
-                self._event_buffers[event.agent_id] = []
+                self._event_buffers.setdefault(event.agent_id, [])
                 try:
                     agent_list = self.query_one(AgentList)
                     agent_list.add_agent_tile(event.agent_id, parent=parent)
@@ -269,6 +273,10 @@ class SynthApp(App):
                 feed.input_bar.update_slash_commands(event.commands)
         elif isinstance(event, UsageUpdated):
             self._update_usage_display(event)
+        elif isinstance(event, HookFired):
+            feed.add_hook_notification(event.hook_name)
+        elif isinstance(event, InitialPromptDelivered):
+            feed.add_prompt(event.text)
         elif isinstance(event, BrokerError):
             self.notify(event.message, severity=event.severity)
         elif isinstance(event, AgentStateChanged):
@@ -349,6 +357,10 @@ class SynthApp(App):
                 feed.input_bar.update_slash_commands(event.commands)
         elif isinstance(event, McpMessageDelivered):
             feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
+        elif isinstance(event, HookFired):
+            feed.add_hook_notification(event.hook_name)
+        elif isinstance(event, InitialPromptDelivered):
+            feed.add_prompt(event.text)
 
     def _update_input_bar_state(self, agent_id: str, state: AgentState) -> None:
         """Update the InputBar disabled state for an agent.
