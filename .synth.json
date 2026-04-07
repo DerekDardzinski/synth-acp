@@ -5,15 +5,16 @@
       "synth-mcp/send_message",
       "synth-mcp/check_delivery",
       "synth-mcp/launch_agent",
-      "synth-mcp/list_agents"
+      "synth-mcp/list_agents",
+      "synth-mcp/get_my_context"
     ],
     "hooks": {
       "on_agent_join": {
-        "recipients": "parent",
+        "recipients": "none",
         "template": "Agent \"{agent_id}\" is now active. Task: \"{task}\"."
       },
       "on_agent_exit": {
-        "recipients": "parent",
+        "recipients": "none",
         "template": "Agent \"{agent_id}\" has left the session."
       },
       "on_agent_prompt": {

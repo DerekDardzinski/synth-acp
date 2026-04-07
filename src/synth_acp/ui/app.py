@@ -481,7 +481,11 @@ class SynthApp(App):
             self._update_input_bar_modes(agent_id)
             self._update_input_bar_models(agent_id)
 
-        self.selected_agent = agent_id
+        switcher = self.query_one("#right", ContentSwitcher)
+        if self.selected_agent == agent_id and switcher.current != f"feed-{agent_id}":
+            self.watch_selected_agent(agent_id)
+        else:
+            self.selected_agent = agent_id
 
     def watch_selected_agent(self, agent_id: str) -> None:
         """React to selected_agent changes — switch panel, update tiles and topbar.
