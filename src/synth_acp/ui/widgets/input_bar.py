@@ -293,15 +293,22 @@ class InputBar(Vertical):
 
     def _build_info_label(self) -> str:
         """Build the static info label text."""
-        parts = [
+        line1 = [
             f"[dim]agent:[/] [$primary]{self._agent_id}[/]",
             f"[dim]harness:[/] {self._harness}",
         ]
+        line2: list[str] = []
         if self._cwd_display:
-            parts.append(f"[dim]cwd:[/] {self._cwd_display}")
-        if self._git_branch:
-            parts.append(f"[dim]branch:[/] [$accent]{self._git_branch}[/]")
-        return " · ".join(parts)
+            cwd_part = self._cwd_display
+            if self._git_branch:
+                cwd_part += f" ([$accent]{self._git_branch}[/])"
+            line2.append(cwd_part)
+        elif self._git_branch:
+            line2.append(f"[$accent]{self._git_branch}[/]")
+        result = " · ".join(line1)
+        if line2:
+            result += "\n" + " · ".join(line2)
+        return result
 
     # --- Mode / model updates ---
 

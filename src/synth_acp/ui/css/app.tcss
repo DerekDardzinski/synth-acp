@@ -2,21 +2,6 @@
 
 Screen { background: $background; layout: vertical; }
 
-/* ── Topbar ── */
-#topbar {
-    dock: top;
-    height: 3;
-    background: $background;
-    border-bottom: tall $surface;
-    layout: horizontal;
-    align: left middle;
-    padding: 0 2;
-}
-#tb-title   { width: auto; color: $primary; text-style: bold; padding-right: 1; }
-#tb-sep     { width: auto; color: $surface-lighten-2; padding: 0 1; }
-#tb-session { width: auto; color: $text-muted; }
-#tb-right   { width: 1fr; content-align: right middle; color: $text-muted; }
-
 /* ── Main layout ── */
 #main { height: 1fr; layout: horizontal; }
 
@@ -24,33 +9,37 @@ Screen { background: $background; layout: vertical; }
 #sidebar {
     width: 32;
     border-right: tall $surface;
-    background: $background;
+    background: transparent;
     layout: vertical;
+}
+#sidebar-label-dock {
+    dock: top;
+    height: auto;
+    hatch: left $panel 60%;
+    padding-bottom: 1;
 }
 #sidebar-label {
     height: 3;
-    background: $background;
-    border-bottom: tall $surface;
-    padding: 0 2;
+    background: $background-lighten-1;
+    padding: 0 1;
+    margin: 1 1 0 1;
     color: $foreground;
     content-align: center middle;
     text-style: bold;
 }
 #agent-list {
     height: 1fr;
-    overflow-y: auto;
-    padding: 0 1;
-    scrollbar-size-vertical: 1;
-    scrollbar-color: $scrollbar;
-    scrollbar-background: transparent;
+    overflow: hidden auto;
     hatch: left $panel 60%;
+    padding: 0;
+    scrollbar-size: 0 0;
 }
 
 AgentTile {
     height: auto;
     width: 1fr;
     padding: 0 1 0 1;
-    margin: 1 0 0 0;
+    margin: 0 1 1 1;
     background: $background-lighten-1;
     border-top: tall $accent;
     transition: border 0.15s in_out_cubic;
@@ -62,7 +51,7 @@ AgentTile:hover {
 }
 AgentTile.tile-active {
     background: $background-lighten-1;
-    border-top: tall $accent;
+    border-top: tall $primary;
 }
 AgentTile.tile-permission { border-top: tall $warning; }
 AgentTile.tile-permission.tile-active { border-top: tall $warning; }
@@ -81,15 +70,22 @@ AgentTile.tile-permission.tile-active { border-top: tall $warning; }
 
 #mcp-btn {
     height: 3;
-    background: $background;
-    border-top: tall $surface;
+    width: 1fr;
+    margin: 0 1 1 1;
+    background: $background-lighten-1;
     padding: 0 2;
     color: $text-muted;
-    content-align: left middle;
+    content-align: center middle;
     transition: color 0.15s in_out_cubic;
 }
 #mcp-btn:hover { color: $foreground; }
-#mcp-btn.btn-active { border-top: tall $border; color: $foreground; }
+#mcp-btn.btn-active { color: $foreground; }
+
+#sidebar-buttons-dock {
+    height: auto;
+    hatch: left $panel 60%;
+    padding-top: 1;
+}
 
 /* ── Right panels ── */
 #right { height: 1fr; width: 1fr; hatch: right $panel 60%; }
@@ -104,15 +100,6 @@ ContentSwitcher > * { height: 1fr; hatch: right $panel 60%; }
 }
 
 /* ── Panel header ── */
-.panel-header-static {
-    height: 3;
-    background: $background;
-    border-bottom: tall $surface;
-    padding: 0 1;
-    content-align: left middle;
-    color: $foreground;
-    text-style: bold;
-}
 
 /* ── Conversation feed container ── */
 ConversationFeed {
@@ -152,6 +139,8 @@ PromptBubble {
     padding: 0 1;
     color: $foreground;
 }
+PromptBubble Markdown { height: auto; margin: 0; padding: 0; }
+PromptBubble .bubble-ts { height: auto; margin: 0; padding: 0; }
 
 AgentMessage {
     height: auto;
@@ -259,7 +248,7 @@ PromptTextArea {
 }
 
 .info-bar {
-    height: 1;
+    height: auto;
     layout: horizontal;
     padding: 0 1;
     margin: 0 3;
@@ -323,27 +312,25 @@ PromptTextArea {
 LaunchButton {
     height: 3;
     width: 1fr;
-    margin: 1 0 0 0;
-    border: tall $surface-lighten-1;
+    margin: 0 1 1 1;
+    background: $background-lighten-1;
     color: $text-muted;
     text-align: center;
     content-align: center middle;
-    transition: border 0.15s in_out_cubic;
     transition: color 0.15s in_out_cubic;
 }
 LaunchButton:hover {
-    border: tall $surface-lighten-3;
     color: $text;
 }
 
 /* ── Messages panel ── */
 #msg-body { height: 1fr; layout: horizontal; }
 #thread-list {
-    width: 34;
+    width: 32;
     border-right: tall $surface;
     overflow-y: auto;
-    padding: 0 1;
-    scrollbar-size-vertical: 1;
+    padding: 0;
+    scrollbar-size-vertical: 0;
     scrollbar-color: $scrollbar;
     scrollbar-background: transparent;
     hatch: left $panel 60%;
@@ -351,7 +338,7 @@ LaunchButton:hover {
 .thread-item {
     height: auto;
     padding: 0 1 1 1;
-    margin: 1 0 0 0;
+    margin: 0 1 1 1;
     background: $background-lighten-1;
     border-top: tall $accent;
     transition: border 0.15s in_out_cubic;
@@ -363,24 +350,32 @@ LaunchButton:hover {
 }
 .thread-item.thread-active {
     background: $background-lighten-1;
-    border-top: tall $accent;
+    border-top: tall $primary;
 }
 .thread-item.thread-pending { border-top: tall $warning; }
 .thread-item.thread-pending.thread-active { border-top: tall $warning; }
 
 /* ── Thread detail ── */
-ThreadDetailHeader {
-    height: 3;
-    background: $background;
-    border-bottom: tall $surface;
-    padding: 0 1;
-    content-align: left middle;
-    color: $foreground;
-}
-
 ThreadDetail {
     height: 1fr;
     layout: vertical;
+    hatch: right $panel 60%;
+}
+
+#msg-title-dock {
+    dock: top;
+    height: auto;
+    hatch: left $panel 60%;
+    padding-bottom: 1;
+}
+#msg-title {
+    height: 3;
+    background: $background-lighten-1;
+    padding: 0 1;
+    margin: 1 1 0 1;
+    color: $foreground;
+    content-align: center middle;
+    text-style: bold;
 }
 
 #thread-detail { height: 1fr; }
@@ -396,6 +391,10 @@ ThreadDetail {
 #thread-detail-scroll .mcp-msg {
     margin: 1 0 0 0;
 }
+
+/* ── Markdown code block wrapping ── */
+MarkdownFence { overflow: hidden hidden; }
+MarkdownFence Label { width: 1fr; text-wrap: wrap; }
 
 Footer { background: $background; color: $text-muted; }
 
@@ -454,6 +453,8 @@ LaunchAgentScreen, HelpScreen {
     padding: 0 1;
     color: $text-muted;
 }
+.mcp-msg Markdown { height: auto; margin: 0; padding: 0; }
+.mcp-msg .bubble-ts { height: auto; margin: 0; padding: 0; }
 
 /* ── Hook notification in conversation ── */
 .hook-notification {

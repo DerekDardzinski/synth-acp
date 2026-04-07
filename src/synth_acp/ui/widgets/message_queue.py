@@ -8,33 +8,26 @@ from typing import Any
 from textual.app import ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Static
+from textual.widgets.markdown import Markdown
 
 from synth_acp.models.events import McpMessageDelivered
 
 log = logging.getLogger(__name__)
 
 
-class ThreadDetailHeader(Static):
-    """Header bar showing participant names and message count."""
-
-    def __init__(self) -> None:
-        super().__init__("", id="thread-detail-header")
-
-
 class ThreadDetail(Vertical):
-    """Thread detail area: header + scrollable message metadata."""
+    """Thread detail area: scrollable message metadata."""
 
     def __init__(self) -> None:
         super().__init__(id="thread-detail")
 
     def compose(self) -> ComposeResult:
-        """Yield header and scrollable message list."""
-        yield ThreadDetailHeader()
+        """Yield scrollable message list."""
         yield ScrollableContainer(id="thread-detail-scroll")
 
     def show_thread(
         self,
-        thread_key: tuple[str, str],
+        thread_key: tuple[str, str],  # noqa: ARG002
         messages: list[McpMessageDelivered],
     ) -> None:
         """Populate the detail pane with messages for a thread.
@@ -43,24 +36,18 @@ class ThreadDetail(Vertical):
             thread_key: Sorted (agent_a, agent_b) pair.
             messages: List of delivered messages in this thread.
         """
-        a, b = thread_key
-        n = len(messages)
-        header = self.query_one("#thread-detail-header", ThreadDetailHeader)
-        header.update(
-            f" [$primary bold]{a}[/] [dim]→[/dim] [$primary bold]{b}[/]"
-            f"  [dim]{n} message{'s' if n != 1 else ''}[/dim]"
-        )
-
         scroll = self.query_one("#thread-detail-scroll", ScrollableContainer)
         scroll.remove_children()
         for msg in messages:
             ts = msg.timestamp.strftime("%H:%M")
-            escaped = msg.preview.replace("[", r"\[") if msg.preview else ""
-            body = escaped or "[dim]delivered[/dim]"
-            scroll.mount(
+            body = msg.preview or ""
+            container = Vertical(classes="mcp-msg")
+            scroll.mount(container)
+            container.mount(Markdown(body, open_links=False))
+            container.mount(
                 Static(
-                    f"{body}\n[dim]◈ {msg.from_agent} → {msg.to_agent}  {ts}[/dim]",
-                    classes="mcp-msg",
+                    f"[dim]◈ {msg.from_agent} → {msg.to_agent}  {ts}[/dim]",
+                    classes="bubble-ts",
                 )
             )
 
@@ -121,14 +108,13 @@ class MessageQueue(Vertical):
         self._active_key: tuple[str, str] | None = None
 
     def compose(self) -> ComposeResult:
-        """Yield header, thread list, and detail pane."""
-        total = sum(len(msgs) for msgs in self._threads.values())
-        yield Static(
-            f" [bold]MCP Messages[/bold]  [dim]{total} messages[/dim]",
-            classes="panel-header-static",
-        )
+        """Yield thread list and detail pane."""
         with Horizontal(id="msg-body"):
             with ScrollableContainer(id="thread-list"):
+                yield Vertical(
+                    Static("MESSAGES", id="msg-title"),
+                    id="msg-title-dock",
+                )
                 for key, msgs in self._threads.items():
                     yield ThreadItem(key, msgs)
             yield ThreadDetail()
@@ -148,6 +134,10 @@ class MessageQueue(Vertical):
             log.debug("Thread list query failed", exc_info=True)
             return
         await thread_list.remove_children()
+        thread_list.mount(Vertical(
+            Static("MESSAGES", id="msg-title"),
+            id="msg-title-dock",
+        ))
         for key, msgs in threads.items():
             thread_list.mount(ThreadItem(key, msgs))
         # Re-select active thread if still present

@@ -202,12 +202,18 @@ class AgentList(Vertical):
 
     def compose(self) -> ComposeResult:
         """Yield sidebar label, scrollable agent tiles, and buttons."""
-        yield Static("AGENTS", id="sidebar-label")
         with ScrollableContainer(id="agent-list"):
+            yield Vertical(
+                Static("AGENTS", id="sidebar-label"),
+                id="sidebar-label-dock",
+            )
             for agent_id in self._agents:
                 yield AgentTile(agent_id)
-            yield LaunchButton()
-        yield MCPButton()
+        yield Vertical(
+            LaunchButton(),
+            MCPButton(),
+            id="sidebar-buttons-dock",
+        )
 
     def add_agent_tile(
         self, agent_id: str, *, task: str = "", parent: str | None = None
@@ -220,5 +226,4 @@ class AgentList(Vertical):
             parent: Optional parent agent ID.
         """
         tile = AgentTile(agent_id, task=task, parent=parent)
-        launch_btn = self.query_one("#launch-btn", LaunchButton)
-        self.query_one("#agent-list", ScrollableContainer).mount(tile, before=launch_btn)
+        self.query_one("#agent-list", ScrollableContainer).mount(tile)

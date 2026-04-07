@@ -13,7 +13,7 @@ class AgentMessage(Markdown):
     """
 
     def __init__(self, agent_id: str) -> None:
-        super().__init__("")
+        super().__init__("", open_links=False)
         self._agent_id = agent_id
         self._stream: MarkdownStream | None = None
 

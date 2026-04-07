@@ -10,7 +10,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
-from textual.widgets import ContentSwitcher, Footer, Static
+from textual.widgets import ContentSwitcher, Footer
 from textual.worker import Worker, WorkerState
 
 from synth_acp.broker.broker import ACPBroker
@@ -111,12 +111,7 @@ class SynthApp(App):
         super()._handle_exception(error)
 
     def compose(self) -> ComposeResult:
-        """Build the top bar, main layout with sidebar, and footer."""
-        with Horizontal(id="topbar"):
-            yield Static("SYNTH", id="tb-title")
-            yield Static("│", id="tb-sep")
-            yield Static(f"project: {self.config.project}", id="tb-session")
-            yield Static("", id="tb-right")
+        """Build the main layout with sidebar and footer."""
         with Horizontal(id="main"):
             agents = [a.agent_id for a in self.config.agents]
             with Vertical(id="sidebar"):
@@ -430,24 +425,13 @@ class SynthApp(App):
             bar.update_current_model(mid)
 
     def _update_usage_display(self, event: UsageUpdated) -> None:
-        """Update the topbar usage display for the selected agent.
+        """Update usage display for the selected agent.
 
         Args:
             event: Usage snapshot from the broker.
         """
         if event.agent_id != self.selected_agent:
             return
-        parts: list[str] = []
-        used = event.used
-        parts.append(f"{used // 1000}k ctx" if used >= 1000 else f"{used} ctx")
-        if event.cost_amount is not None:
-            parts.append(f"${event.cost_amount:.2f}")
-        try:
-            self.query_one("#tb-right", Static).update(
-                f"[dim]{'  '.join(parts)}[/dim]" if parts else ""
-            )
-        except Exception:
-            log.debug("Topbar usage update failed", exc_info=True)
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """Handle worker state changes — notify and restart on error.
@@ -514,16 +498,6 @@ class SynthApp(App):
             self.query_one("#mcp-btn", MCPButton).remove_class("btn-active")
         except Exception:
             log.debug("MCP button deselect failed", exc_info=True)
-        # Update topbar with agent display name
-        display_name = agent_id
-        for a in self.config.agents:
-            if a.agent_id == agent_id:
-                display_name = getattr(a, "display_name", a.agent_id)
-                break
-        try:
-            self.query_one("#tb-session", Static).update(display_name)
-        except Exception:
-            log.debug("Topbar session label update failed", exc_info=True)
         self._update_input_bar_state(agent_id, self._agent_states.get(agent_id, AgentState.IDLE))
 
     async def show_messages(self) -> None:

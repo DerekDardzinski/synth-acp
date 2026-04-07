@@ -242,12 +242,13 @@ class ConversationFeed(Vertical):
         if turn is None:
             return
         ts = datetime.now(UTC).strftime("%H:%M")
-        escaped = preview.replace("[", r"\[")
-        widget = Static(
-            f"{escaped}\n[dim]◈ {from_agent} → {to_agent}  {ts}[/dim]",
-            classes="mcp-msg",
-        )
-        turn.mount(widget)
+        from textual.containers import Vertical
+        from textual.widgets.markdown import Markdown
+
+        container = Vertical(classes="mcp-msg")
+        turn.mount(container)
+        container.mount(Markdown(preview, open_links=False))
+        container.mount(Static(f"[dim]◈ {from_agent} → {to_agent}  {ts}[/dim]", classes="bubble-ts"))
         self._scroll.scroll_end(animate=False)
 
     def add_hook_notification(self, hook_name: str) -> None:

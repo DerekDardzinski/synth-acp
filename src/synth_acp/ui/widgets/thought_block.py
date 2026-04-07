@@ -14,7 +14,7 @@ class ThoughtBlock(Collapsible):
     """
 
     def __init__(self) -> None:
-        super().__init__(Markdown(""), title="Thinking…", collapsed=False)
+        super().__init__(Markdown("", open_links=False), title="Thinking…", collapsed=False)
         self._stream: MarkdownStream | None = None
 
     @property

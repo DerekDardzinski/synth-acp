@@ -172,7 +172,7 @@ class ToolCallBlock(Vertical):
         if not text_content or self._text_rendered:
             return []
         self._text_rendered = True
-        return [Markdown(text_content, id="tc-text")]
+        return [Markdown(text_content, id="tc-text", open_links=False)]
 
     def _diff_widgets(self, diffs: list[ToolCallDiff] | None) -> list[DiffView]:
         """Build DiffView widgets for diffs."""
