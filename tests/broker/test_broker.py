@@ -564,13 +564,19 @@ class TestRelaunchTerminatedAgent:
         mock_session.state = AgentState.INITIALIZING
         mock_session.run = AsyncMock()
 
-        with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_session):
-            await broker.handle(LaunchAgent(agent_id="agent-1"))
+        try:
+            with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_session):
+                await broker.handle(LaunchAgent(agent_id="agent-1"))
 
-        # New session replaced the old one
-        assert broker._registry._sessions["agent-1"] is mock_session
-        # No BrokerError emitted
-        assert broker._event_queue.empty()
+            # New session replaced the old one
+            assert broker._registry._sessions["agent-1"] is mock_session
+            # No BrokerError emitted
+            assert broker._event_queue.empty()
+        finally:
+            if broker._message_bus:
+                await broker._message_bus.stop()
+            if broker._lifecycle:
+                await broker._lifecycle.close_db()
 
 
 class TestSelfTerminate:

@@ -42,6 +42,7 @@ from synth_acp.ui.messages import BrokerEventMessage
 from synth_acp.ui.screens.help import HelpScreen
 from synth_acp.ui.screens.launch import LaunchAgentScreen
 from synth_acp.ui.screens.permission import PermissionBar
+from synth_acp.ui.screens.session_picker import SessionPickerScreen
 from synth_acp.ui.widgets.agent_list import AgentList, AgentTile, MCPButton
 from synth_acp.ui.widgets.conversation import ConversationFeed
 from synth_acp.ui.widgets.input_bar import InputBar
@@ -77,18 +78,20 @@ class SynthApp(App):
         Binding("tab", "next_agent", "Next agent", show=False),
         Binding("m", "messages", "MCP messages"),
         Binding("l", "launch", "Launch agent"),
+        Binding("ctrl+r", "restore", "Restore session"),
         Binding("f1", "help", "Help"),
     ]
 
     selected_agent: reactive[str] = reactive("")
     selected_thread: reactive[str] = reactive("")
 
-    def __init__(self, broker: ACPBroker, config: SessionConfig, css_path: str | None = None) -> None:
+    def __init__(self, broker: ACPBroker, config: SessionConfig, css_path: str | None = None, restore: bool = False) -> None:
         if css_path:
             self.CSS_PATH = css_path
         super().__init__()
         self.broker = broker
         self.config = config
+        self._restore_mode = restore
         self._event_buffers: dict[str, list[BrokerEvent]] = {}
         self._panels: dict[str, ConversationFeed] = {}
         self._agent_states: dict[str, AgentState] = {}
@@ -124,11 +127,15 @@ class SynthApp(App):
         self.theme = "catppuccin-mocha"
         for agent in self.config.agents:
             self._event_buffers[agent.agent_id] = []
-        for agent in self.config.agents:
-            await self.broker.handle(LaunchAgent(agent_id=agent.agent_id))
-        if self.config.agents:
-            await self.select_agent(self.config.agents[0].agent_id)
-        self.run_worker(self._consume_broker_events(), exit_on_error=False, name="broker-consumer")
+        if self._restore_mode:
+            self.run_worker(self._consume_broker_events(), exit_on_error=False, name="broker-consumer")
+            self._do_restore(from_startup=True)
+        else:
+            for agent in self.config.agents:
+                await self.broker.handle(LaunchAgent(agent_id=agent.agent_id))
+            if self.config.agents:
+                await self.select_agent(self.config.agents[0].agent_id)
+            self.run_worker(self._consume_broker_events(), exit_on_error=False, name="broker-consumer")
 
     async def _consume_broker_events(self) -> None:
         """Consume broker events and post them as Textual messages."""
@@ -560,6 +567,31 @@ class SynthApp(App):
                 log.debug("Failed to add tile for %s", result.agent_id, exc_info=True)
             await self.select_agent(result.agent_id)
             await self.broker.handle(LaunchAgent(agent_id=result.agent_id, config=result))
+
+    @work
+    async def action_restore(self) -> None:
+        """Open the session picker modal (ctrl+r)."""
+        await self._show_session_picker(from_startup=False)
+
+    @work
+    async def _do_restore(self, *, from_startup: bool) -> None:
+        """Worker wrapper for the session picker flow."""
+        await self._show_session_picker(from_startup=from_startup)
+
+    async def _show_session_picker(self, *, from_startup: bool) -> None:
+        """Show the session picker and handle the result."""
+        from synth_acp.models.commands import RestoreSession
+
+        sessions = await ACPBroker.list_restorable_sessions(self.broker._db_path)
+        result = await self.push_screen_wait(SessionPickerScreen(sessions))
+        if result is not None:
+            await self.broker.handle(RestoreSession(broker_session_id=result))
+        elif from_startup:
+            # Cancelled at startup — fall through to normal launch
+            for agent in self.config.agents:
+                await self.broker.handle(LaunchAgent(agent_id=agent.agent_id))
+            if self.config.agents:
+                await self.select_agent(self.config.agents[0].agent_id)
 
     async def action_help(self) -> None:
         """Open the help modal showing key bindings and usage."""

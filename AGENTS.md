@@ -139,6 +139,28 @@ uv run pytest -q --tb=short --no-header -rF     # Quick summary
 uv run pytest --co                                # List collected tests (dry run)
 ```
 
+### aiosqlite / MessageBus cleanup
+
+Any test that triggers `broker.handle(LaunchAgent(...))` or calls
+`broker._start_message_bus()` **must** stop the bus and close the lifecycle DB
+in a `finally` block — otherwise the aiosqlite background thread and the Unix
+socket server keep the event loop alive and the test hangs indefinitely:
+
+```python
+try:
+    await broker.handle(LaunchAgent(agent_id="agent-1"))
+    # ... assertions ...
+finally:
+    if broker._message_bus:
+        await broker._message_bus.stop()
+    if broker._lifecycle:
+        await broker._lifecycle.close_db()
+```
+
+Never open synchronous `sqlite3` connections in `__init__` or other sync code paths
+that run during test setup — use lazy async initialization instead. Sync SQLite with
+WAL mode can deadlock against aiosqlite connections to the same database.
+
 ## Tooling
 
 | Tool | Purpose | Command |

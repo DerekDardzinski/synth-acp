@@ -433,18 +433,19 @@ _STYLE_CSS = {
 }
 
 
-def _run_tui(config: SessionConfig, style: str = "default") -> None:
+def _run_tui(config: SessionConfig, style: str = "default", restore: bool = False) -> None:
     """Launch the Textual TUI.
 
     Args:
         config: Resolved session configuration.
         style: CSS style variant name.
+        restore: Whether to show the session picker on startup.
     """
     from synth_acp.ui.app import SynthApp
 
     broker = ACPBroker(config)
     css_path = _STYLE_CSS.get(style, _STYLE_CSS["default"])
-    SynthApp(broker, config, css_path=css_path).run()
+    SynthApp(broker, config, css_path=css_path, restore=restore).run()
 
 
 # ------------------------------------------------------------------
@@ -459,6 +460,7 @@ def cli(
     config: Path | None = typer.Option(None, "-c", "--config", help="Path to config file"),
     headless: bool = typer.Option(False, help="Run without TUI (stdin/stdout mode)"),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Enable debug logging"),
+    restore: bool = typer.Option(False, "-r", "--restore", help="Restore a previous session"),
     style: str = typer.Option(
         "default",
         "-s",
@@ -481,9 +483,12 @@ def cli(
     resolved = _resolve_config(harness, agent, config, headless)
 
     if headless:
+        if restore:
+            print("Session restore requires TUI mode.", file=sys.stderr)
+            raise typer.Exit(1)
         asyncio.run(_run(resolved))
     else:
-        _run_tui(resolved, style=style)
+        _run_tui(resolved, style=style, restore=restore)
 
 
 main = app

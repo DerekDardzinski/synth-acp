@@ -173,6 +173,7 @@ class ACPSession:
         self._unsubscribe: Callable[[], None] = self._accumulator.subscribe(self._on_snapshot)
         self._terminals: dict[str, TerminalProcess] = {}
         self._terminal_count: int = 0
+        self._on_session_created: Callable[[str, str], Awaitable[None]] | None = None
 
     @property
     def state(self) -> AgentState:
@@ -197,6 +198,12 @@ class ACPSession:
             AgentStateChanged(agent_id=self.agent_id, old_state=old, new_state=new)
         )
 
+    def set_session_created_callback(
+        self, cb: Callable[[str, str], Awaitable[None]] | None
+    ) -> None:
+        """Register a callback invoked after new_session() returns."""
+        self._on_session_created = cb
+
     async def run(self) -> None:
         """Main lifecycle — spawns agent, handshakes, waits for exit."""
         try:
@@ -219,6 +226,9 @@ class ACPSession:
                 self._capabilities = getattr(init_response, "agent_capabilities", None)
                 session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers)
                 self._session_id = session.session_id
+
+                if self._on_session_created:
+                    await self._on_session_created(self.agent_id, session.session_id)
 
                 # Capture modes
                 if session.modes is not None:
@@ -312,6 +322,113 @@ class ACPSession:
             log.error("Session %s raised unexpectedly", self.agent_id, exc_info=True)
             await self._event_sink(BrokerError(agent_id=self.agent_id, message=f"Agent error: {e}"))
 
+        finally:
+            for t in self._terminals.values():
+                t.kill()
+            for fut in self._permission_futures.values():
+                if not fut.done():
+                    fut.cancel()
+            self._permission_futures.clear()
+            self._unsubscribe()
+            await self._sm.force_terminal()
+
+    async def run_restored(self, saved_acp_session_id: str) -> None:
+        """Restore a previous ACP session instead of creating a new one."""
+        try:
+            await self._sm.transition(AgentState.INITIALIZING)
+            async with _spawn_isolated_agent(self, self._binary, *self._args, cwd=self._cwd) as (
+                conn,
+                proc,
+            ):
+                self._conn = conn
+                self._proc = proc
+
+                init_response = await conn.initialize(
+                    protocol_version=1,
+                    client_capabilities=ClientCapabilities(
+                        fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
+                        terminal=True,
+                    ),
+                    client_info=Implementation(name="synth", version="0.1.0"),
+                )
+                self._capabilities = getattr(init_response, "agent_capabilities", None)
+
+                # Try load_session; fall back to new_session on failure.
+                try:
+                    session = await conn.load_session(
+                        session_id=saved_acp_session_id,
+                        cwd=self._cwd,
+                        mcp_servers=self._mcp_servers,
+                    )
+                    self._session_id = saved_acp_session_id
+                except Exception as exc:
+                    log.warning(
+                        "load_session failed for %s (session %s), falling back to new_session: %s",
+                        self.agent_id,
+                        saved_acp_session_id,
+                        exc,
+                    )
+                    await self._event_sink(
+                        BrokerError(
+                            agent_id=self.agent_id,
+                            message=f"Failed to restore session, starting fresh: {exc}",
+                            severity="warning",
+                        )
+                    )
+                    session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers)
+                    self._session_id = session.session_id
+
+                # Capture modes
+                if session.modes is not None:
+                    self._available_modes = [
+                        AgentMode(
+                            id=m.id,
+                            name=m.name,
+                            description=getattr(m, "description", None),
+                        )
+                        for m in session.modes.available_modes
+                    ]
+                    self._current_mode_id = session.modes.current_mode_id
+                    await self._event_sink(
+                        AgentModesReceived(
+                            agent_id=self.agent_id,
+                            available_modes=self._available_modes,
+                            current_mode_id=self._current_mode_id,
+                        )
+                    )
+
+                # Capture models
+                if session.models is not None:
+                    self._available_models = [
+                        AgentModel(
+                            id=m.model_id,
+                            name=m.name,
+                            description=getattr(m, "description", None),
+                        )
+                        for m in session.models.available_models
+                    ]
+                    self._current_model_id = session.models.current_model_id
+                    await self._event_sink(
+                        AgentModelsReceived(
+                            agent_id=self.agent_id,
+                            available_models=self._available_models,
+                            current_model_id=self._current_model_id,
+                        )
+                    )
+
+                await self._sm.transition(AgentState.IDLE)
+                await proc.wait()
+        except InvalidTransitionError as e:
+            log.error("Invalid state transition in session %s: %s", self.agent_id, e, exc_info=True)
+            await self._event_sink(
+                BrokerError(agent_id=self.agent_id, message=f"Internal state error: {e}", severity="error")
+            )
+        except asyncio.CancelledError:
+            log.debug("Session %s cancelled", self.agent_id)
+            raise
+        except Exception as e:
+            log.error("Session %s raised unexpectedly", self.agent_id, exc_info=True)
+            await self._event_sink(BrokerError(agent_id=self.agent_id, message=f"Agent error: {e}"))
         finally:
             for t in self._terminals.values():
                 t.kill()

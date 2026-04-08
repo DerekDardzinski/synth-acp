@@ -16,7 +16,7 @@ from acp.schema import EnvVariable, McpServerStdio
 
 from synth_acp.acp.session import ACPSession
 from synth_acp.broker.registry import AgentRegistry
-from synth_acp.db import ensure_schema_async
+from synth_acp.db import ensure_schema_async, expire_old_sessions_async
 from synth_acp.harnesses import load_harness_registry
 from synth_acp.models.agent import AgentConfig, AgentState
 from synth_acp.models.config import MessageHook, SessionConfig, render_template
@@ -149,6 +149,7 @@ class AgentLifecycle:
             mcp_servers=mcp_servers,
             agent_mode=agent_cfg.agent_mode,
         )
+        session.set_session_created_callback(self._on_acp_session_created)
         self._registry.register(agent_id, session)
         self._registry.set_harness(agent_id, agent_cfg.harness)
         self._tasks[agent_id] = self._make_run_task(agent_id, session)
@@ -158,9 +159,10 @@ class AgentLifecycle:
             await ensure_schema_async(db)
             now = int(time.time() * 1000)
             await db.execute(
-                "INSERT OR REPLACE INTO agents (agent_id, session_id, status, registered) "
-                "VALUES (?, ?, 'active', ?)",
-                (agent_id, self._session_id, now),
+                "INSERT OR REPLACE INTO agents "
+                "(agent_id, session_id, status, registered, harness, agent_mode, cwd) "
+                "VALUES (?, ?, 'active', ?, ?, ?, ?)",
+                (agent_id, self._session_id, now, agent_cfg.harness, agent_cfg.agent_mode, agent_cfg.cwd),
             )
             await db.commit()
 
@@ -306,9 +308,10 @@ class AgentLifecycle:
         db = await self._ensure_db()
         now = int(time.time() * 1000)
         await db.execute(
-            "INSERT OR REPLACE INTO agents (agent_id, session_id, status, registered, parent, task) "
-            "VALUES (?, ?, 'active', ?, ?, ?)",
-            (agent_id, self._session_id, now, from_agent, task),
+            "INSERT OR REPLACE INTO agents "
+            "(agent_id, session_id, status, registered, parent, task, harness, agent_mode, cwd) "
+            "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+            (agent_id, self._session_id, now, from_agent, task, harness, agent_mode, cwd),
         )
         await db.commit()
 
@@ -332,6 +335,7 @@ class AgentLifecycle:
             mcp_servers=mcp_servers,
             agent_mode=agent_cfg.agent_mode,
         )
+        session.set_session_created_callback(self._on_acp_session_created)
         self._registry.register(agent_id, session)
         self._tasks[agent_id] = self._make_run_task(agent_id, session)
         self._first_prompted.add(agent_id)
@@ -398,6 +402,74 @@ class AgentLifecycle:
         if self._tasks:
             await asyncio.wait(self._tasks.values(), timeout=2.0)
 
+    async def _on_acp_session_created(self, agent_id: str, acp_session_id: str) -> None:
+        """Write back the ACP session ID after the agent process creates it."""
+        db = await self._ensure_db()
+        await db.execute(
+            "UPDATE agents SET acp_session_id = ? WHERE agent_id = ? AND session_id = ?",
+            (acp_session_id, agent_id, self._session_id),
+        )
+        await db.commit()
+
+    async def restore(
+        self,
+        agent_id: str,
+        acp_session_id: str | None,
+        harness: str,
+        agent_mode: str | None,
+        cwd: str,
+        parent: str | None,
+    ) -> None:
+        """Restore a previously-running agent from saved state (no SQLite insert)."""
+        entry = next((e for e in self._harness_registry if e.short_name == harness), None)
+        if not entry:
+            await self._sink(
+                BrokerError(agent_id=agent_id, message=f"Cannot restore: unknown harness '{harness}'")
+            )
+            return
+
+        cmd = entry.run_cmd.split()
+        agent_cfg = AgentConfig(agent_id=agent_id, harness=harness, agent_mode=agent_mode, cwd=cwd)
+        mcp_servers = [
+            McpServerStdio(
+                name="synth-mcp",
+                command="synth-mcp",
+                args=[],
+                env=self._build_mcp_env(agent_id, agent_cfg.env),
+            )
+        ]
+
+        session = ACPSession(
+            agent_id=agent_id,
+            binary=cmd[0],
+            args=cmd[1:],
+            cwd=cwd,
+            event_sink=self._sink,
+            mcp_servers=mcp_servers,
+            agent_mode=agent_mode,
+        )
+        self._registry.register(agent_id, session)
+        if parent:
+            self._registry.set_parent(agent_id, parent)
+        self._registry.set_harness(agent_id, harness)
+
+        # No ACP session ID means the agent never had a conversation — launch fresh.
+        if acp_session_id:
+            coro = session.run_restored(acp_session_id)
+        else:
+            session.set_session_created_callback(self._on_acp_session_created)
+            coro = session.run()
+
+        task = asyncio.create_task(coro, name=f"run-{agent_id}")
+
+        def _on_done(t: asyncio.Task[None]) -> None:
+            self._tasks.pop(agent_id, None)
+            if not t.cancelled() and (exc := t.exception()):
+                log.error("session.run_restored() for %s raised", agent_id, exc_info=exc)
+
+        task.add_done_callback(_on_done)
+        self._tasks[agent_id] = task
+
     async def _ensure_db(self) -> aiosqlite.Connection:
         if self._db is None:
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -410,6 +482,11 @@ class AgentLifecycle:
             await self._db.close()
             self._db = None
 
+    async def expire_old_sessions(self) -> None:
+        """Remove restorable sessions older than 30 days."""
+        db = await self._ensure_db()
+        await expire_old_sessions_async(db)
+
     async def register_agents(self) -> None:
         """Pre-register all config agents in SQLite."""
         db = await self._ensure_db()
@@ -417,9 +494,10 @@ class AgentLifecycle:
         now = int(time.time() * 1000)
         for agent in self._config.agents:
             await db.execute(
-                "INSERT OR REPLACE INTO agents (agent_id, session_id, status, registered) "
-                "VALUES (?, ?, 'active', ?)",
-                (agent.agent_id, self._session_id, now),
+                "INSERT OR REPLACE INTO agents "
+                "(agent_id, session_id, status, registered, harness, agent_mode, cwd) "
+                "VALUES (?, ?, 'active', ?, ?, ?, ?)",
+                (agent.agent_id, self._session_id, now, agent.harness, agent.agent_mode, agent.cwd),
             )
         await db.commit()
 

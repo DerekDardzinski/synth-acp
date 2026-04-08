@@ -9,16 +9,20 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import aiosqlite
+
 from synth_acp.broker.lifecycle import AgentLifecycle
 from synth_acp.broker.message_bus import MessageBus
 from synth_acp.broker.permissions import PermissionEngine
 from synth_acp.broker.registry import AgentRegistry
+from synth_acp.db import ensure_schema_async
 from synth_acp.models.agent import AgentConfig, AgentMode, AgentModel, AgentState
 from synth_acp.models.commands import (
     BrokerCommand,
     CancelTurn,
     LaunchAgent,
     RespondPermission,
+    RestoreSession,
     SendPrompt,
     SetAgentMode,
     SetAgentModel,
@@ -67,6 +71,7 @@ class ACPBroker:
         self._registry = AgentRegistry(config)
         self._message_bus: MessageBus | None = None
         self._lifecycle: AgentLifecycle | None = None
+        self._expired: bool = False
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -91,6 +96,8 @@ class ACPBroker:
                 await lifecycle.set_mode(aid, mid)
             case SetAgentModel(agent_id=aid, model_id=mid):
                 await lifecycle.set_model(aid, mid)
+            case RestoreSession(broker_session_id=sid):
+                await self.restore_session(sid)
 
     # ------------------------------------------------------------------
     # State queries (thin delegations to registry)
@@ -132,6 +139,74 @@ class ACPBroker:
         if not counter or counter[1] <= 1:
             return ""
         return f"{counter[0]} of {counter[1]}"
+
+    # ------------------------------------------------------------------
+    # Session restore
+    # ------------------------------------------------------------------
+
+    async def restore_session(self, broker_session_id: str) -> None:
+        """Restore agents from a previous session."""
+        self._session_id = broker_session_id
+        self._permission_engine._session_id = broker_session_id
+
+        db = await aiosqlite.connect(self._db_path)
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute("PRAGMA journal_mode=WAL")
+            cursor = await db.execute(
+                "SELECT agent_id, acp_session_id, harness, agent_mode, cwd, parent "
+                "FROM agents WHERE session_id = ? AND status = 'restorable' "
+                "ORDER BY parent NULLS FIRST",
+                (broker_session_id,),
+            )
+            rows = await cursor.fetchall()
+            await db.execute(
+                "UPDATE agents SET status = 'active' WHERE session_id = ? AND status = 'restorable'",
+                (broker_session_id,),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        # Start message bus without register_agents — rows already exist in SQLite.
+        await self._start_message_bus(skip_register=True)
+        lifecycle = await self._ensure_lifecycle()
+
+        for row in rows:
+            await lifecycle.restore(
+                agent_id=row["agent_id"],
+                acp_session_id=row["acp_session_id"],
+                harness=row["harness"],
+                agent_mode=row["agent_mode"],
+                cwd=row["cwd"],
+                parent=row["parent"],
+            )
+            if row["parent"]:
+                self._registry.set_parent(row["agent_id"], row["parent"])
+
+    @staticmethod
+    async def list_restorable_sessions(db_path: Path) -> list[dict]:
+        """Return restorable sessions grouped by session_id."""
+        db = await aiosqlite.connect(db_path)
+        try:
+            cursor = await db.execute(
+                "SELECT session_id, GROUP_CONCAT(agent_id) as agents, "
+                "MAX(registered) as last_active, COUNT(*) as agent_count "
+                "FROM agents WHERE status = 'restorable' "
+                "GROUP BY session_id ORDER BY MAX(registered) DESC"
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "session_id": r[0],
+                    "agents": r[1].split(","),
+                    "last_active": r[2],
+                    "agent_count": r[3],
+                }
+                for r in rows
+            ]
+        finally:
+            await db.close()
 
     # ------------------------------------------------------------------
     # Event sink with permission interception + backpressure
@@ -348,10 +423,18 @@ class ACPBroker:
             )
         return self._lifecycle
 
-    async def _start_message_bus(self) -> None:
+    async def _start_message_bus(self, *, skip_register: bool = False) -> None:
         if self._message_bus is None:
             lifecycle = await self._ensure_lifecycle()
-            await lifecycle.register_agents()
+            if skip_register:
+                # Schema must exist for the message bus even without registration.
+                db = await lifecycle._ensure_db()
+                await ensure_schema_async(db)
+            else:
+                await lifecycle.register_agents()
+            if not self._expired:
+                self._expired = True
+                await lifecycle.expire_old_sessions()
             self._message_bus = MessageBus(
                 self._db_path, self._session_id, self._deliver_message, self._process_commands
             )
@@ -422,6 +505,26 @@ class ACPBroker:
         if self._lifecycle:
             await self._lifecycle.close_db()
 
+        # Mark terminated agents as restorable in SQLite
+        terminated_ids = [
+            aid
+            for aid, s in self._registry.all_sessions().items()
+            if s.session_id and s.state == AgentState.TERMINATED
+        ]
+        if terminated_ids:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            db = await aiosqlite.connect(self._db_path)
+            try:
+                await db.execute(
+                    f"UPDATE agents SET status = 'restorable' WHERE session_id = ? "
+                    f"AND agent_id IN ({','.join('?' * len(terminated_ids))})",
+                    (self._session_id, *terminated_ids),
+                )
+                await db.commit()
+            finally:
+                await db.close()
+
+        # Backward-compat sessions.json
         sessions_path = Path.home() / ".synth" / "sessions.json"
         sessions_path.parent.mkdir(parents=True, exist_ok=True)
         session_ids = {

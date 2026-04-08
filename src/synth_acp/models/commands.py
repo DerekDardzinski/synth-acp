@@ -68,3 +68,9 @@ class SetAgentModel(BrokerCommand):
 
     agent_id: str
     model_id: str
+
+
+class RestoreSession(BrokerCommand):
+    """Restore a previously saved SYNTH session."""
+
+    broker_session_id: str
