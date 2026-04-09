@@ -403,11 +403,31 @@ class AgentLifecycle:
             await asyncio.wait(self._tasks.values(), timeout=2.0)
 
     async def _on_acp_session_created(self, agent_id: str, acp_session_id: str) -> None:
-        """Write back the ACP session ID after the agent process creates it."""
+        """Write back the ACP session ID after the agent process creates it.
+
+        Also transitions status from 'restorable' to 'active' at this point,
+        so only fully-connected agents are considered active.
+        """
         db = await self._ensure_db()
         await db.execute(
-            "UPDATE agents SET acp_session_id = ? WHERE agent_id = ? AND session_id = ?",
+            "UPDATE agents SET acp_session_id = ?, status = 'active' "
+            "WHERE agent_id = ? AND session_id = ?",
             (acp_session_id, agent_id, self._session_id),
+        )
+        await db.commit()
+
+    async def mark_agents_restorable(self) -> None:
+        """Mark all active agents in this session as restorable.
+
+        Called during broker shutdown before close_db(). Uses the DB directly
+        rather than the in-memory registry, which may be incomplete if agents
+        were still initialising when shutdown was triggered.
+        """
+        db = await self._ensure_db()
+        await db.execute(
+            "UPDATE agents SET status = 'restorable' "
+            "WHERE session_id = ? AND status = 'active' AND acp_session_id IS NOT NULL",
+            (self._session_id,),
         )
         await db.commit()
 
@@ -453,11 +473,17 @@ class AgentLifecycle:
             self._registry.set_parent(agent_id, parent)
         self._registry.set_harness(agent_id, harness)
 
+        # Always register the session-created callback on both branches.
+        session.set_session_created_callback(self._on_acp_session_created)
+
+        # Suppress on_agent_startup hook — restored agents already have
+        # orchestration context from their prior conversation history.
+        self._first_prompted.add(agent_id)
+
         # No ACP session ID means the agent never had a conversation — launch fresh.
         if acp_session_id:
             coro = session.run_restored(acp_session_id)
         else:
-            session.set_session_created_callback(self._on_acp_session_created)
             coro = session.run()
 
         task = asyncio.create_task(coro, name=f"run-{agent_id}")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -38,7 +39,9 @@ from synth_acp.models.events import (
     MessageChunkReceived,
     PermissionAutoResolved,
     PermissionRequested,
+    SessionRestoreComplete,
     UsageUpdated,
+    UserPromptSubmitted,
 )
 from synth_acp.models.permissions import PermissionDecision, PermissionRule
 
@@ -72,6 +75,7 @@ class ACPBroker:
         self._message_bus: MessageBus | None = None
         self._lifecycle: AgentLifecycle | None = None
         self._expired: bool = False
+        self._journal_seq: dict[str, int] = {}  # agent_id → next sequence number
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -87,6 +91,7 @@ class ACPBroker:
             case TerminateAgent(agent_id=aid):
                 await lifecycle.terminate(aid)
             case SendPrompt(agent_id=aid, text=text):
+                await self._sink(UserPromptSubmitted(agent_id=aid, text=text))
                 await lifecycle.prompt(aid, text)
             case RespondPermission(agent_id=aid, request_id=rid, option_id=oid):
                 await self._resolve_permission(aid, rid, oid)
@@ -148,6 +153,10 @@ class ACPBroker:
         """Restore agents from a previous session."""
         self._session_id = broker_session_id
         self._permission_engine._session_id = broker_session_id
+        # Sync an already-constructed lifecycle so its DB writes use the restored
+        # session_id rather than the ephemeral one captured at construction.
+        if self._lifecycle is not None:
+            self._lifecycle._session_id = broker_session_id
 
         db = await aiosqlite.connect(self._db_path)
         db.row_factory = aiosqlite.Row
@@ -160,11 +169,6 @@ class ACPBroker:
                 (broker_session_id,),
             )
             rows = await cursor.fetchall()
-            await db.execute(
-                "UPDATE agents SET status = 'active' WHERE session_id = ? AND status = 'restorable'",
-                (broker_session_id,),
-            )
-            await db.commit()
         finally:
             await db.close()
 
@@ -184,29 +188,51 @@ class ACPBroker:
             if row["parent"]:
                 self._registry.set_parent(row["agent_id"], row["parent"])
 
+        # Initialize journal seq counters from existing DB state so new
+        # events don't collide with the original session's journal entries.
+        try:
+            db = await aiosqlite.connect(self._db_path)
+            try:
+                await db.execute("PRAGMA journal_mode=WAL")
+                cursor = await db.execute(
+                    "SELECT agent_id, MAX(seq) FROM ui_events "
+                    "WHERE session_id = ? GROUP BY agent_id",
+                    (broker_session_id,),
+                )
+                for aid, max_seq in await cursor.fetchall():
+                    self._journal_seq[aid] = max_seq + 1
+            finally:
+                await db.close()
+        except Exception:
+            log.debug("Failed to init journal seq counters", exc_info=True)
+
     @staticmethod
     async def list_restorable_sessions(db_path: Path) -> list[dict]:
         """Return restorable sessions grouped by session_id."""
-        db = await aiosqlite.connect(db_path)
         try:
-            cursor = await db.execute(
-                "SELECT session_id, GROUP_CONCAT(agent_id) as agents, "
-                "MAX(registered) as last_active, COUNT(*) as agent_count "
-                "FROM agents WHERE status = 'restorable' "
-                "GROUP BY session_id ORDER BY MAX(registered) DESC"
-            )
-            rows = await cursor.fetchall()
-            return [
-                {
-                    "session_id": r[0],
-                    "agents": r[1].split(","),
-                    "last_active": r[2],
-                    "agent_count": r[3],
-                }
-                for r in rows
-            ]
-        finally:
-            await db.close()
+            db = await aiosqlite.connect(db_path)
+            try:
+                await db.execute("PRAGMA journal_mode=WAL")
+                cursor = await db.execute(
+                    "SELECT session_id, GROUP_CONCAT(agent_id) as agents, "
+                    "MAX(registered) as last_active, COUNT(*) as agent_count "
+                    "FROM agents WHERE status = 'restorable' "
+                    "GROUP BY session_id ORDER BY MAX(registered) DESC"
+                )
+                rows = await cursor.fetchall()
+                return [
+                    {
+                        "session_id": r[0],
+                        "agents": r[1].split(","),
+                        "last_active": r[2],
+                        "agent_count": r[3],
+                    }
+                    for r in rows
+                ]
+            finally:
+                await db.close()
+        except Exception:
+            return []
 
     # ------------------------------------------------------------------
     # Event sink with permission interception + backpressure
@@ -269,6 +295,9 @@ class ACPBroker:
         else:
             await self._event_queue.put(event)
 
+        # Journal UI-visible events for session restore.
+        await self._journal_event(event)
+
         if isinstance(event, AgentStateChanged) and event.new_state == AgentState.IDLE:
             if self._message_bus and self._lifecycle:
                 pending = self._message_bus.pop_pending(event.agent_id)
@@ -276,17 +305,89 @@ class ACPBroker:
                     original = self._registry.pop_initial_message(event.agent_id)
                     if original:
                         parent = self._registry.get_parent(event.agent_id)
-                        await self._event_queue.put(
+                        await self._sink(
                             InitialPromptDelivered(
                                 agent_id=event.agent_id,
                                 from_agent=parent or "system",
                                 text=original,
                             )
                         )
-                        await self._event_queue.put(
+                        await self._sink(
                             HookFired(agent_id=event.agent_id, hook_name="on_agent_prompt")
                         )
                     await self._lifecycle.prompt(event.agent_id, pending)
+
+    # ------------------------------------------------------------------
+    # Event journal for session restore
+    # ------------------------------------------------------------------
+
+    _JOURNALABLE = frozenset({
+        "MessageChunkReceived",
+        "AgentThoughtReceived",
+        "ToolCallUpdated",
+        "TurnComplete",
+        "HookFired",
+        "InitialPromptDelivered",
+        "McpMessageDelivered",
+        "PlanReceived",
+        "UserPromptSubmitted",
+    })
+
+    async def _journal_event(self, event: BrokerEvent) -> None:
+        """Persist a UI-visible event to the journal table."""
+        event_type = type(event).__name__
+        if event_type not in self._JOURNALABLE:
+            return
+        if self._lifecycle is None or self._lifecycle._db is None:
+            return
+        try:
+            db = self._lifecycle._db
+            seq = self._journal_seq.get(event.agent_id, 0)
+            self._journal_seq[event.agent_id] = seq + 1
+            now = int(time.time() * 1000)
+            payload = event.model_dump_json()
+            await db.execute(
+                "INSERT INTO ui_events (session_id, agent_id, seq, event_type, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (self._session_id, event.agent_id, seq, event_type, payload, now),
+            )
+            await db.commit()
+        except Exception:
+            log.debug("Failed to journal event %s for %s", event_type, event.agent_id, exc_info=True)
+
+    async def load_journal(self, agent_id: str, session_id: str) -> list[BrokerEvent]:
+        """Load journaled events for an agent from SQLite.
+
+        Returns deserialized BrokerEvent objects in sequence order.
+        The caller decides how to deliver them (buffer, queue, etc.).
+        """
+        from synth_acp.models import events as ev
+
+        result: list[BrokerEvent] = []
+        try:
+            db = await aiosqlite.connect(self._db_path)
+            try:
+                await db.execute("PRAGMA journal_mode=WAL")
+                cursor = await db.execute(
+                    "SELECT event_type, payload FROM ui_events "
+                    "WHERE session_id = ? AND agent_id = ? ORDER BY seq",
+                    (session_id, agent_id),
+                )
+                rows = await cursor.fetchall()
+            finally:
+                await db.close()
+
+            for event_type, payload in rows:
+                cls = getattr(ev, event_type, None)
+                if cls is None:
+                    continue
+                try:
+                    result.append(cls.model_validate_json(payload))
+                except Exception:
+                    log.debug("Failed to deserialize journal event %s", event_type, exc_info=True)
+        except Exception:
+            log.debug("Journal load failed for %s", agent_id, exc_info=True)
+        return result
 
     @staticmethod
     def _find_option_id(options: list, decision: PermissionDecision) -> str | None:
@@ -466,7 +567,7 @@ class ACPBroker:
             return False
         try:
             for sender in from_agents:
-                await self._event_queue.put(
+                await self._sink(
                     McpMessageDelivered(agent_id=agent_id, from_agent=sender, to_agent=agent_id, preview=text)
                 )
             if self._lifecycle:
@@ -499,30 +600,15 @@ class ACPBroker:
         if self._lifecycle:
             await self._lifecycle.shutdown()
 
+        # Mark active agents restorable BEFORE closing the DB connection.
+        if self._lifecycle:
+            await self._lifecycle.mark_agents_restorable()
+
         if self._message_bus:
             await self._message_bus.stop()
 
         if self._lifecycle:
             await self._lifecycle.close_db()
-
-        # Mark terminated agents as restorable in SQLite
-        terminated_ids = [
-            aid
-            for aid, s in self._registry.all_sessions().items()
-            if s.session_id and s.state == AgentState.TERMINATED
-        ]
-        if terminated_ids:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            db = await aiosqlite.connect(self._db_path)
-            try:
-                await db.execute(
-                    f"UPDATE agents SET status = 'restorable' WHERE session_id = ? "
-                    f"AND agent_id IN ({','.join('?' * len(terminated_ids))})",
-                    (self._session_id, *terminated_ids),
-                )
-                await db.commit()
-            finally:
-                await db.close()
 
         # Backward-compat sessions.json
         sessions_path = Path.home() / ".synth" / "sessions.json"

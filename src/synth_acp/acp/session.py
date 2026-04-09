@@ -333,7 +333,23 @@ class ACPSession:
             await self._sm.force_terminal()
 
     async def run_restored(self, saved_acp_session_id: str) -> None:
-        """Restore a previous ACP session instead of creating a new one."""
+        """Restore a previous ACP session instead of creating a new one.
+
+        Key invariant: self._session_id MUST be set before load_session is
+        called.  The ACP SDK fires session_update notifications during the
+        load_session await, and session_update drops any notification whose
+        session_id does not match self._session_id.  Setting it after the
+        call means all history notifications are silently discarded and the
+        accumulator stays empty.
+
+        We set _suppress_history_replay=True so _on_snapshot skips emitting
+        per-notification events while the accumulator collects the full
+        history silently.  The broker replays the UI event journal separately.
+
+        If load_session fails (e.g. the agent has no history for that
+        session ID), we fall back to new_session and invoke
+        _on_session_created so the fresh acp_session_id is persisted to DB.
+        """
         try:
             await self._sm.transition(AgentState.INITIALIZING)
             async with _spawn_isolated_agent(self, self._binary, *self._args, cwd=self._cwd) as (
@@ -353,14 +369,16 @@ class ACPSession:
                 )
                 self._capabilities = getattr(init_response, "agent_capabilities", None)
 
-                # Try load_session; fall back to new_session on failure.
+                # CRITICAL: assign session_id BEFORE calling load_session.
+                self._session_id = saved_acp_session_id
+
+                self._suppress_history_replay = True
                 try:
                     session = await conn.load_session(
                         session_id=saved_acp_session_id,
                         cwd=self._cwd,
                         mcp_servers=self._mcp_servers,
                     )
-                    self._session_id = saved_acp_session_id
                 except Exception as exc:
                     log.warning(
                         "load_session failed for %s (session %s), falling back to new_session: %s",
@@ -375,8 +393,19 @@ class ACPSession:
                             severity="warning",
                         )
                     )
+                    self._accumulator.reset()
                     session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers)
                     self._session_id = session.session_id
+                    if self._on_session_created:
+                        await self._on_session_created(self.agent_id, session.session_id)
+                finally:
+                    self._suppress_history_replay = False
+
+                # On the happy path (session_id unchanged), fire the callback
+                # to flip DB status → active. The fallback path already calls
+                # it inside the except block with the new session_id.
+                if self._session_id == saved_acp_session_id and self._on_session_created:
+                    await self._on_session_created(self.agent_id, saved_acp_session_id)
 
                 # Capture modes
                 if session.modes is not None:

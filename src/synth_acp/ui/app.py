@@ -33,10 +33,12 @@ from synth_acp.models.events import (
     MessageChunkReceived,
     PermissionRequested,
     PlanReceived,
+    SessionRestoreComplete,
     TerminalCreated,
     ToolCallUpdated,
     TurnComplete,
     UsageUpdated,
+    UserPromptSubmitted,
 )
 from synth_acp.ui.messages import BrokerEventMessage
 from synth_acp.ui.screens.help import HelpScreen
@@ -174,6 +176,14 @@ class SynthApp(App):
                 self._event_buffers[recipient].append(event)
             return
 
+        # Handle session history restore — render static snapshot into the feed.
+        if isinstance(event, SessionRestoreComplete):
+            if event.agent_id in self._panels:
+                feed = self._panels[event.agent_id]
+                if feed.input_bar is not None:
+                    feed.input_bar.set_busy(False)
+            return
+
         # Buffer events for agents without panels
         if event.agent_id not in self._panels:
             if event.agent_id not in self._event_buffers:
@@ -267,7 +277,8 @@ class SynthApp(App):
             await feed.mount_terminal(event.terminal_id, event.terminal_process)
         elif isinstance(event, TurnComplete):
             await feed.finalize_current_message()
-            feed.input_bar.set_busy(False)
+            if feed.input_bar is not None:
+                feed.input_bar.set_busy(False)
         elif isinstance(event, PlanReceived):
             await feed.update_plan(event.entries)
         elif isinstance(event, AvailableCommandsReceived):
@@ -278,6 +289,8 @@ class SynthApp(App):
         elif isinstance(event, HookFired):
             feed.add_hook_notification(event.hook_name)
         elif isinstance(event, InitialPromptDelivered):
+            feed.add_prompt(event.text)
+        elif isinstance(event, UserPromptSubmitted):
             feed.add_prompt(event.text)
         elif isinstance(event, BrokerError):
             self.notify(event.message, severity=event.severity)
@@ -358,11 +371,19 @@ class SynthApp(App):
             if feed.input_bar is not None:
                 feed.input_bar.update_slash_commands(event.commands)
         elif isinstance(event, McpMessageDelivered):
+            key = tuple(sorted([event.from_agent, event.to_agent]))
+            self._mcp_threads.setdefault(key, []).append(event)  # type: ignore[arg-type]
+            self._mcp_count += 1
             feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
         elif isinstance(event, HookFired):
             feed.add_hook_notification(event.hook_name)
         elif isinstance(event, InitialPromptDelivered):
             feed.add_prompt(event.text)
+        elif isinstance(event, UserPromptSubmitted):
+            feed.add_prompt(event.text)
+        elif isinstance(event, SessionRestoreComplete):
+            if feed.input_bar is not None:
+                feed.input_bar.set_busy(False)
 
     def _update_input_bar_state(self, agent_id: str, state: AgentState) -> None:
         """Update the InputBar disabled state for an agent.
@@ -487,6 +508,12 @@ class SynthApp(App):
             # Push any mode/model data that arrived before the panel existed
             self._update_input_bar_modes(agent_id)
             self._update_input_bar_models(agent_id)
+            # Refresh MCP badge in case replayed events updated the count
+            if self._mcp_count:
+                try:
+                    self.query_one("#mcp-btn", MCPButton).update_count(self._mcp_count)
+                except Exception:
+                    pass
 
         switcher = self.query_one("#right", ContentSwitcher)
         if self.selected_agent == agent_id and switcher.current != f"feed-{agent_id}":
@@ -571,6 +598,13 @@ class SynthApp(App):
     @work
     async def action_restore(self) -> None:
         """Open the session picker modal (ctrl+r)."""
+        active = [
+            aid for aid, state in self._agent_states.items()
+            if state not in (AgentState.TERMINATED,)
+        ]
+        if active:
+            self.notify("Cannot restore while agents are running.", severity="warning")
+            return
         await self._show_session_picker(from_startup=False)
 
     @work
@@ -585,7 +619,38 @@ class SynthApp(App):
         sessions = await ACPBroker.list_restorable_sessions(self.broker._db_path)
         result = await self.push_screen_wait(SessionPickerScreen(sessions))
         if result is not None:
+            # Pre-initialise event buffers for all agents in the restored
+            # session before the broker starts launching them.
+            session_info = next((s for s in sessions if s["session_id"] == result), None)
+            if session_info:
+                for aid in session_info["agents"]:
+                    self._event_buffers.setdefault(aid, [])
+
             await self.broker.handle(RestoreSession(broker_session_id=result))
+
+            # Remove tiles for config agents not in the restored session.
+            if session_info:
+                restored_ids = set(session_info["agents"])
+                for agent in self.config.agents:
+                    if agent.agent_id not in restored_ids:
+                        try:
+                            tile = self.query_one(f"#tile-{agent.agent_id}", AgentTile)
+                            tile.remove()
+                        except Exception:
+                            pass
+
+            # Load journal events into buffers BEFORE creating panels.
+            # select_agent will drain them through _replay_event after
+            # the feed is mounted and its widget tree is ready.
+            if session_info:
+                for aid in session_info["agents"]:
+                    journal = await self.broker.load_journal(aid, result)
+                    self._event_buffers[aid].extend(journal)
+
+            # Select the first restored agent to create its panel and drain
+            # the buffer (which will include journal-replayed events).
+            if session_info and session_info["agents"]:
+                await self.select_agent(session_info["agents"][0])
         elif from_startup:
             # Cancelled at startup — fall through to normal launch
             for agent in self.config.agents:

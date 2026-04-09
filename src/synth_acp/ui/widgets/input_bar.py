@@ -438,10 +438,6 @@ class InputBar(Vertical):
 
         app.run_worker(app.broker.handle(SendPrompt(agent_id=target, text=text)))
 
-        if target in app._panels:
-            feed = app._panels[target]
-            feed.add_prompt(text)
-
     def set_disabled(self, disabled: bool, hint: str) -> None:  # noqa: ARG002
         """Enable or disable the input.
 

@@ -219,6 +219,25 @@ class TerminalCreated(BrokerEvent):
     terminal_process: Any
 
 
+class SessionRestoreComplete(BrokerEvent):
+    """Emitted after the broker finishes replaying the event journal for an agent.
+
+    The UI can use this to dismiss loading indicators. The broker has already
+    pushed all journaled events into the queue before this event.
+    """
+
+
+class UserPromptSubmitted(BrokerEvent):
+    """A user prompt was submitted to an agent.
+
+    Emitted by the broker when it handles SendPrompt, so user messages
+    flow through the same event pipeline as agent responses and get
+    journaled for session restore.
+    """
+
+    text: str
+
+
 type AgentEvent = (
     AgentStateChanged | MessageChunkReceived | ToolCallUpdated | TurnComplete
     | AgentThoughtReceived | PlanReceived | AvailableCommandsReceived | TerminalCreated
@@ -231,6 +250,7 @@ type ConfigEvent = (
 type SystemEvent = (
     BrokerError | PermissionRequested | PermissionAutoResolved
     | UsageUpdated | McpMessageDelivered | HookFired | InitialPromptDelivered
+    | SessionRestoreComplete | UserPromptSubmitted
 )
 
 type BrokerEventUnion = AgentEvent | ConfigEvent | SystemEvent
