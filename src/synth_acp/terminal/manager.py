@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import fcntl
+import logging
 import os
 import pty
 import shlex
@@ -13,6 +14,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
 from synth_acp.terminal.shell_read import shell_read
+
+log = logging.getLogger(__name__)
 
 BUFFER_SIZE = 64 * 1024 * 2
 
@@ -115,7 +118,7 @@ class TerminalProcess:
         try:
             await self._run()
         except Exception:
-            pass
+            log.error("TerminalProcess._run failed", exc_info=True)
         finally:
             self._exit_event.set()
 
@@ -136,11 +139,10 @@ class TerminalProcess:
             run_command = f"{command.command} {shlex.join(command.args)}"
 
         shell = os.environ.get("SHELL", "sh")
-        run_command = shlex.join([shell, "-c", run_command])
 
         try:
-            process = self._process = await asyncio.create_subprocess_shell(
-                run_command,
+            process = self._process = await asyncio.create_subprocess_exec(
+                shell, "-c", run_command,
                 stdin=slave,
                 stdout=slave,
                 stderr=slave,

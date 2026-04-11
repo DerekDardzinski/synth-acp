@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import sqlite3
+import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
-
-import aiosqlite
 
 from synth_acp.broker.lifecycle import AgentLifecycle
 from synth_acp.broker.message_bus import MessageBus
@@ -39,7 +40,6 @@ from synth_acp.models.events import (
     MessageChunkReceived,
     PermissionAutoResolved,
     PermissionRequested,
-    SessionRestoreComplete,
     UsageUpdated,
     UserPromptSubmitted,
 )
@@ -158,68 +158,91 @@ class ACPBroker:
         if self._lifecycle is not None:
             self._lifecycle._session_id = broker_session_id
 
-        db = await aiosqlite.connect(self._db_path)
-        db.row_factory = aiosqlite.Row
-        try:
-            await db.execute("PRAGMA journal_mode=WAL")
-            cursor = await db.execute(
-                "SELECT agent_id, acp_session_id, harness, agent_mode, cwd, parent "
-                "FROM agents WHERE session_id = ? AND status = 'restorable' "
-                "ORDER BY parent NULLS FIRST",
-                (broker_session_id,),
-            )
-            rows = await cursor.fetchall()
-        finally:
-            await db.close()
+        def _query_restorable() -> list[sqlite3.Row]:
+            conn = sqlite3.connect(str(self._db_path))
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                return conn.execute(
+                    "SELECT agent_id, acp_session_id, harness, agent_mode, cwd, parent "
+                    "FROM agents WHERE session_id = ? AND status = 'restorable' "
+                    "ORDER BY parent NULLS FIRST",
+                    (broker_session_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+
+        rows = await asyncio.to_thread(_query_restorable)
+
+        # Agents with an acp_session_id but no journal events have no
+        # conversation history — load_session will fail for them.  Clear
+        # the id so restore() takes the fresh-launch path directly.
+        def _agents_with_history() -> set[str]:
+            conn = sqlite3.connect(str(self._db_path))
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                return {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT DISTINCT agent_id FROM ui_events WHERE session_id = ?",
+                        (broker_session_id,),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+
+        has_history = await asyncio.to_thread(_agents_with_history)
 
         # Start message bus without register_agents — rows already exist in SQLite.
         await self._start_message_bus(skip_register=True)
         lifecycle = await self._ensure_lifecycle()
 
         for row in rows:
+            aid = row["agent_id"]
             await lifecycle.restore(
-                agent_id=row["agent_id"],
-                acp_session_id=row["acp_session_id"],
+                agent_id=aid,
+                acp_session_id=row["acp_session_id"] if aid in has_history else None,
                 harness=row["harness"],
                 agent_mode=row["agent_mode"],
                 cwd=row["cwd"],
                 parent=row["parent"],
             )
             if row["parent"]:
-                self._registry.set_parent(row["agent_id"], row["parent"])
+                self._registry.set_parent(aid, row["parent"])
 
         # Initialize journal seq counters from existing DB state so new
         # events don't collide with the original session's journal entries.
         try:
-            db = await aiosqlite.connect(self._db_path)
-            try:
-                await db.execute("PRAGMA journal_mode=WAL")
-                cursor = await db.execute(
-                    "SELECT agent_id, MAX(seq) FROM ui_events "
-                    "WHERE session_id = ? GROUP BY agent_id",
-                    (broker_session_id,),
-                )
-                for aid, max_seq in await cursor.fetchall():
-                    self._journal_seq[aid] = max_seq + 1
-            finally:
-                await db.close()
+            def _query_journal_seq() -> list[tuple]:
+                conn = sqlite3.connect(str(self._db_path))
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    return conn.execute(
+                        "SELECT agent_id, MAX(seq) FROM ui_events "
+                        "WHERE session_id = ? GROUP BY agent_id",
+                        (broker_session_id,),
+                    ).fetchall()
+                finally:
+                    conn.close()
+
+            for aid, max_seq in await asyncio.to_thread(_query_journal_seq):
+                self._journal_seq[aid] = max_seq + 1
         except Exception:
             log.debug("Failed to init journal seq counters", exc_info=True)
 
     @staticmethod
     async def list_restorable_sessions(db_path: Path) -> list[dict]:
         """Return restorable sessions grouped by session_id."""
-        try:
-            db = await aiosqlite.connect(db_path)
+        def _query() -> list[dict]:
+            conn = sqlite3.connect(str(db_path))
             try:
-                await db.execute("PRAGMA journal_mode=WAL")
-                cursor = await db.execute(
+                conn.execute("PRAGMA journal_mode=WAL")
+                rows = conn.execute(
                     "SELECT session_id, GROUP_CONCAT(agent_id) as agents, "
                     "MAX(registered) as last_active, COUNT(*) as agent_count "
                     "FROM agents WHERE status = 'restorable' "
                     "GROUP BY session_id ORDER BY MAX(registered) DESC"
-                )
-                rows = await cursor.fetchall()
+                ).fetchall()
                 return [
                     {
                         "session_id": r[0],
@@ -230,7 +253,10 @@ class ACPBroker:
                     for r in rows
                 ]
             finally:
-                await db.close()
+                conn.close()
+
+        try:
+            return await asyncio.to_thread(_query)
         except Exception:
             return []
 
@@ -287,11 +313,19 @@ class ACPBroker:
         elif isinstance(event, UsageUpdated):
             self._registry.update_usage(event)
 
+        if isinstance(event, AgentStateChanged) and event.new_state == AgentState.TERMINATED:
+            self._cleanup_agent_state(event.agent_id)
+
         if isinstance(event, MessageChunkReceived):
             try:
                 self._event_queue.put_nowait(event)
             except asyncio.QueueFull:
                 log.debug("Event queue full, dropping chunk for %s", event.agent_id)
+        elif self._shutting_down:
+            try:
+                self._event_queue.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
         else:
             await self._event_queue.put(event)
 
@@ -316,6 +350,20 @@ class ACPBroker:
                             HookFired(agent_id=event.agent_id, hook_name="on_agent_prompt")
                         )
                     await self._lifecycle.prompt(event.agent_id, pending)
+
+    # ------------------------------------------------------------------
+    # Agent state cleanup
+    # ------------------------------------------------------------------
+
+    def _cleanup_agent_state(self, agent_id: str) -> None:
+        """Remove accumulated per-agent state for a terminated agent."""
+        self._pending_permissions = {
+            k: v for k, v in self._pending_permissions.items() if v.agent_id != agent_id
+        }
+        self._active_permission.pop(agent_id, None)
+        self._permission_queue.pop(agent_id, None)
+        self._permission_counter.pop(agent_id, None)
+        self._journal_seq.pop(agent_id, None)
 
     # ------------------------------------------------------------------
     # Event journal for session restore
@@ -365,17 +413,19 @@ class ACPBroker:
 
         result: list[BrokerEvent] = []
         try:
-            db = await aiosqlite.connect(self._db_path)
-            try:
-                await db.execute("PRAGMA journal_mode=WAL")
-                cursor = await db.execute(
-                    "SELECT event_type, payload FROM ui_events "
-                    "WHERE session_id = ? AND agent_id = ? ORDER BY seq",
-                    (session_id, agent_id),
-                )
-                rows = await cursor.fetchall()
-            finally:
-                await db.close()
+            def _query() -> list[tuple[str, str]]:
+                conn = sqlite3.connect(str(self._db_path))
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    return conn.execute(
+                        "SELECT event_type, payload FROM ui_events "
+                        "WHERE session_id = ? AND agent_id = ? ORDER BY seq",
+                        (session_id, agent_id),
+                    ).fetchall()
+                finally:
+                    conn.close()
+
+            rows = await asyncio.to_thread(_query)
 
             for event_type, payload in rows:
                 cls = getattr(ev, event_type, None)
@@ -438,7 +488,7 @@ class ACPBroker:
             return
 
         if selected_kind in ("allow_always", "reject_always"):
-            self._permission_engine.persist(
+            await self._permission_engine.persist_async(
                 PermissionRule(
                     agent_id=agent_id,
                     tool_kind=pending.kind,
@@ -612,12 +662,18 @@ class ACPBroker:
 
         # Backward-compat sessions.json
         sessions_path = Path.home() / ".synth" / "sessions.json"
-        sessions_path.parent.mkdir(parents=True, exist_ok=True)
+        sessions_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         session_ids = {
             aid: s.session_id
             for aid, s in self._registry.all_sessions().items()
             if s.session_id and s.state == AgentState.TERMINATED
         }
-        sessions_path.write_text(json.dumps(session_ids))
+        fd, tmp = tempfile.mkstemp(dir=sessions_path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(session_ids, f)
+            Path(tmp).rename(sessions_path)
+        except Exception:
+            Path(tmp).unlink(missing_ok=True)
 
         self._shutdown_event.set()

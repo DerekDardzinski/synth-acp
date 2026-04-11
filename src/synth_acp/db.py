@@ -125,7 +125,7 @@ async def _migrate_schema_async(conn) -> None:
 
 _EXPIRE_SQL = (
     "DELETE FROM agents WHERE status = 'restorable'"
-    " AND registered < strftime('%s', 'now', '-{days} days') * 1000"
+    " AND registered < ?"
 )
 _EXPIRE_ORPHAN_MESSAGES = (
     "DELETE FROM messages WHERE session_id NOT IN (SELECT session_id FROM agents)"
@@ -138,10 +138,16 @@ _EXPIRE_ORPHAN_UI_EVENTS = (
 )
 
 
+def _cutoff_ms(max_age_days: int) -> int:
+    """Return a millisecond timestamp for *max_age_days* ago."""
+    import time
+
+    return int((time.time() - int(max_age_days) * 86400) * 1000)
+
+
 def expire_old_sessions_sync(conn, max_age_days: int = 30) -> None:
     """Delete restorable agents older than *max_age_days* and orphaned rows."""
-    days = int(max_age_days)
-    conn.execute(_EXPIRE_SQL.format(days=days))
+    conn.execute(_EXPIRE_SQL, (_cutoff_ms(max_age_days),))
     conn.execute(_EXPIRE_ORPHAN_MESSAGES)
     conn.execute(_EXPIRE_ORPHAN_COMMANDS)
     conn.execute(_EXPIRE_ORPHAN_UI_EVENTS)
@@ -150,18 +156,8 @@ def expire_old_sessions_sync(conn, max_age_days: int = 30) -> None:
 
 async def expire_old_sessions_async(conn, max_age_days: int = 30) -> None:
     """Async variant of :func:`expire_old_sessions_sync`."""
-    days = int(max_age_days)
-    await conn.execute(
-        "DELETE FROM agents WHERE status = 'restorable'"
-        f" AND registered < strftime('%s', 'now', '-{days} days') * 1000"
-    )
-    await conn.execute(
-        "DELETE FROM messages WHERE session_id NOT IN (SELECT session_id FROM agents)"
-    )
-    await conn.execute(
-        "DELETE FROM agent_commands WHERE session_id NOT IN (SELECT session_id FROM agents)"
-    )
-    await conn.execute(
-        "DELETE FROM ui_events WHERE session_id NOT IN (SELECT session_id FROM agents)"
-    )
+    await conn.execute(_EXPIRE_SQL, (_cutoff_ms(max_age_days),))
+    await conn.execute(_EXPIRE_ORPHAN_MESSAGES)
+    await conn.execute(_EXPIRE_ORPHAN_COMMANDS)
+    await conn.execute(_EXPIRE_ORPHAN_UI_EVENTS)
     await conn.commit()

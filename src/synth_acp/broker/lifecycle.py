@@ -206,6 +206,7 @@ class AgentLifecycle:
             self._config.settings.hooks.on_agent_exit, agent_id, task, parent, "on_agent_exit",
         )
         self._registry.orphan_children(agent_id)
+        self._first_prompted.discard(agent_id)
 
     async def prompt(self, agent_id: str, text: str) -> None:
         """Send a prompt to a running agent."""
@@ -426,7 +427,7 @@ class AgentLifecycle:
         db = await self._ensure_db()
         await db.execute(
             "UPDATE agents SET status = 'restorable' "
-            "WHERE session_id = ? AND status = 'active' AND acp_session_id IS NOT NULL",
+            "WHERE session_id = ? AND status = 'active'",
             (self._session_id,),
         )
         await db.commit()
@@ -498,7 +499,7 @@ class AgentLifecycle:
 
     async def _ensure_db(self) -> aiosqlite.Connection:
         if self._db is None:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             self._db = await aiosqlite.connect(self._db_path)
             await self._db.execute("PRAGMA journal_mode=WAL")
         return self._db

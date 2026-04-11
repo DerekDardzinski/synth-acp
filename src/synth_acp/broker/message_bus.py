@@ -116,7 +116,7 @@ class MessageBus:
             writer.close()
 
     async def _delivery_loop(self) -> None:
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             async with aiosqlite.connect(self._db_path) as db:
                 await ensure_schema_async(db)

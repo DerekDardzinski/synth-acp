@@ -49,10 +49,25 @@ def _get_tool(mcp_server, name: str):
     raise KeyError(f"Tool {name!r} not found")
 
 
+@pytest.fixture()
+async def mcp_factory(db_path: Path):
+    """Yield a factory that creates MCP servers and closes them all after the test."""
+    servers = []
+
+    def _make(db: str | None = None, session: str = "sess-1", agent: str = "agent-a", **kw):
+        s = create_mcp_server(str(db or db_path), session, agent, **kw)
+        servers.append(s)
+        return s
+
+    yield _make
+    for s in servers:
+        await s.close_db()
+
+
 class TestSendMessage:
-    async def test_send_message_when_broadcast_expands_to_individual_rows(self, db_path: Path) -> None:
+    async def test_send_message_when_broadcast_expands_to_individual_rows(self, db_path: Path, mcp_factory) -> None:
         _register_agents(db_path, [("agent-a", None, None), ("agent-b", None, None), ("agent-c", None, None)])
-        server = create_mcp_server(str(db_path), "sess-1", "agent-a")
+        server = mcp_factory()
         send_message = _get_tool(server, "send_message")
 
         result = json.loads(await send_message(to_agent="*", body="hello all"))
@@ -68,9 +83,9 @@ class TestSendMessage:
 
 
 class TestLaunchAgent:
-    async def test_launch_agent_when_called_inserts_pending_command(self, db_path: Path) -> None:
+    async def test_launch_agent_when_called_inserts_pending_command(self, db_path: Path, mcp_factory) -> None:
         _init_schema(db_path)
-        server = create_mcp_server(str(db_path), "sess-1", "agent-a")
+        server = mcp_factory()
         launch_agent = _get_tool(server, "launch_agent")
 
         result = json.loads(
@@ -99,9 +114,9 @@ class TestLaunchAgent:
         assert payload["agent_id"] == "worker-1"
         assert payload["harness"] == "kiro"
 
-    async def test_launch_agent_when_at_capacity_returns_queued(self, db_path: Path) -> None:
+    async def test_launch_agent_when_at_capacity_returns_queued(self, db_path: Path, mcp_factory) -> None:
         _register_agents(db_path, [("agent-a", None, None)])
-        server = create_mcp_server(str(db_path), "sess-1", "agent-a")
+        server = mcp_factory()
         launch_agent = _get_tool(server, "launch_agent")
 
         with patch.dict("os.environ", {"SYNTH_MAX_AGENTS": "1"}):
@@ -114,7 +129,7 @@ class TestLaunchAgent:
 
 class TestListAgents:
     async def test_list_agents_when_agents_have_parent_includes_parent_and_task(
-        self, db_path: Path
+        self, db_path: Path, mcp_factory,
     ) -> None:
         _register_agents(
             db_path,
@@ -125,7 +140,7 @@ class TestListAgents:
                 ("agent-a", None, None),
             ],
         )
-        server = create_mcp_server(str(db_path), "sess-1", "agent-a")
+        server = mcp_factory()
         list_agents = _get_tool(server, "list_agents")
 
         result = json.loads(await list_agents())
@@ -145,14 +160,14 @@ class TestMcpStartupValidation:
         assert exc_info.value.code == 1
 
 class TestMcpConnectionSafety:
-    async def test_send_message_closes_conn_on_visibility_error(self, db_path: Path) -> None:
-        """Connection must close even when _get_visible_agents_async raises."""
+    async def test_send_message_closes_conn_on_visibility_error(self, db_path: Path, mcp_factory) -> None:
+        """Connection must survive when _get_visible_agents_async raises."""
         _register_agents(db_path, [("agent-a", None, None)])
-        server = create_mcp_server(str(db_path), "sess-1", "agent-a")
+        server = mcp_factory()
         send_message = _get_tool(server, "send_message")
 
         with patch(
-            "synth_acp.models.visibility.get_visible_agents",
+            "synth_acp.models.visibility.get_visible_agents_async",
             side_effect=RuntimeError("db corruption"),
         ), pytest.raises(RuntimeError, match="db corruption"):
             await send_message(to_agent="agent-b", body="hi")
@@ -163,14 +178,16 @@ class TestMcpConnectionSafety:
         async with aiosqlite.connect(str(db_path)) as conn:
             await conn.execute("SELECT 1")
 
-    async def test_list_agents_closes_conn_on_register_error(self, db_path: Path) -> None:
-        """Connection must close even when _ensure_registered raises."""
+    async def test_list_agents_closes_conn_on_register_error(self, db_path: Path, mcp_factory) -> None:
+        """Connection must survive when _ensure_registered raises."""
         _init_schema(db_path)
-        server = create_mcp_server(str(db_path), "sess-1", "agent-a")
+        server = mcp_factory()
         list_agents = _get_tool(server, "list_agents")
 
+        # Force an error by corrupting the persistent connection after it's created
+        # First call succeeds and creates the connection
         with patch(
-            "synth_acp.mcp.server.aiosqlite.connect",
+            "synth_acp.models.visibility.get_visible_agents_async",
             side_effect=RuntimeError("connect failed"),
         ), pytest.raises(RuntimeError, match="connect failed"):
             await list_agents()

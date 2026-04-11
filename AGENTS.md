@@ -139,9 +139,36 @@ uv run pytest -q --tb=short --no-header -rF     # Quick summary
 uv run pytest --co                                # List collected tests (dry run)
 ```
 
-### aiosqlite / MessageBus cleanup
+### aiosqlite / SQLite best practices
 
-Any test that triggers `broker.handle(LaunchAgent(...))` or calls
+`aiosqlite` creates a dedicated **non-daemon thread** per connection. An unclosed
+connection keeps the process alive after the event loop exits — the user sees a
+hang requiring Ctrl-C. Sync `sqlite3` has no background threads, so a leaked
+connection is just a file descriptor, not a hung process.
+
+**Choose the right tool for the pattern:**
+
+| Pattern | Use | Why |
+|---------|-----|-----|
+| Long-lived connection (lifecycle DB, message bus delivery loop) | `aiosqlite` | Dedicated thread amortises setup; `async with` or explicit `close_db()` ensures cleanup |
+| Open-close per call (permission writes, one-off queries) | `asyncio.to_thread` + `sqlite3` | Borrows a daemon pool thread briefly; no shutdown hang risk |
+| Sync init before event loop starts (`__init__`, CLI setup) | `sqlite3` directly | No event loop yet; sync is fine and has zero thread overhead |
+| Agent subprocess (MCP server) | `aiosqlite` persistent conn | Subprocess gets killed anyway; `close_db()` hook exists for tests |
+
+**Rules:**
+
+- Every `aiosqlite.connect()` in the main process **must** be inside `async with`
+  or have a guaranteed `close()` in a `finally` block. A bare
+  `conn = await aiosqlite.connect(...)` without `try/finally` is a shutdown hang
+  waiting to happen.
+- Never open `aiosqlite` connections for short-lived one-off operations. Use
+  `asyncio.to_thread` with sync `sqlite3` instead.
+- Sync `sqlite3` with WAL mode can deadlock against `aiosqlite` connections to the
+  same database when both are in the same process. Keep sync `sqlite3` usage limited
+  to init-time schema creation (before `aiosqlite` connections are opened) or
+  offloaded to `asyncio.to_thread`.
+
+**Test cleanup:** Any test that triggers `broker.handle(LaunchAgent(...))` or calls
 `broker._start_message_bus()` **must** stop the bus and close the lifecycle DB
 in a `finally` block — otherwise the aiosqlite background thread and the Unix
 socket server keep the event loop alive and the test hangs indefinitely:
@@ -157,9 +184,9 @@ finally:
         await broker._lifecycle.close_db()
 ```
 
-Never open synchronous `sqlite3` connections in `__init__` or other sync code paths
-that run during test setup — use lazy async initialization instead. Sync SQLite with
-WAL mode can deadlock against aiosqlite connections to the same database.
+Tests that create MCP servers with `create_mcp_server()` must call
+`await server.close_db()` after the test (or use the `mcp_factory` fixture
+in `tests/mcp/test_server.py` which handles this automatically).
 
 ## Tooling
 

@@ -249,6 +249,19 @@ uv run ruff format                                # Format
 uv run ty check --output-format concise src/      # Type check
 ```
 
+## Security & Trust Model
+
+Synth is a single-user desktop tool. All agents run as child processes of the synth process and inherit the user's OS-level privileges.
+
+**Trust boundary**: Agents have the same access as the user. Each agent subprocess receives environment variables (`SYNTH_DB_PATH`, `SYNTH_SESSION_ID`) that grant direct access to the shared SQLite database. The MCP server provides structured access, but does not enforce an authentication boundary — any child process can read or write the database directly.
+
+**Implications**:
+- Do not expose synth over a network or use it in a multi-user/multi-tenant context without additional sandboxing.
+- The permission system (approve/reject tool calls) is a UX convenience for human oversight, not a security boundary against a malicious agent.
+- The `!` shell escape in the input bar executes commands with the full privileges of the synth process.
+
+**File permissions**: The synth database directory (`~/.synth/`) is created with mode `0o700` and the database file with mode `0o600` to prevent access by other local users.
+
 ## License
 
 See LICENSE file.

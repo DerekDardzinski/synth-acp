@@ -16,10 +16,10 @@ class TestPermissionEngine:
 
         assert engine.check("agent-1", "execute", "sess-1") is None
 
-    def test_check_when_allow_always_stored_returns_allow_always(self, tmp_path: Path) -> None:
+    async def test_check_when_allow_always_stored_returns_allow_always(self, tmp_path: Path) -> None:
         db = tmp_path / "synth.db"
         engine = PermissionEngine(db, session_id="sess-1")
-        engine.persist(
+        await engine.persist_async(
             PermissionRule(
                 agent_id="agent-1",
                 tool_kind="execute",
@@ -30,10 +30,10 @@ class TestPermissionEngine:
 
         assert engine.check("agent-1", "execute", "sess-1") == PermissionDecision.allow_always
 
-    def test_persist_when_called_writes_to_sqlite(self, tmp_path: Path) -> None:
+    async def test_persist_when_called_writes_to_sqlite(self, tmp_path: Path) -> None:
         db = tmp_path / "synth.db"
         engine = PermissionEngine(db, session_id="sess-1")
-        engine.persist(
+        await engine.persist_async(
             PermissionRule(
                 agent_id="agent-1",
                 tool_kind="execute",
@@ -48,10 +48,10 @@ class TestPermissionEngine:
 
         assert row == ("agent-1", "execute", "sess-1", "allow_always")
 
-    def test_check_when_different_session_returns_none(self, tmp_path: Path) -> None:
+    async def test_check_when_different_session_returns_none(self, tmp_path: Path) -> None:
         db = tmp_path / "synth.db"
         engine = PermissionEngine(db, session_id="sess-1")
-        engine.persist(
+        await engine.persist_async(
             PermissionRule(
                 agent_id="agent-1",
                 tool_kind="execute",
@@ -62,11 +62,11 @@ class TestPermissionEngine:
 
         assert engine.check("agent-1", "execute", "sess-2") is None
 
-    def test_init_when_called_starts_with_empty_cache(self, tmp_path: Path) -> None:
+    async def test_init_when_called_starts_with_empty_cache(self, tmp_path: Path) -> None:
         db = tmp_path / "synth.db"
         # Persist a rule via one engine instance
         engine1 = PermissionEngine(db, session_id="sess-1")
-        engine1.persist(
+        await engine1.persist_async(
             PermissionRule(
                 agent_id="agent-1",
                 tool_kind="execute",

@@ -143,7 +143,7 @@ class TestBrokerDispatch:
             ],
         )
 
-        with patch.object(broker._permission_engine, "persist") as mock_persist:
+        with patch.object(broker._permission_engine, "persist_async") as mock_persist:
             await broker._resolve_permission("agent-1", "req-1", "opt-1")
 
         mock_persist.assert_called_once()

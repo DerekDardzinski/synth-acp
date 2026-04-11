@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sqlite3
 import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -37,21 +36,36 @@ def create_mcp_server(
     """
     mcp = FastMCP("synth-mcp")
     _schema_ensured = False
+    _persistent_conn: aiosqlite.Connection | None = None
+    _conn_lock = asyncio.Lock()
+
+    async def _get_conn() -> aiosqlite.Connection:
+        """Return a long-lived aiosqlite connection, creating it on first use."""
+        nonlocal _schema_ensured, _persistent_conn
+        if _persistent_conn is None:
+            if not db_path:
+                raise RuntimeError("SYNTH_DB_PATH is not set — synth-mcp must be launched by synth")
+            _persistent_conn = await aiosqlite.connect(db_path)
+            await _persistent_conn.execute("PRAGMA journal_mode=WAL")
+            _schema_ensured = False
+        if not _schema_ensured:
+            await ensure_schema_async(_persistent_conn)
+            _schema_ensured = True
+        return _persistent_conn
 
     @asynccontextmanager
     async def _db_conn() -> AsyncIterator[aiosqlite.Connection]:
-        nonlocal _schema_ensured
-        if not db_path:
-            raise RuntimeError("SYNTH_DB_PATH is not set — synth-mcp must be launched by synth")
-        conn = await aiosqlite.connect(db_path)
-        try:
-            await conn.execute("PRAGMA journal_mode=WAL")
-            if not _schema_ensured:
-                await ensure_schema_async(conn)
-                _schema_ensured = True
-            yield conn
-        finally:
-            await conn.close()
+        async with _conn_lock:
+            yield await _get_conn()
+
+    async def _close_db() -> None:
+        """Close the persistent connection. Safe to call multiple times."""
+        nonlocal _persistent_conn
+        if _persistent_conn is not None:
+            await _persistent_conn.close()
+            _persistent_conn = None
+
+    mcp.close_db = _close_db  # type: ignore[attr-defined]
 
     async def _ensure_registered(conn: aiosqlite.Connection) -> None:
         await conn.execute(
@@ -60,18 +74,10 @@ def create_mcp_server(
         )
         await conn.commit()
 
-    async def _get_visible_agents_async() -> list[str]:
-        from synth_acp.models.visibility import get_visible_agents
+    async def _get_visible_agents_async(conn: aiosqlite.Connection) -> list[str]:
+        from synth_acp.models.visibility import get_visible_agents_async
 
-        def _query() -> list[str]:
-            conn = sqlite3.connect(db_path)
-            conn.execute("PRAGMA journal_mode=WAL")
-            try:
-                return get_visible_agents(conn, agent_id, session_id, communication_mode)
-            finally:
-                conn.close()
-
-        return await asyncio.to_thread(_query)
+        return await get_visible_agents_async(conn, agent_id, session_id, communication_mode)
 
     @mcp.tool()
     async def send_message(to_agent: str, body: str, kind: str = "chat", reply_to: int | None = None) -> str:
@@ -111,7 +117,7 @@ def create_mcp_server(
 
             now = int(time.time() * 1000)
             if to_agent == "*":
-                visible = await _get_visible_agents_async()
+                visible = await _get_visible_agents_async(conn)
                 ids = []
                 for aid in visible:
                     cursor = await conn.execute(
@@ -123,7 +129,7 @@ def create_mcp_server(
                 await notify()
                 return json.dumps({"message_ids": ids})
 
-            visible = await _get_visible_agents_async()
+            visible = await _get_visible_agents_async(conn)
             if to_agent not in visible:
                 return json.dumps({"error": f"Agent not visible: {to_agent}"})
             cursor = await conn.execute(
@@ -241,7 +247,7 @@ def create_mcp_server(
         """
         async with _db_conn() as conn:
             await _ensure_registered(conn)
-            visible = await _get_visible_agents_async()
+            visible = await _get_visible_agents_async(conn)
             all_ids = [*visible, agent_id]
             cursor = await conn.execute(
                 "SELECT agent_id, status, parent, task FROM agents WHERE session_id = ? AND agent_id IN ({})".format(

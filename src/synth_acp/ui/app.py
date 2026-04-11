@@ -371,9 +371,6 @@ class SynthApp(App):
             if feed.input_bar is not None:
                 feed.input_bar.update_slash_commands(event.commands)
         elif isinstance(event, McpMessageDelivered):
-            key = tuple(sorted([event.from_agent, event.to_agent]))
-            self._mcp_threads.setdefault(key, []).append(event)  # type: ignore[arg-type]
-            self._mcp_count += 1
             feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
         elif isinstance(event, HookFired):
             feed.add_hook_notification(event.hook_name)

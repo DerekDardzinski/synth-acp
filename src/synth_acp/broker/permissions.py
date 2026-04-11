@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from pathlib import Path
@@ -23,16 +24,20 @@ class PermissionEngine:
         self._db_path = db_path
         self._session_id = session_id
         self._cache: dict[tuple[str, str, str], PermissionDecision] = {}
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS rules ("
-            "agent_id TEXT, tool_kind TEXT, session_id TEXT, decision TEXT, "
-            "PRIMARY KEY (agent_id, tool_kind, session_id))"
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS rules ("
+                "agent_id TEXT, tool_kind TEXT, session_id TEXT, decision TEXT, "
+                "PRIMARY KEY (agent_id, tool_kind, session_id))"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if db_path.exists():
+            db_path.chmod(0o600)
 
     def check(self, agent_id: str, tool_kind: str, session_id: str) -> PermissionDecision | None:
         """Return the cached decision for *(agent_id, tool_kind, session_id)*, or ``None``.
@@ -47,18 +52,27 @@ class PermissionEngine:
         """
         return self._cache.get((agent_id, tool_kind, session_id))
 
-    def persist(self, rule: PermissionRule) -> None:
-        """Write a rule to both the in-memory cache and SQLite.
+    async def persist_async(self, rule: PermissionRule) -> None:
+        """Write a rule to both the in-memory cache and SQLite (async).
+
+        Uses ``asyncio.to_thread`` with sync ``sqlite3`` to avoid blocking
+        the event loop without creating long-lived ``aiosqlite`` threads
+        that can hang on shutdown.
 
         Args:
             rule: The permission rule to persist.
         """
         self._cache[(rule.agent_id, rule.tool_kind, rule.session_id)] = rule.decision
+        await asyncio.to_thread(self._persist_sync, rule)
+
+    def _persist_sync(self, rule: PermissionRule) -> None:
         conn = sqlite3.connect(str(self._db_path))
-        conn.execute(
-            "INSERT OR REPLACE INTO rules (agent_id, tool_kind, session_id, decision) "
-            "VALUES (?, ?, ?, ?)",
-            (rule.agent_id, rule.tool_kind, rule.session_id, rule.decision.value),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO rules (agent_id, tool_kind, session_id, decision) "
+                "VALUES (?, ?, ?, ?)",
+                (rule.agent_id, rule.tool_kind, rule.session_id, rule.decision.value),
+            )
+            conn.commit()
+        finally:
+            conn.close()

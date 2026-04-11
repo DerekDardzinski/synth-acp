@@ -426,6 +426,20 @@ class ACPSession:
                         )
                     )
 
+                # Apply configured agent_mode if it differs from the restored mode
+                if (
+                    self._agent_mode is not None
+                    and self._agent_mode != self._current_mode_id
+                    and self._agent_mode in {m.id for m in self._available_modes}
+                ):
+                    await conn.set_session_mode(
+                        mode_id=self._agent_mode, session_id=self._session_id
+                    )
+                    self._current_mode_id = self._agent_mode
+                    await self._event_sink(
+                        AgentModeChanged(agent_id=self.agent_id, mode_id=self._agent_mode)
+                    )
+
                 # Capture models
                 if session.models is not None:
                     self._available_models = [
