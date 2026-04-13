@@ -149,6 +149,7 @@ AgentMessage {
     padding: 0 1;
     color: $text-muted;
 }
+AgentMessage Markdown { height: auto; margin: 0; padding: 0; }
 
 ThoughtBlock {
     height: auto;

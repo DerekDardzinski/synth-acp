@@ -7,6 +7,8 @@ from textual.containers import Vertical
 from textual.widgets import Static
 from textual.widgets.markdown import Markdown
 
+from synth_acp.ui.widgets.copy_button import CopyButton
+
 
 class PromptBubble(Vertical):
     """Right-aligned user prompt with $primary border and markdown rendering.
@@ -22,5 +24,6 @@ class PromptBubble(Vertical):
         self._timestamp = timestamp
 
     def compose(self) -> ComposeResult:
+        yield CopyButton(lambda: self._text)
         yield Markdown(self._text, open_links=False)
         yield Static(f"[dim]{self._timestamp}[/dim]", classes="bubble-ts")

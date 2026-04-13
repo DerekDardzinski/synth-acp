@@ -12,6 +12,7 @@ from textual.widgets import Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.widgets.agent_message import AgentMessage
+from synth_acp.ui.widgets.copy_button import CopyButton
 from synth_acp.ui.widgets.input_bar import InputBar
 from synth_acp.ui.widgets.plan_block import PlanBlock
 from synth_acp.ui.widgets.prompt_bubble import PromptBubble
@@ -39,7 +40,15 @@ class ConversationFeed(Vertical):
         agent_name: Display name for the agent.
     """
 
-    def __init__(self, agent_id: str, agent_name: str, project: str = "", harness: str = "", cwd: str = "", **kwargs: object) -> None:
+    def __init__(
+        self,
+        agent_id: str,
+        agent_name: str,
+        project: str = "",
+        harness: str = "",
+        cwd: str = "",
+        **kwargs: object,
+    ) -> None:
         super().__init__(**kwargs)
         self._agent_id = agent_id
         self._agent_name = agent_name
@@ -247,8 +256,11 @@ class ConversationFeed(Vertical):
 
         container = Vertical(classes="mcp-msg")
         turn.mount(container)
+        container.mount(CopyButton(lambda p=preview: p))
         container.mount(Markdown(preview, open_links=False))
-        container.mount(Static(f"[dim]◈ {from_agent} → {to_agent}  {ts}[/dim]", classes="bubble-ts"))
+        container.mount(
+            Static(f"[dim]◈ {from_agent} → {to_agent}  {ts}[/dim]", classes="bubble-ts")
+        )
         self._scroll.scroll_end(animate=False)
 
     def add_hook_notification(self, hook_name: str) -> None:

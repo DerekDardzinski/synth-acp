@@ -5,6 +5,8 @@ from __future__ import annotations
 from textual.widgets import Collapsible
 from textual.widgets.markdown import Markdown, MarkdownStream
 
+from synth_acp.ui.widgets.copy_button import CopyButton
+
 
 class ThoughtBlock(Collapsible):
     """Collapsible block for agent reasoning/thought chunks.
@@ -14,8 +16,14 @@ class ThoughtBlock(Collapsible):
     """
 
     def __init__(self) -> None:
-        super().__init__(Markdown("", open_links=False), title="Thinking…", collapsed=False)
+        super().__init__(
+            CopyButton(lambda: "".join(self._chunks)),
+            Markdown("", open_links=False),
+            title="Thinking…",
+            collapsed=False,
+        )
         self._stream: MarkdownStream | None = None
+        self._chunks: list[str] = []
 
     @property
     def _markdown(self) -> Markdown:
@@ -28,6 +36,7 @@ class ThoughtBlock(Collapsible):
         Args:
             chunk: Markdown fragment to append.
         """
+        self._chunks.append(chunk)
         if self._stream is None:
             self._stream = Markdown.get_stream(self._markdown)
         await self._stream.write(chunk)
