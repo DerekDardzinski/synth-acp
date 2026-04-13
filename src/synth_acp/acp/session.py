@@ -79,6 +79,7 @@ EventSink = Callable[[BrokerEvent], Awaitable[None]]
 
 
 _SHUTDOWN_TIMEOUT = 2.0
+_PIPE_LIMIT = 8 * 1024 * 1024  # 8 MiB — agent tool responses can be large
 
 
 @asynccontextmanager
@@ -106,6 +107,7 @@ async def _spawn_isolated_agent(
         stdin=aio_subprocess.PIPE,
         stdout=aio_subprocess.PIPE,
         stderr=aio_subprocess.PIPE,
+        limit=_PIPE_LIMIT,
         env=merged_env,
         cwd=cwd,
         process_group=0,
