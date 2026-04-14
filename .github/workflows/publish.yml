@@ -1,0 +1,27 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync
+      - run: uv run ruff check --output-format concise
+      - run: uv run pytest -q --tb=short --no-header -rF
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -3,6 +3,19 @@ name = "synth-acp"
 version = "0.1.0"
 description = "SYNTH — Synchronized Network of Teamed Harnesses over ACP"
 requires-python = ">=3.12"
+license = "AGPL-3.0-only"
+readme = "README.md"
+authors = [
+    { name = "Derek Dardzinski", email = "dardzinski.derek@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: Textual",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
     "agent-client-protocol==0.9.0",
     "textual[syntax]>=8.2.1",
@@ -24,6 +37,11 @@ dev = [
 [project.scripts]
 synth = "synth_acp.cli:main"
 synth-mcp = "synth_acp.mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/DerekDardzinski/synth-acp"
+Repository = "https://github.com/DerekDardzinski/synth-acp"
+Issues = "https://github.com/DerekDardzinski/synth-acp/issues"
 
 [build-system]
 requires = ["hatchling"]
