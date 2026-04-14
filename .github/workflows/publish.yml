@@ -23,5 +23,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+      - name: Verify tag matches package version
+        run: |
+          TAG=${GITHUB_REF#refs/tags/v}
+          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::Tag v$TAG does not match pyproject.toml version $VERSION"
+            exit 1
+          fi
       - run: uv build
       - uses: pypa/gh-action-pypi-publish@release/v1
