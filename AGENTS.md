@@ -25,7 +25,11 @@ Layers 1 and 2 have zero Textual imports. The frontend communicates with the bro
 
 ```
 src/synth_acp/
-├── cli.py              # argparse CLI, entry point
+├── cli.py              # typer CLI, entry point
+├── db.py               # Shared SQLite schema and helpers
+├── harnesses.py        # Harness registry loader (TOML → HarnessEntry)
+├── data/
+│   └── harnesses/      # Harness TOML definitions (kiro.toml, claude.toml, etc.)
 ├── models/
 │   ├── agent.py        # AgentState enum, AgentConfig
 │   ├── config.py       # SessionConfig, HooksConfig (parsed from .synth.json)
@@ -45,12 +49,17 @@ src/synth_acp/
 ├── mcp/
 │   ├── server.py       # synth-mcp entrypoint (FastMCP, agent-to-agent messaging)
 │   └── notifier.py     # BrokerNotifier — Unix socket notification to message bus
+├── terminal/
+│   ├── manager.py      # PTY terminal process management
+│   └── shell_read.py   # Buffered async stream reader for PTY output
 └── ui/
     ├── app.py          # SynthApp — bridges broker ↔ Textual messages
     ├── messages.py     # Textual Message subclasses wrapping BrokerEvent
+    ├── ansi/           # Vendored ANSI terminal state parser (from toad)
     ├── screens/
     │   ├── launch.py
     │   ├── permission.py
+    │   ├── session_picker.py
     │   └── help.py
     ├── widgets/
     │   ├── agent_list.py
@@ -59,7 +68,14 @@ src/synth_acp/
     │   ├── agent_message.py
     │   ├── tool_call.py
     │   ├── message_queue.py
-    │   └── input_bar.py
+    │   ├── input_bar.py
+    │   ├── thought_block.py
+    │   ├── copy_button.py
+    │   ├── shell_result.py
+    │   ├── terminal.py
+    │   ├── plan_block.py
+    │   ├── diff_view.py
+    │   └── gradient_bar.py
     └── css/
         └── app.tcss
 ```
@@ -69,15 +85,13 @@ src/synth_acp/
 - `agent-client-protocol` — ACP Python SDK (Pydantic models, `spawn_agent_process`, `SessionAccumulator`)
 - `mcp>=1.0.0` — MCP server via `mcp.server.fastmcp.FastMCP` (agent-to-agent messaging)
 - `textual` — TUI framework
+- `typer` — CLI framework
 - `aiosqlite` — async SQLite for message bus
 
 ### Reference Docs
 
 - `README.md` — configuration reference, lifecycle hooks, MCP tools
 - `examples/synth.example.json` — complete config with all available options
-- `docs/references/acp_sdk.md` — ACP SDK imports, Client interface, spawn_agent_process
-- `docs/references/acp_protocol.md` — ACP types quick reference
-- `docs/references/toad_agent.md` — Toad's ACP client patterns (annotated)
 
 ## Build System
 
@@ -97,6 +111,25 @@ uv run pytest                      # Run tests
 uv run pytest tests/acp/           # Run specific test directory
 uv run pytest -k "test_foo"        # Run matching tests
 ```
+
+### Publishing
+
+Releases are published to PyPI via GitHub Actions on version tags. The workflow
+uses PyPI Trusted Publishing (OIDC) — no API tokens needed.
+
+```bash
+# 1. Bump version in pyproject.toml
+# 2. Commit the bump
+git add pyproject.toml
+git commit -m "release: v0.2.0"
+
+# 3. Tag and push (triggers CI → test → publish)
+git tag v0.2.0
+git push origin main --tags
+```
+
+The tag must match the version in `pyproject.toml` exactly (without the `v` prefix).
+The CI workflow verifies this before publishing.
 
 ## Testing
 

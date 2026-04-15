@@ -13,14 +13,21 @@ A multi-agent orchestration dashboard that manages teams of AI coding agents thr
 - Supports flexible topologies: human-dispatch, orchestrator, peer-to-peer
 - Configurable lifecycle hooks for agent join, exit, and prompt injection
 
+## Install
+
+```bash
+# Install as a global CLI tool (run `synth` from anywhere)
+uv tool install synth-acp
+```
+
 ## Quick Start
 
 ```bash
-# Install
-uv sync
+# Navigate to your project
+cd my-project
 
 # Initialize a config file (interactive)
-uv run synth init
+synth init
 
 # Or create one manually
 cat > .synth.json << 'EOF'
@@ -33,10 +40,14 @@ cat > .synth.json << 'EOF'
 EOF
 
 # Launch the TUI
-uv run synth
+synth
 
 # Or run headless (CLI mode)
-uv run synth --headless
+synth --headless
+
+# Or launch directly with a harness (no config file needed)
+synth --harness kiro
+synth --harness kiro --agent-mode plan
 ```
 
 ## Configuration
@@ -233,9 +244,9 @@ Messages are delivered to idle agents between turns. Message kinds (`chat`, `req
 | Key | Action |
 |-----|--------|
 | `Tab` | Cycle agent focus |
-| `Enter` | Submit prompt |
 | `m` | MCP messages panel |
 | `l` | Launch agent |
+| `Ctrl+r` | Restore session |
 | `F1` | Help |
 | `q` | Quit |
 
@@ -247,6 +258,28 @@ uv run pytest -q --tb=short --no-header -rF      # Run tests
 uv run ruff check --fix --output-format concise   # Lint
 uv run ruff format                                # Format
 uv run ty check --output-format concise src/      # Type check
+```
+
+## Publishing
+
+Releases are published to PyPI via GitHub Actions when a version tag is pushed.
+
+```bash
+# 1. Bump version in pyproject.toml
+# 2. Commit and tag
+git add pyproject.toml
+git commit -m "release: v0.2.0"
+git tag v0.2.0
+git push origin main --tags
+```
+
+The tag must match the version in `pyproject.toml` (without the `v` prefix). CI runs
+tests and lint before publishing — if either fails, nothing is uploaded.
+
+Install from PyPI:
+
+```bash
+uv pip install synth-acp
 ```
 
 ## Security & Trust Model

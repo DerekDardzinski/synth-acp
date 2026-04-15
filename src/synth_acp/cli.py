@@ -163,12 +163,15 @@ async def _read_input() -> str:
 # ------------------------------------------------------------------
 
 
-def _build_transient_config(harness_name: str, agent_name: str | None) -> SessionConfig:
+def _build_transient_config(
+    harness_name: str, agent_id: str | None, agent_mode: str | None,
+) -> SessionConfig:
     """Build a transient SessionConfig from a harness name.
 
     Args:
         harness_name: The ``--harness`` value (short_name).
-        agent_name: Optional ``--agent`` value.
+        agent_id: Optional ``--agent-id`` value.
+        agent_mode: Optional ``--agent-mode`` value.
 
     Returns:
         A SessionConfig with a single agent.
@@ -183,17 +186,21 @@ def _build_transient_config(harness_name: str, agent_name: str | None) -> Sessio
         print(f"Unknown harness '{harness_name}'. Known: {known}", file=sys.stderr)
         raise typer.Exit(1)
 
-    agent_id = agent_name or harness.short_name
+    aid = agent_id or agent_mode or harness.short_name
+    agent_dict: dict[str, Any] = {"agent_id": aid, "harness": harness_name}
+    if agent_mode:
+        agent_dict["agent_mode"] = agent_mode
 
     return SessionConfig(
         project=Path.cwd().name,
-        agents=[{"agent_id": agent_id, "harness": harness_name}],
+        agents=[agent_dict],
     )
 
 
 def _resolve_config(
     harness: str | None,
-    agent: str | None,
+    agent_id: str | None,
+    agent_mode: str | None,
     config_path: Path | None,
     headless: bool,
 ) -> SessionConfig:
@@ -201,7 +208,8 @@ def _resolve_config(
 
     Args:
         harness: ``--harness`` flag value.
-        agent: ``--agent`` flag value.
+        agent_id: ``--agent-id`` flag value.
+        agent_mode: ``--agent-mode`` flag value.
         config_path: ``--config`` flag value.
         headless: Whether running in headless mode.
 
@@ -213,7 +221,7 @@ def _resolve_config(
     """
     # 1. --harness → transient config
     if harness:
-        return _build_transient_config(harness, agent)
+        return _build_transient_config(harness, agent_id, agent_mode)
 
     # 2. --config → load file
     if config_path:
@@ -456,7 +464,8 @@ def _run_tui(config: SessionConfig, style: str = "default", restore: bool = Fals
 @app.command()
 def cli(
     harness: str | None = typer.Option(None, help="Harness to launch (e.g. kiro, claude)"),
-    agent: str | None = typer.Option(None, help="Agent within the harness"),
+    agent_id: str | None = typer.Option(None, "--agent-id", help="Agent identifier"),
+    agent_mode: str | None = typer.Option(None, "--agent-mode", help="Agent mode (e.g. code, plan, chat)"),
     config: Path | None = typer.Option(None, "-c", "--config", help="Path to config file"),
     headless: bool = typer.Option(False, help="Run without TUI (stdin/stdout mode)"),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Enable debug logging"),
@@ -480,7 +489,7 @@ def cli(
         logging.getLogger("aiosqlite").setLevel(logging.WARNING)
         logging.getLogger("markdown_it").setLevel(logging.WARNING)
 
-    resolved = _resolve_config(harness, agent, config, headless)
+    resolved = _resolve_config(harness, agent_id, agent_mode, config, headless)
 
     if headless:
         if restore:

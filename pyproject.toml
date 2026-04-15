@@ -49,9 +49,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/synth_acp"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/synth_acp/data/harnesses" = "synth_acp/data/harnesses"
-
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
@@ -60,6 +57,7 @@ testpaths = ["tests"]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
+exclude = ["scripts"]
 
 [tool.ruff.lint]
 select = [
@@ -75,6 +73,8 @@ ignore = [
     "PLR2004",
     "SIM102",
     "SIM105",
+    "SIM108",
+    "SIM114",
     "PLW0603",
     "PLW2901",
     "PLC0415",

@@ -15,7 +15,7 @@ Screen { background: $background; layout: vertical; }
 #sidebar-label-dock {
     dock: top;
     height: auto;
-    hatch: left $panel 60%;
+    /* hatch: left $panel 60%; */
     padding-bottom: 1;
 }
 #sidebar-label {
@@ -30,7 +30,7 @@ Screen { background: $background; layout: vertical; }
 #agent-list {
     height: 1fr;
     overflow: hidden auto;
-    hatch: left $panel 60%;
+    /* hatch: left $panel 60%; */
     padding: 0;
     scrollbar-size: 0 0;
 }
@@ -83,7 +83,7 @@ AgentTile.tile-permission.tile-active { border-top: tall $warning; }
 
 #sidebar-buttons-dock {
     height: auto;
-    hatch: left $panel 60%;
+    /* hatch: left $panel 60%; */
     padding-top: 1;
 }
 
