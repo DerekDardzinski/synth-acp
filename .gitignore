@@ -11,3 +11,8 @@ dist/
 .serena/
 synth-debug.log
 *.bak
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
