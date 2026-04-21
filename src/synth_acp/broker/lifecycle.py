@@ -90,7 +90,13 @@ class AgentLifecycle:
     def _make_prompt_task(self, agent_id: str, coro: Coroutine[object, object, None]) -> asyncio.Task[None]:
         key = f"prompt-{agent_id}"
         task = asyncio.create_task(coro, name=key)
-        task.add_done_callback(lambda _: self._tasks.pop(key, None))
+
+        def _on_done(t: asyncio.Task[None]) -> None:
+            self._tasks.pop(key, None)
+            if not t.cancelled() and (exc := t.exception()):
+                log.error("prompt task for %s raised", agent_id, exc_info=exc)
+
+        task.add_done_callback(_on_done)
         return task
 
     async def launch(self, agent_id: str, *, adhoc_config: AgentConfig | None = None) -> None:

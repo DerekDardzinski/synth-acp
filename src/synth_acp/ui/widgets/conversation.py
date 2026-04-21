@@ -190,6 +190,9 @@ class ConversationFeed(Vertical):
         """
         try:
             existing = self.query_one(f"#tool-{tool_call_id}", ToolCallBlock)
+        except Exception:
+            existing = None
+        if existing is not None:
             existing.update_status(status)
             await existing.update_content(
                 locations=locations,
@@ -199,8 +202,7 @@ class ConversationFeed(Vertical):
                 text_content=text_content,
             )
             self._scroll_to_bottom()
-        except Exception:
-            log.debug("Tool call query failed", exc_info=True)
+        else:
             if self._current_message is not None:
                 await self._current_message.finalize()
                 self._current_message = None
@@ -292,7 +294,7 @@ class ConversationFeed(Vertical):
             return
         ts = datetime.now(UTC).strftime("%H:%M")
         widget = Static(
-            f"[dim]synth: {hook_name} hook fired  {ts}[/dim]",
+            f"[dim]synth: {escape(hook_name)} hook fired  {ts}[/dim]",
             classes="hook-notification",
         )
         target.mount(widget)

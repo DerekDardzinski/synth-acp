@@ -499,6 +499,14 @@ class ACPSession:
                     stop_reason=response.stop_reason if response else "unknown",
                 )
             )
+        except ConnectionError:
+            log.warning("Connection lost for %s during prompt", self.agent_id)
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=f"Connection lost to {self.agent_id}",
+                )
+            )
         finally:
             if self.state == AgentState.BUSY:
                 await self._sm.transition(AgentState.IDLE)

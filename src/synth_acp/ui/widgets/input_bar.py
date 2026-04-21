@@ -320,7 +320,7 @@ class InputBar(Vertical):
     def _build_cwd_label(self) -> str:
         """Build the cwd/branch label text."""
         if self._cwd_display:
-            cwd_part = self._cwd_display
+            cwd_part = escape(self._cwd_display)
             if self._git_branch:
                 cwd_part += f" ([$accent]{escape(self._git_branch)}[/])"
             return cwd_part

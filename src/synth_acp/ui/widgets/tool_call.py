@@ -8,7 +8,6 @@ from typing import Any
 from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
 from textual.highlight import highlight
-from textual.markup import escape
 from textual.widgets import Label, Markdown, Rule, Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
@@ -148,11 +147,14 @@ class ToolCallBlock(Vertical):
         self._text_rendered = False
         self._copyable_parts: list[str] = []
 
-    def _build_markup(self) -> str:
-        """Build the header markup."""
+    def _build_markup(self) -> Content:
+        """Build the header as a Content object."""
         icon, color = TOOL_KIND_STYLE.get(self._kind, _FALLBACK_STYLE)
         badge = _STATUS_BADGE.get(self._status, "[dim]·[/dim]")
-        return f"[{color}]{icon}[/{color}] {escape(self._title)}  {badge}"
+        return Content.from_markup(
+            f"[{color}]{icon}[/{color}] $title  {badge}",
+            title=self._title,
+        )
 
     def compose(self):
         """Compose header and initial content widgets."""
@@ -171,7 +173,7 @@ class ToolCallBlock(Vertical):
         self._locations_rendered = True
         loc = locations[0]
         label = f"{loc.path}:{loc.line}" if loc.line is not None else loc.path
-        return [Static(label, id="tc-location")]
+        return [Static(label, id="tc-location", markup=False)]
 
     def _raw_input_widgets(self, raw_input: Any) -> list[Label]:
         """Build raw input widget if applicable."""

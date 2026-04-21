@@ -56,7 +56,7 @@ class _OptionRow(HorizontalGroup):
             yield _NonSelectableLabel(Content.styled(self._key, "b"), id="index")
         else:
             yield _NonSelectableLabel(Content(" "), id="index")
-        yield _NonSelectableLabel(self._name, id="label")
+        yield _NonSelectableLabel(self._name, id="label", markup=False)
 
     def on_click(self) -> None:
         """Post selected message on click."""
