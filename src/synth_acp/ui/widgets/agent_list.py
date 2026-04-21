@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import ScrollableContainer, Vertical
+from textual.markup import escape
 from textual.message import Message
 from textual.widgets import Static
 
@@ -97,16 +98,16 @@ class AgentTile(Vertical):
             if self._state == AgentState.AWAITING_PERMISSION
             else ""
         )
-        name = f"[$primary bold]{self._agent_id}[/]"
+        name = f"[$primary bold]{escape(self._agent_id)}[/]"
         if self._parent_agent:
-            name += f" [$text-muted](via {self._parent_agent})[/]"
+            name += f" [$text-muted](via {escape(self._parent_agent)})[/]"
         mode_badge = (
-            f"  [$accent dim]{self._current_mode}[/]"
+            f"  [$accent dim]{escape(self._current_mode)}[/]"
             if self._current_mode
             else ""
         )
         preview = (
-            f"[dim italic]{self._agent_task}[/dim italic]"
+            f"[dim italic]{escape(self._agent_task)}[/dim italic]"
             if self._agent_task
             else PREVIEW_TEXT.get(self._state, DEFAULT_PREVIEW)
         )

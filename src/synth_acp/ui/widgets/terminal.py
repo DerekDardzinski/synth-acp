@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -19,6 +20,8 @@ from synth_acp.ui import ansi
 
 if TYPE_CHECKING:
     from synth_acp.terminal.manager import TerminalProcess
+
+log = logging.getLogger(__name__)
 
 
 class Terminal(ScrollView, can_focus=False):
@@ -231,19 +234,19 @@ class Terminal(ScrollView, can_focus=False):
     def _update_from_state(
         self, scrollback_delta: set[int] | None, alternate_delta: set[int] | None
     ) -> None:
-        if self._state.current_directory:
+        if self._state.current_directory and not self._finalized:
             self.finalize()
         width = self._state.width
-        height = self._state.scrollback_buffer.height
+        buffer_height = self._state.scrollback_buffer.height
 
         if self._state.alternate_screen:
-            height += self._state.alternate_buffer.height
-        self.virtual_size = Size(min(self._state.buffer.max_line_width, width), height)
+            buffer_height += self._state.alternate_buffer.height
+        self.virtual_size = Size(min(self._state.buffer.max_line_width, width), buffer_height)
         if self._anchored and not self._anchor_released:
             self.scroll_y = self.max_scroll_y
 
         scroll_y = int(self.scroll_y)
-        visible_lines = frozenset(range(scroll_y, scroll_y + height))
+        visible_lines = frozenset(range(scroll_y, scroll_y + self._height))
 
         if scrollback_delta is None and alternate_delta is None:
             self.refresh()
@@ -337,6 +340,7 @@ class Terminal(ScrollView, can_focus=False):
                 line.render_segments(visual_style), cell_length=line.cell_length
             )
         except Exception:
+            log.debug("render_segments failed for line %d", y, exc_info=True)
             strip = Strip.blank(line.cell_length)
 
         if cache_key is not None:

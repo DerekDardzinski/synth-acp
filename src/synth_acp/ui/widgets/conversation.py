@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from textual.app import ComposeResult
 from textual.containers import ScrollableContainer, Vertical
+from textual.markup import escape
 from textual.widgets import Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
@@ -259,7 +260,7 @@ class ConversationFeed(Vertical):
         container.mount(CopyButton(lambda p=preview: p))
         container.mount(Markdown(preview, open_links=False))
         container.mount(
-            Static(f"[dim]◈ {from_agent} → {to_agent}  {ts}[/dim]", classes="bubble-ts")
+            Static(f"[dim]◈ {escape(from_agent)} → {escape(to_agent)}  {ts}[/dim]", classes="bubble-ts")
         )
         self._scroll.scroll_end(animate=False)
 

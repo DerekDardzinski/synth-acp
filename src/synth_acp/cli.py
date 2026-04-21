@@ -187,7 +187,11 @@ def _build_transient_config(
         raise typer.Exit(1)
 
     aid = agent_id or agent_mode or harness.short_name
-    agent_dict: dict[str, Any] = {"agent_id": aid, "harness": harness_name}
+    agent_dict: dict[str, Any] = {
+        "agent_id": aid,
+        "harness": harness_name,
+        "cwd": str(Path.cwd().resolve()),
+    }
     if agent_mode:
         agent_dict["agent_mode"] = agent_mode
 

@@ -7,6 +7,7 @@ from typing import Any
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
+from textual.markup import escape
 from textual.widgets import Static
 from textual.widgets.markdown import Markdown
 
@@ -46,7 +47,7 @@ class ThreadDetail(Vertical):
             container.mount(Markdown(body, open_links=False))
             container.mount(
                 Static(
-                    f"[dim]◈ {msg.from_agent} → {msg.to_agent}  {ts}[/dim]",
+                    f"[dim]◈ {escape(msg.from_agent)} → {escape(msg.to_agent)}  {ts}[/dim]",
                     classes="bubble-ts",
                 )
             )
@@ -70,9 +71,9 @@ class ThreadItem(Static):
         last = messages[-1]
         ts = last.timestamp.strftime("%H:%M")
         snippet = last.preview[:30] + "…" if len(last.preview) > 30 else last.preview
-        preview_line = f"  [dim]{snippet}[/dim]" if snippet else f"  [dim]{ts}[/dim]"
+        preview_line = f"  [dim]{escape(snippet)}[/dim]" if snippet else f"  [dim]{ts}[/dim]"
         content = (
-            f"[$primary bold]{a}[/] [dim]→[/dim] [$primary bold]{b}[/]\n{preview_line}"
+            f"[$primary bold]{escape(a)}[/] [dim]→[/dim] [$primary bold]{escape(b)}[/]\n{preview_line}"
         )
         key_id = f"titem-{a}-{b}"
         super().__init__(content, id=key_id, classes="thread-item")

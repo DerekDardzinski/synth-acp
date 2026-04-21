@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import subprocess
@@ -13,6 +14,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
 from textual.highlight import highlight
+from textual.markup import escape
 from textual.message import Message
 from textual.widgets import Button, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
@@ -26,9 +28,11 @@ log = logging.getLogger(__name__)
 def _short_path(cwd: str) -> str:
     """Collapse a cwd to use ~ for the home directory."""
     try:
-        return "~/" + str(Path(cwd).relative_to(Path.home()))
+        resolved = Path(cwd).resolve()
+        rel = resolved.relative_to(Path.home())
+        return "~" if str(rel) == "." else "~/" + str(rel)
     except ValueError:
-        return cwd
+        return str(Path(cwd).resolve())
 
 
 def _git_branch(cwd: str) -> str | None:
@@ -212,7 +216,7 @@ class _PickerLabel(Static):
             return
         self.display = True
         name = next((n for vid, n in self._items if vid == self._current_id), self._current_id)
-        self.update(f"[dim]{self._prefix}:[/] [$accent]{name}[/] [dim]▾[/]")
+        self.update(f"[dim]{self._prefix}:[/] [$accent]{escape(name)}[/] [dim]▾[/]")
 
     def on_click(self) -> None:
         """Toggle the popup OptionList on the screen."""
@@ -258,17 +262,22 @@ class InputBar(Vertical):
         self._harness = harness
         self._cwd = cwd
         self._cwd_display = _short_path(cwd) if cwd else ""
-        self._git_branch = _git_branch(cwd) if cwd else None
+        self._git_branch: str | None = None
         self._slash_commands: list[object] = []
 
     def on_mount(self) -> None:
         """Start polling git branch if cwd is set."""
         if self._cwd:
+            self.run_worker(self._async_poll_git_branch(), name="git-poll-init")
             self.set_interval(5, self._poll_git_branch)
 
     def _poll_git_branch(self) -> None:
-        """Check for branch changes and update the info label."""
-        branch = _git_branch(self._cwd)
+        """Timer callback — spawn async worker to avoid blocking the event loop."""
+        self.run_worker(self._async_poll_git_branch(), exclusive=True, name="git-poll")
+
+    async def _async_poll_git_branch(self) -> None:
+        """Fetch git branch in a thread and update the label if it changed."""
+        branch = await asyncio.to_thread(_git_branch, self._cwd)
         if branch != self._git_branch:
             self._git_branch = branch
             try:
@@ -294,17 +303,17 @@ class InputBar(Vertical):
     def _build_info_label(self) -> str:
         """Build the static info label text."""
         line1 = [
-            f"[dim]agent:[/] [$primary]{self._agent_id}[/]",
-            f"[dim]harness:[/] {self._harness}",
+            f"[dim]agent:[/] [$primary]{escape(self._agent_id)}[/]",
+            f"[dim]harness:[/] {escape(self._harness)}",
         ]
         line2: list[str] = []
         if self._cwd_display:
             cwd_part = self._cwd_display
             if self._git_branch:
-                cwd_part += f" ([$accent]{self._git_branch}[/])"
+                cwd_part += f" ([$accent]{escape(self._git_branch)}[/])"
             line2.append(cwd_part)
         elif self._git_branch:
-            line2.append(f"[$accent]{self._git_branch}[/]")
+            line2.append(f"[$accent]{escape(self._git_branch)}[/]")
         result = " · ".join(line1)
         if line2:
             result += "\n" + " · ".join(line2)

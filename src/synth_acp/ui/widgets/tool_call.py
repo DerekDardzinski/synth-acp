@@ -6,6 +6,7 @@ from typing import Any
 
 from textual.containers import Vertical, VerticalScroll
 from textual.highlight import highlight
+from textual.markup import escape
 from textual.widgets import Label, Markdown, Rule, Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
@@ -132,7 +133,7 @@ class ToolCallBlock(Vertical):
         """Build the header markup."""
         icon, color = TOOL_KIND_STYLE.get(self._kind, _FALLBACK_STYLE)
         badge = _STATUS_BADGE.get(self._status, "[dim]·[/dim]")
-        return f"[{color}]{icon}[/{color}] {self._title}  {badge}"
+        return f"[{color}]{icon}[/{color}] {escape(self._title)}  {badge}"
 
     def compose(self):
         """Compose header and initial content widgets."""

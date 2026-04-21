@@ -94,7 +94,10 @@ class FEPattern(Pattern):
                 OSC_TERMINATORS = self.OSC_TERMINATORS
                 while (character := (yield)) not in OSC_TERMINATORS:
                     store(character)
-                    if last_character == "\x1b" and character in {"\\", "\0x5c"}:
+                    if last_character == "\x1b" and character == "\\":
+                        # Trim the already-stored ESC from the sequence buffer
+                        sequence.seek(sequence.tell() - 1)
+                        sequence.truncate()
                         break
                     last_character = character
                 store(character)
@@ -298,6 +301,12 @@ class ANSIScroll(NamedTuple):
         yield self.lines
 
 
+class ANSIDeleteCharacter(NamedTuple):
+    """Delete characters at cursor, shifting remaining content left."""
+
+    count: int
+
+
 class ANSIFeatures(NamedTuple):
     """Terminal feature flags."""
 
@@ -351,6 +360,7 @@ type ANSICommand = (
     ANSIStyle
     | ANSIContent
     | ANSICursor
+    | ANSIDeleteCharacter
     | ANSINewLine
     | ANSIClear
     | ANSIScrollMargin
@@ -371,21 +381,26 @@ class ANSIStream:
 
     @classmethod
     @lru_cache(maxsize=1024)
-    def _parse_sgr(cls, sgr: str) -> Style | None:
-        """Parse a SGR (Select Graphics Rendition) code in to a Style instance,
-        or `None` to indicate a reset.
+    def _parse_sgr(cls, sgr: str) -> tuple[Style, bool] | None:
+        """Parse a SGR (Select Graphics Rendition) code in to a Style instance.
+
+        Returns `None` for a pure reset (code 0 with no following codes).
+        Otherwise returns ``(style, did_reset)`` where *did_reset* is True
+        when the sequence contained a reset code before other codes
+        (e.g. ``0;32``), meaning the caller should assign rather than add.
 
         Args:
             sgr: SGR sequence.
 
         Returns:
-            A Visual Style, or `None`.
+            ``(Style, bool)`` or ``None`` for pure reset.
         """
         codes = [
             code if code < 255 else 255
             for code in map(int, [sgr_code or "0" for sgr_code in sgr.split(";")])
         ]
         style = NULL_STYLE
+        did_reset = False
         while codes:
             match codes:
                 case [38, 2, red, green, blue, *codes]:
@@ -401,13 +416,16 @@ class ANSIStream:
                     # Background ANSI
                     style += Style(background=ANSI_COLORS[ansi_color])
                 case [0, *codes]:
-                    # reset
-                    return None
+                    # reset — clear accumulated style but continue processing
+                    style = NULL_STYLE
+                    did_reset = True
                 case [code, *codes]:
                     if sgr_style := SGR_STYLES.get(code):
                         style += sgr_style
 
-        return style
+        if did_reset and style == NULL_STYLE:
+            return None
+        return (style, did_reset)
 
     def feed(self, text: str) -> Iterable[ANSICommand]:
         """Feed text potentially containing ANSI sequences, and parse in to
@@ -517,11 +535,7 @@ class ANSIStream:
                         absolute_y=int(row or 1) - 1,
                     )
                 case [characters, _, "P"]:
-                    return ANSICursor(
-                        clear_range=(0, int(characters or 1) - 1),
-                        relative=True,
-                        erase=True,
-                    )
+                    return ANSIDeleteCharacter(int(characters or 1))
                 case [lines, _, "S"]:
                     return ANSIScroll(-1, int(lines))
                 case [lines, _, "T"]:
@@ -552,13 +566,14 @@ class ANSIStream:
                 case [top, bottom, "r"]:
                     return ANSIScrollMargin(
                         int(top or "1") - 1 if top else None,
-                        int(bottom or "1") - 1 if top else None,
+                        int(bottom or "1") - 1 if bottom else None,
                     )
                 case ["4", _, "h" | "l" as replace_mode]:
+                    # IRM: ESC[4h = insert mode, ESC[4l = replace mode
                     return (
-                        cls.ENABLE_REPLACE_MODE
+                        cls.DISABLE_REPLACE_MODE
                         if replace_mode == "h"
-                        else cls.DISABLE_REPLACE_MODE
+                        else cls.ENABLE_REPLACE_MODE
                     )
 
                 case ["6", _, "n"]:
@@ -653,10 +668,15 @@ class ANSIStream:
 
             case ["csi", csi]:
                 if csi.endswith("m"):
-                    if (sgr_style := self._parse_sgr(csi[1:-1])) is None:
+                    sgr_result = self._parse_sgr(csi[1:-1])
+                    if sgr_result is None:
                         self.style = NULL_STYLE
                     else:
-                        self.style += sgr_style
+                        sgr_style, did_reset = sgr_result
+                        if did_reset:
+                            self.style = sgr_style
+                        else:
+                            self.style += sgr_style
                         # Special case to use widget background rather
                         # than theme background
                         if (
@@ -1017,9 +1037,9 @@ class TerminalState:
 
     async def write_stdin(self, text: str) -> bool:
         if self._write_stdin is not None:
-            return await self._write_stdin(text)
-            return False
-        return True
+            await self._write_stdin(text)
+            return True
+        return False
 
     @property
     def screen_start_line_no(self) -> int:
@@ -1344,7 +1364,7 @@ class TerminalState:
                         strip_control_codes=False,
                     )
                 self.update_line(buffer, line_no, updated_line)
-                buffer.update_cursor(line_no, cursor_line_offset + len(content))
+                buffer.update_cursor(line_no, cursor_line_offset + content.cell_length)
                 buffer.updates = self.advance_updates()
 
             case ANSICursor(
@@ -1373,13 +1393,11 @@ class TerminalState:
                         screen_cursor_line >= margin_top
                         and screen_cursor_line <= margin_bottom
                     ):
-                        start_line_no = self.screen_start_line_no
-
                         scroll_cursor = screen_cursor_line + delta_y
-                        if scroll_cursor > (start_line_no + margin_bottom):
+                        if scroll_cursor > margin_bottom:
                             self.scroll_buffer(-1, 1)
                             return
-                        if scroll_cursor < (start_line_no + margin_top):
+                        if scroll_cursor < margin_top:
                             self.scroll_buffer(+1, 1)
                             return
 
@@ -1461,6 +1479,24 @@ class TerminalState:
                     self._line_updated(buffer, current_cursor_line)
                     self._line_updated(buffer, buffer.cursor_line)
 
+            case ANSIDeleteCharacter(count):
+                buffer = self.buffer
+                if buffer.cursor_line < len(buffer.folded_lines):
+                    folded_line = buffer.folded_lines[buffer.cursor_line]
+                    line_no = folded_line.line_no
+                    line = buffer.lines[line_no]
+                    cursor_offset = self.get_cursor_line_offset(buffer)
+                    content = line.content
+                    deleted_end = min(cursor_offset + count, len(content))
+                    before = content[:cursor_offset]
+                    after = content[deleted_end:]
+                    padding = Content.blank(deleted_end - cursor_offset, line.style)
+                    updated = Content.assemble(
+                        before, after, padding, strip_control_codes=False
+                    )
+                    self.update_line(buffer, line_no, updated)
+                    buffer.updates = self.advance_updates()
+
             case ANSIFeatures() as features:
                 if features.show_cursor is not None:
                     self.show_cursor = features.show_cursor
@@ -1474,6 +1510,8 @@ class TerminalState:
                     self.cursor_keys = features.cursor_keys
                 if features.auto_wrap is not None:
                     self.auto_wrap = features.auto_wrap
+                if features.replace_mode is not None:
+                    self.replace_mode = features.replace_mode
                 self.advance_updates()
 
             case ANSIClear(clear):

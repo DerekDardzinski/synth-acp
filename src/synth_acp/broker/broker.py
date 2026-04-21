@@ -647,18 +647,29 @@ class ACPBroker:
     async def shutdown(self) -> None:
         self._shutting_down = True
 
-        if self._lifecycle:
-            await self._lifecycle.shutdown()
+        try:
+            if self._lifecycle:
+                await self._lifecycle.shutdown()
+        except Exception:
+            log.debug("Lifecycle shutdown error", exc_info=True)
 
-        # Mark active agents restorable BEFORE closing the DB connection.
-        if self._lifecycle:
-            await self._lifecycle.mark_agents_restorable()
+        try:
+            if self._lifecycle:
+                await self._lifecycle.mark_agents_restorable()
+        except Exception:
+            log.debug("mark_agents_restorable error", exc_info=True)
 
-        if self._message_bus:
-            await self._message_bus.stop()
+        try:
+            if self._message_bus:
+                await self._message_bus.stop()
+        except Exception:
+            log.debug("MessageBus stop error", exc_info=True)
 
-        if self._lifecycle:
-            await self._lifecycle.close_db()
+        try:
+            if self._lifecycle:
+                await self._lifecycle.close_db()
+        except Exception:
+            log.debug("close_db error", exc_info=True)
 
         # Backward-compat sessions.json
         sessions_path = Path.home() / ".synth" / "sessions.json"

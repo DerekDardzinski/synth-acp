@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from acp.schema import PermissionOption
 
-from synth_acp.cli import parse_input, parse_permission_response
+from synth_acp.cli import _build_transient_config, parse_input, parse_permission_response
 
 
 class TestParseInput:
@@ -37,3 +39,14 @@ class TestParsePermissionResponse:
         ]
         assert parse_permission_response("2", options) == "allow-always"
 
+
+
+class TestBuildTransientConfig:
+    """Tests for _build_transient_config."""
+
+    def test_build_transient_config_when_called_sets_absolute_cwd(self) -> None:
+        """Transient config must resolve cwd to an absolute path, not '.'."""
+        config = _build_transient_config("kiro", None, None)
+        agent = config.agents[0]
+        assert agent.cwd != "."
+        assert Path(agent.cwd).is_absolute()
