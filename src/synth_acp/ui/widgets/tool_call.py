@@ -2,15 +2,32 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from textual.containers import Vertical, VerticalScroll
+from textual.content import Content
 from textual.highlight import highlight
 from textual.markup import escape
 from textual.widgets import Label, Markdown, Rule, Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.widgets.diff_view import DiffView
+
+_ANSI_RE = re.compile(r"\x1b\[[\d;]*[A-Za-z]")
+
+
+def _render_output(text: str, language: str | None) -> Content:
+    """Render output text, interpreting ANSI escapes when present."""
+    if _ANSI_RE.search(text):
+        from rich.ansi import AnsiDecoder
+
+        decoder = AnsiDecoder()
+        lines = list(decoder.decode(text))
+        parts = [Content.from_rich_text(line) for line in lines]
+        return Content("\n").join(parts)
+    return highlight(text, language=language)
+
 
 TOOL_KIND_STYLE: dict[str, tuple[str, str]] = {
     "read": ("◎", "#3b82f6"),
@@ -197,7 +214,7 @@ class ToolCallBlock(Vertical):
         widgets: list[Static | Label | VerticalScroll | Rule] = []
         widgets.append(Rule(line_style="dashed", id="tc-output-sep"))
         lang = "bash" if self._kind == "execute" else None
-        content = highlight(text, language=lang)
+        content = _render_output(text, language=lang)
         label = Label(content, id="tc-raw-output-label")
         scroll = VerticalScroll(label, id="tc-raw-output")
         widgets.append(scroll)
