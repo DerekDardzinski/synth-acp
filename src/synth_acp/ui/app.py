@@ -302,6 +302,8 @@ class SynthApp(App):
                 return
             if event.new_state in {AgentState.IDLE, AgentState.TERMINATED}:
                 feed.input_bar.set_busy(False)
+                if event.new_state == AgentState.IDLE and event.agent_id == self.selected_agent:
+                    feed.input_bar.query_one("#prompt-input").focus()
             elif event.new_state in {AgentState.INITIALIZING, AgentState.BUSY, AgentState.CONFIGURING}:
                 feed.input_bar.set_busy(True)
 
