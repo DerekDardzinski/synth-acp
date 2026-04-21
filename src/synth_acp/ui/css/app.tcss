@@ -265,9 +265,17 @@ PromptTextArea {
     width: 1fr;
     content-align: left middle;
 }
+.info-bar-pickers {
+    height: auto;
+}
+.info-cwd {
+    padding: 0 1;
+    margin: 0 3;
+    color: $text-muted;
+}
 .info-bar-picker {
     width: auto;
-    padding: 0 1;
+    padding: 0 1 0 0;
     color: $text-muted;
     content-align: left middle;
 }

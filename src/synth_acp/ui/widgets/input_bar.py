@@ -267,6 +267,11 @@ class InputBar(Vertical):
 
     def on_mount(self) -> None:
         """Start polling git branch if cwd is set."""
+        cwd = self.query_one("#cwd-label", Static)
+        if self._cwd_display:
+            cwd.update(self._build_cwd_label())
+        else:
+            cwd.display = False
         if self._cwd:
             self.run_worker(self._async_poll_git_branch(), name="git-poll-init")
             self.set_interval(5, self._poll_git_branch)
@@ -281,12 +286,18 @@ class InputBar(Vertical):
         if branch != self._git_branch:
             self._git_branch = branch
             try:
-                self.query_one("#info-label", Static).update(self._build_info_label())
+                label = self.query_one("#cwd-label", Static)
+                text = self._build_cwd_label()
+                label.update(text)
+                label.display = bool(text)
             except Exception:
                 pass
 
     def compose(self) -> ComposeResult:
         """Yield the text area and info bar."""
+        with Horizontal(classes="info-bar info-bar-pickers"):
+            yield _PickerLabel("mode", id="mode-picker", classes="info-bar-picker")
+            yield _PickerLabel("model", id="model-picker", classes="info-bar-picker")
         yield PromptTextArea(id="prompt-input")
         with Horizontal(classes="info-bar"):
             yield Static(
@@ -294,30 +305,28 @@ class InputBar(Vertical):
                 id="info-label",
                 classes="info-bar-left",
             )
-            yield _PickerLabel("mode", id="mode-picker", classes="info-bar-picker")
-            yield _PickerLabel("model", id="model-picker", classes="info-bar-picker")
             yield Button("Submit ⏎", id="submit-btn", classes="info-bar-right")
             yield Button("Cancel ■", id="cancel-btn", classes="info-bar-right cancel-btn")
+        yield Static("", id="cwd-label", classes="info-cwd")
         yield ActivityBar(classes="input-activity")
 
     def _build_info_label(self) -> str:
         """Build the static info label text."""
-        line1 = [
-            f"[dim]agent:[/] [$primary]{escape(self._agent_id)}[/]",
-            f"[dim]harness:[/] {escape(self._harness)}",
-        ]
-        line2: list[str] = []
+        return (
+            f"[dim]agent:[/] [$primary]{escape(self._agent_id)}[/]"
+            f" · [dim]harness:[/] {escape(self._harness)}"
+        )
+
+    def _build_cwd_label(self) -> str:
+        """Build the cwd/branch label text."""
         if self._cwd_display:
             cwd_part = self._cwd_display
             if self._git_branch:
                 cwd_part += f" ([$accent]{escape(self._git_branch)}[/])"
-            line2.append(cwd_part)
-        elif self._git_branch:
-            line2.append(f"[$accent]{escape(self._git_branch)}[/]")
-        result = " · ".join(line1)
-        if line2:
-            result += "\n" + " · ".join(line2)
-        return result
+            return cwd_part
+        if self._git_branch:
+            return f"[$accent]{escape(self._git_branch)}[/]"
+        return ""
 
     # --- Mode / model updates ---
 
