@@ -12,6 +12,7 @@ from textual.markup import escape
 from textual.widgets import Label, Markdown, Rule, Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
+from synth_acp.ui.widgets.copy_button import CopyButton
 from synth_acp.ui.widgets.diff_view import DiffView
 
 _ANSI_RE = re.compile(r"\x1b\[[\d;]*[A-Za-z]")
@@ -145,6 +146,7 @@ class ToolCallBlock(Vertical):
         self._raw_input_rendered = False
         self._raw_output_rendered = False
         self._text_rendered = False
+        self._copyable_parts: list[str] = []
 
     def _build_markup(self) -> str:
         """Build the header markup."""
@@ -154,6 +156,7 @@ class ToolCallBlock(Vertical):
 
     def compose(self):
         """Compose header and initial content widgets."""
+        yield CopyButton(lambda: "\n".join(self._copyable_parts))
         yield Static(self._build_markup(), id="tc-header")
         yield from self._location_widgets(self._initial_locations)
         yield from self._raw_input_widgets(self._initial_raw_input)
@@ -182,6 +185,7 @@ class ToolCallBlock(Vertical):
         if cmd is None:
             return []
         self._raw_input_rendered = True
+        self._copyable_parts.append(f"$ {cmd}")
         content = highlight(f"$ {cmd}", language="bash")
         return [Label(content, id="tc-raw-input")]
 
@@ -190,6 +194,7 @@ class ToolCallBlock(Vertical):
         if not text_content or self._text_rendered:
             return []
         self._text_rendered = True
+        self._copyable_parts.append(text_content)
         return [Markdown(text_content, id="tc-text", open_links=False)]
 
     def _diff_widgets(self, diffs: list[ToolCallDiff] | None) -> list[DiffView]:
@@ -211,6 +216,7 @@ class ToolCallBlock(Vertical):
         if not text:
             return []
         self._raw_output_rendered = True
+        self._copyable_parts.append(text)
         widgets: list[Static | Label | VerticalScroll | Rule] = []
         widgets.append(Rule(line_style="dashed", id="tc-output-sep"))
         lang = "bash" if self._kind == "execute" else None
