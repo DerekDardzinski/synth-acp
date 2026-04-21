@@ -651,28 +651,33 @@ class ACPBroker:
         self._shutting_down = True
 
         try:
-            if self._lifecycle:
-                await self._lifecycle.shutdown()
-        except Exception:
-            log.debug("Lifecycle shutdown error", exc_info=True)
+            try:
+                if self._lifecycle:
+                    await self._lifecycle.shutdown()
+            except Exception:
+                log.debug("Lifecycle shutdown error", exc_info=True)
 
-        try:
-            if self._lifecycle:
-                await self._lifecycle.mark_agents_restorable()
-        except Exception:
-            log.debug("mark_agents_restorable error", exc_info=True)
+            try:
+                if self._lifecycle:
+                    await self._lifecycle.mark_agents_restorable()
+            except Exception:
+                log.debug("mark_agents_restorable error", exc_info=True)
 
-        try:
-            if self._message_bus:
-                await self._message_bus.stop()
-        except Exception:
-            log.debug("MessageBus stop error", exc_info=True)
+            try:
+                if self._message_bus:
+                    await self._message_bus.stop()
+            except Exception:
+                log.debug("MessageBus stop error", exc_info=True)
+        finally:
+            # close_db and _shutdown_event.set MUST run — an unclosed
+            # aiosqlite connection keeps a non-daemon thread alive.
+            try:
+                if self._lifecycle:
+                    await self._lifecycle.close_db()
+            except Exception:
+                log.debug("close_db error", exc_info=True)
 
-        try:
-            if self._lifecycle:
-                await self._lifecycle.close_db()
-        except Exception:
-            log.debug("close_db error", exc_info=True)
+            self._shutdown_event.set()
 
         # Backward-compat sessions.json
         sessions_path = Path.home() / ".synth" / "sessions.json"
@@ -689,5 +694,3 @@ class ACPBroker:
             Path(tmp).rename(sessions_path)
         except Exception:
             Path(tmp).unlink(missing_ok=True)
-
-        self._shutdown_event.set()

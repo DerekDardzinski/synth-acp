@@ -674,3 +674,12 @@ class SynthApp(App):
             await self.broker.shutdown()
         except Exception:
             log.debug("Broker shutdown error", exc_info=True)
+        finally:
+            # Guarantee DB cleanup even if shutdown was interrupted —
+            # an unclosed aiosqlite connection keeps a non-daemon thread
+            # alive, hanging the process after the event loop exits.
+            if self.broker._lifecycle:
+                try:
+                    await self.broker._lifecycle.close_db()
+                except Exception:
+                    pass
