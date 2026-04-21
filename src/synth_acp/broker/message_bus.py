@@ -53,6 +53,7 @@ class MessageBus:
         self._server: asyncio.Server | None = None
         self._socket_path = str(Path(tempfile.gettempdir()) / f"synth-{session_id}.sock")
         self._wake_event = asyncio.Event()
+        self._delivery_db: aiosqlite.Connection | None = None
 
     @property
     def socket_path(self) -> str:
@@ -78,6 +79,15 @@ class MessageBus:
                 task.cancel()
         if self._tasks:
             await asyncio.wait(self._tasks, timeout=timeout)
+        # Safety net: close the delivery loop DB if the task didn't
+        # finish in time — prevents a non-daemon aiosqlite thread
+        # from keeping the process alive after the event loop exits.
+        if self._delivery_db is not None:
+            try:
+                await self._delivery_db.close()
+            except Exception:
+                pass
+            self._delivery_db = None
         sock = Path(self._socket_path)
         if sock.exists():
             sock.unlink()
@@ -119,6 +129,7 @@ class MessageBus:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             async with aiosqlite.connect(self._db_path) as db:
+                self._delivery_db = db
                 await ensure_schema_async(db)
                 await db.commit()
                 await self._deliver_pending(db)
@@ -144,6 +155,8 @@ class MessageBus:
             raise
         except Exception:
             log.exception("MessageBus connection error")
+        finally:
+            self._delivery_db = None
 
     async def _deliver_pending(self, db: aiosqlite.Connection) -> None:
         """Query pending messages, group by recipient, deliver with kind-aware formatting."""
