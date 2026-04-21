@@ -1,40 +1,30 @@
 {
-  "project": "test",
+  "project": "coding-workflow",
+
+  "agents": [
+    {
+      "agent_id": "planner",
+      "harness": "kiro",
+      "agent_mode": "code-planner"
+    }
+  ],
   "settings": {
+    "communication_mode": "LOCAL",
     "auto_approve_tools": [
       "synth-mcp/send_message",
       "synth-mcp/check_delivery",
       "synth-mcp/launch_agent",
+      "synth-mcp/terminate_agent",
       "synth-mcp/list_agents",
       "synth-mcp/get_my_context"
     ],
     "hooks": {
-      "on_agent_join": {
-        "recipients": "none",
-        "template": "Agent \"{agent_id}\" is now active. Task: \"{task}\"."
-      },
-      "on_agent_exit": {
-        "recipients": "none",
-        "template": "Agent \"{agent_id}\" has left the session."
+      "on_agent_startup": {
+        "prepend": "<orchestration_context>\nagent_id: {agent_id}\nsession: You are in a multi-agent coding session.\ncommunication: Use send_message() to talk to other agents. Your text output goes to the human UI only — other agents cannot see it.\nrecovery: Call get_my_context() if you lose track of your identity or parent.\n</orchestration_context>\n\n"
       },
       "on_agent_prompt": {
-        "prepend": "<orchestration_context>\nagent_id: {agent_id}\nparent_agent: {parent_id}\nreply_tool: send_message(to_agent='{parent_id}', kind='response')\nvisibility: Your text output goes to the UI only. Other agents cannot see it.\nrecovery: Call get_my_context() if you lose track of this information.\n</orchestration_context>\n\n"
-      },
-      "on_agent_startup": {
-        "prepend": "<orchestration_context>\nYour agent_id: {agent_id}\nsession: You are in a multi-agent session. Use list_agents() to see other agents.\ncommunication: Use send_message() to talk to other agents. Your text output goes to the user only.\nchild_agents: When launching child agents, instruct them to send_message(to_agent='{agent_id}', kind='response').\n</orchestration_context>\n\n"
+        "prepend": "<orchestration_context>\nagent_id: {agent_id}\ntask: {task}\nparent_agent: {parent_id}\nreply_tool: send_message(to_agent='{parent_id}', kind='response')\nvisibility: Your text output goes to the UI only. Other agents cannot see it.\nrecovery: Call get_my_context() if you lose track of this information.\n</orchestration_context>\n\n"
       }
     }
-  },
-  "agents": [
-    {
-      "agent_id": "kiro",
-      "harness": "kiro",
-      "agent_mode": "coder"
-    },
-    {
-      "agent_id": "kiro-2",
-      "harness": "kiro",
-      "agent_mode": "coder"
-    }
-  ]
+  }
 }

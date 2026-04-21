@@ -1,0 +1,43 @@
+formula = "spec-driven"
+description = "Spec-driven coding workflow with adaptive depth"
+version = 3
+type = "workflow"
+
+[vars.feature]
+description = "Feature name"
+required = true
+
+[[steps]]
+id = "research"
+title = "Research: {{feature}}"
+description = "Dispatch researchers. Post merged findings as comments on molecule root."
+
+[[steps]]
+id = "interview"
+title = "Interview: {{feature}}"
+description = "Gather requirements. Post Q&A as comments on molecule root."
+needs = ["research"]
+
+[[steps]]
+id = "design-dag"
+title = "Design DAG: {{feature}}"
+description = "Create phase tasks as children of molecule root with --description, --design, --acceptance. Wire dependencies."
+needs = ["interview"]
+
+[[steps]]
+id = "review-plan"
+title = "Review plan: {{feature}}"
+description = "Dispatch code-plan-critic. Verify DAG completeness, criterion testability, and file scope disjointness."
+needs = ["design-dag"]
+
+[[steps]]
+id = "implement"
+title = "Implement: {{feature}}"
+description = "Dispatch code-builders for ready phase tasks. Max 3 concurrent."
+needs = ["review-plan"]
+
+[[steps]]
+id = "finalize"
+title = "Finalize: {{feature}}"
+description = "Full project tool gate, changelog on root issue, bd vc commit, report to user."
+needs = ["implement"]
