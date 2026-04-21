@@ -53,6 +53,10 @@ class AgentRegistry:
     def get_harness(self, agent_id: str) -> str:
         return self._harnesses.get(agent_id, "")
 
+    def get_cwd(self, agent_id: str) -> str:
+        s = self._sessions.get(agent_id)
+        return s._cwd if s else ""
+
     def orphan_children(self, parent_id: str) -> None:
         for aid, p in self._parents.items():
             if p == parent_id:

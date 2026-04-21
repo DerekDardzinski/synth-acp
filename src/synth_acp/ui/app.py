@@ -61,11 +61,14 @@ class DynamicAgentInfo(NamedTuple):
     Attributes:
         parent: Agent ID of the parent, or None.
         task: Task description.
+        harness: Harness short name.
+        cwd: Working directory.
     """
 
     parent: str | None
     task: str
     harness: str
+    cwd: str = ""
 
 
 class SynthApp(App):
@@ -195,7 +198,7 @@ class SynthApp(App):
             if event.agent_id not in self._dynamic_agents and event.agent_id not in {a.agent_id for a in self.config.agents}:
                 parent = self.broker.get_agent_parent(event.agent_id)
                 harness = self.broker.get_agent_harness(event.agent_id)
-                self._dynamic_agents[event.agent_id] = DynamicAgentInfo(parent=parent, task="", harness=harness)
+                self._dynamic_agents[event.agent_id] = DynamicAgentInfo(parent=parent, task="", harness=harness, cwd=self.broker.get_agent_cwd(event.agent_id))
                 self._event_buffers.setdefault(event.agent_id, [])
                 try:
                     agent_list = self.query_one(AgentList)
@@ -487,11 +490,13 @@ class SynthApp(App):
             agent_cfg = next((a for a in self.config.agents if a.agent_id == agent_id), None)
             agent_name = agent_cfg.display_name if agent_cfg else agent_id
             harness = agent_cfg.harness if agent_cfg else ""
+            cwd = agent_cfg.cwd if agent_cfg else ""
             if not harness:
                 dyn = self._dynamic_agents.get(agent_id)
                 if dyn:
                     harness = dyn.harness
-            feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, cwd=agent_cfg.cwd if agent_cfg else "", id=f"feed-{agent_id}")
+                    cwd = cwd or dyn.cwd
+            feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, cwd=cwd, id=f"feed-{agent_id}")
             self._panels[agent_id] = feed
             await self.query_one("#right").mount(feed)
             for event in self._event_buffers.get(agent_id, []):
@@ -583,7 +588,7 @@ class SynthApp(App):
         """Launch modal logic, separated for testability."""
         result = await self.push_screen_wait(LaunchAgentScreen())
         if result is not None:
-            self._dynamic_agents[result.agent_id] = DynamicAgentInfo(parent=None, task="", harness=result.harness)
+            self._dynamic_agents[result.agent_id] = DynamicAgentInfo(parent=None, task="", harness=result.harness, cwd=result.cwd)
             self._event_buffers[result.agent_id] = []
             try:
                 self.query_one(AgentList).add_agent_tile(result.agent_id)

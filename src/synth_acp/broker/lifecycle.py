@@ -282,7 +282,7 @@ class AgentLifecycle:
         agent_id = data["agent_id"]
         harness = data["harness"]
         agent_mode = data.get("agent_mode") or None
-        cwd = data.get("cwd", ".")
+        cwd = str(Path(data.get("cwd", ".")).resolve())
         task = data.get("task", "")
         message = data.get("message", "")
 

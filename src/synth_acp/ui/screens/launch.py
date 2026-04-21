@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from pathlib import Path
 from typing import ClassVar
 
 from textual.app import ComposeResult
@@ -50,6 +51,8 @@ class LaunchAgentScreen(ModalScreen[AgentConfig | None]):
             yield Input(placeholder="e.g. my-agent", id="agent-id-input")
             yield Label("Agent Mode [dim](optional)[/dim]", classes="field-label")
             yield Input(placeholder="e.g. code, plan, chat", id="agent-mode-input")
+            yield Label("Working Directory", classes="field-label")
+            yield Input(value=str(Path.cwd().resolve()), id="cwd-input")
             yield Button("Launch", id="launch-submit", variant="primary")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -60,6 +63,7 @@ class LaunchAgentScreen(ModalScreen[AgentConfig | None]):
         harness = self.query_one("#harness-select", Select).value
         agent_id = self.query_one("#agent-id-input", Input).value.strip()
         agent_mode = self.query_one("#agent-mode-input", Input).value.strip() or None
+        cwd = self.query_one("#cwd-input", Input).value.strip()
 
         if harness is Select.BLANK:
             self.notify("Select a harness", severity="warning")
@@ -68,11 +72,14 @@ class LaunchAgentScreen(ModalScreen[AgentConfig | None]):
             self.notify("Agent ID is required", severity="warning")
             return
 
+        resolved_cwd = str(Path(cwd).resolve()) if cwd else str(Path.cwd().resolve())
+
         try:
             config = AgentConfig(
                 agent_id=agent_id,
                 harness=str(harness),
                 agent_mode=agent_mode,
+                cwd=resolved_cwd,
             )
         except ValueError as exc:
             self.notify(str(exc), severity="error")

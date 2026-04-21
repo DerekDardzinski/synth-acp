@@ -123,6 +123,9 @@ class ACPBroker:
     def get_agent_harness(self, agent_id: str) -> str:
         return self._registry.get_harness(agent_id)
 
+    def get_agent_cwd(self, agent_id: str) -> str:
+        return self._registry.get_cwd(agent_id)
+
     def get_agent_modes(self, agent_id: str) -> list[AgentMode]:
         return self._registry.get_modes(agent_id)
 

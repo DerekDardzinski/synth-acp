@@ -28,12 +28,14 @@ class TestLaunchScreen:
         mock_id_input.value = "  "
         mock_mode_input = MagicMock(spec=Input)
         mock_mode_input.value = ""
+        mock_cwd_input = MagicMock(spec=Input)
+        mock_cwd_input.value = "/tmp"
 
         with (
             patch.object(
                 screen,
                 "query_one",
-                side_effect=[mock_select, mock_id_input, mock_mode_input],
+                side_effect=[mock_select, mock_id_input, mock_mode_input, mock_cwd_input],
             ),
             patch.object(screen, "notify") as mock_notify,
             patch.object(screen, "dismiss") as mock_dismiss,
@@ -56,12 +58,14 @@ class TestLaunchScreen:
         mock_id_input.value = "my-agent"
         mock_mode_input = MagicMock(spec=Input)
         mock_mode_input.value = ""
+        mock_cwd_input = MagicMock(spec=Input)
+        mock_cwd_input.value = "/tmp"
 
         with (
             patch.object(
                 screen,
                 "query_one",
-                side_effect=[mock_select, mock_id_input, mock_mode_input],
+                side_effect=[mock_select, mock_id_input, mock_mode_input, mock_cwd_input],
             ),
             patch.object(screen, "notify") as mock_notify,
             patch.object(screen, "dismiss") as mock_dismiss,
@@ -83,12 +87,14 @@ class TestLaunchScreen:
         mock_id_input.value = "my-agent"
         mock_mode_input = MagicMock(spec=Input)
         mock_mode_input.value = "code"
+        mock_cwd_input = MagicMock(spec=Input)
+        mock_cwd_input.value = "/tmp/project"
 
         with (
             patch.object(
                 screen,
                 "query_one",
-                side_effect=[mock_select, mock_id_input, mock_mode_input],
+                side_effect=[mock_select, mock_id_input, mock_mode_input, mock_cwd_input],
             ),
             patch.object(screen, "dismiss") as mock_dismiss,
         ):
