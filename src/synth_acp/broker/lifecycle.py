@@ -408,14 +408,28 @@ class AgentLifecycle:
 
         Also transitions status from 'restorable' to 'active' at this point,
         so only fully-connected agents are considered active.
+
+        Uses asyncio.to_thread + sync sqlite3 because this callback fires
+        from a background agent task and can race with shutdown.  A sync
+        write on a daemon pool thread cannot keep the process alive.
         """
-        db = await self._ensure_db()
-        await db.execute(
-            "UPDATE agents SET acp_session_id = ?, status = 'active' "
-            "WHERE agent_id = ? AND session_id = ?",
-            (acp_session_id, agent_id, self._session_id),
-        )
-        await db.commit()
+        def _write() -> None:
+            conn = sqlite3.connect(str(self._db_path))
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    "UPDATE agents SET acp_session_id = ?, status = 'active' "
+                    "WHERE agent_id = ? AND session_id = ?",
+                    (acp_session_id, agent_id, self._session_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception:
+            log.debug("Failed to persist acp_session_id for %s", agent_id, exc_info=True)
 
     async def mark_agents_restorable(self) -> None:
         """Mark all active agents in this session as restorable.
