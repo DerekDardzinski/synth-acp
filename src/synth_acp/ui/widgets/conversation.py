@@ -41,6 +41,9 @@ class ConversationFeed(Vertical):
         agent_name: Display name for the agent.
     """
 
+    # Pixel threshold for considering the user "at the bottom".
+    _BOTTOM_THRESHOLD = 20
+
     def __init__(
         self,
         agent_id: str,
@@ -63,6 +66,7 @@ class ConversationFeed(Vertical):
         self._scroll: ScrollableContainer | None = None
         self.input_bar: InputBar | None = None
         self._pending_terminals: dict[str, TerminalProcess] = {}
+        self._follow: bool = True
 
     def compose(self) -> ComposeResult:
         """Yield the scrollable container and input bar."""
@@ -74,6 +78,22 @@ class ConversationFeed(Vertical):
         """Cache the scroll container and input bar references."""
         self._scroll = self.query_one(".conv-scroll", ScrollableContainer)
         self.input_bar = self.query_one(InputBar)
+
+    def _is_at_bottom(self) -> bool:
+        """Return True if the scroll container is near the bottom."""
+        if self._scroll is None:
+            return True
+        max_y = self._scroll.max_scroll_y
+        return max_y - self._scroll.scroll_y <= self._BOTTOM_THRESHOLD
+
+    def _scroll_to_bottom(self) -> None:
+        """Schedule a scroll-to-bottom after the next layout pass."""
+        if self._scroll is not None and self._follow:
+            self._scroll.call_after_refresh(self._scroll.scroll_end, animate=False)
+
+    def on_scroll(self) -> None:
+        """Track whether the user has scrolled away from the bottom."""
+        self._follow = self._is_at_bottom()
 
     @property
     def _mount_target(self) -> TurnContainer | ScrollableContainer | None:
@@ -104,7 +124,8 @@ class ConversationFeed(Vertical):
             return
         ts = datetime.now(UTC).strftime("%H:%M")
         turn.mount(PromptBubble(text, ts))
-        self._scroll.scroll_end(animate=False)
+        self._follow = True
+        self._scroll_to_bottom()
 
     async def add_chunk(self, chunk: str) -> None:
         """Append a streaming chunk, creating an AgentMessage if needed.
@@ -119,8 +140,7 @@ class ConversationFeed(Vertical):
                 return
             target.mount(self._current_message)
         await self._current_message.append_chunk(chunk)
-        if self._scroll is not None:
-            self._scroll.scroll_end(animate=False)
+        self._scroll_to_bottom()
 
     async def add_thought_chunk(self, chunk: str) -> None:
         """Append a streaming thought chunk, creating a ThoughtBlock if needed.
@@ -135,8 +155,7 @@ class ConversationFeed(Vertical):
                 return
             target.mount(self._current_thought)
         await self._current_thought.append_chunk(chunk)
-        if self._scroll is not None:
-            self._scroll.scroll_end(animate=False)
+        self._scroll_to_bottom()
 
     async def add_tool_call(
         self,
@@ -179,6 +198,7 @@ class ConversationFeed(Vertical):
                 diffs=diffs,
                 text_content=text_content,
             )
+            self._scroll_to_bottom()
         except Exception:
             log.debug("Tool call query failed", exc_info=True)
             if self._current_message is not None:
@@ -205,7 +225,7 @@ class ConversationFeed(Vertical):
 
                 process = self._pending_terminals.pop(terminal_id)
                 await block.mount(Terminal(process))
-            self._scroll.scroll_end(animate=False)
+            self._scroll_to_bottom()
 
     async def finalize_current_message(self) -> None:
         """Finalize the active streaming message, thought block, and turn."""
@@ -232,7 +252,7 @@ class ConversationFeed(Vertical):
         self._plan_block = block
         target = self._mount_target or self._scroll
         await target.mount(block)
-        self._scroll.scroll_end(animate=False)
+        self._scroll_to_bottom()
 
     def add_mcp_message(self, from_agent: str, to_agent: str, preview: str) -> None:
         """Mount an MCP message delivery notification inside a new turn.
@@ -262,7 +282,8 @@ class ConversationFeed(Vertical):
         container.mount(
             Static(f"[dim]◈ {escape(from_agent)} → {escape(to_agent)}  {ts}[/dim]", classes="bubble-ts")
         )
-        self._scroll.scroll_end(animate=False)
+        self._follow = True
+        self._scroll_to_bottom()
 
     def add_hook_notification(self, hook_name: str) -> None:
         """Mount a dim system line indicating a lifecycle hook fired."""
@@ -275,8 +296,7 @@ class ConversationFeed(Vertical):
             classes="hook-notification",
         )
         target.mount(widget)
-        if self._scroll is not None:
-            self._scroll.scroll_end(animate=False)
+        self._scroll_to_bottom()
 
     async def mount_terminal(self, terminal_id: str, terminal_process: TerminalProcess) -> None:
         """Mount a Terminal widget inside the matching ToolCallBlock.
@@ -311,7 +331,7 @@ class ConversationFeed(Vertical):
             return
         block = ShellResultBlock(command)
         turn.mount(block)
-        self._scroll.scroll_end(animate=False)
+        self._scroll_to_bottom()
 
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -321,4 +341,5 @@ class ConversationFeed(Vertical):
         stdout, _ = await proc.communicate()
         output = stdout.decode(errors="replace") if stdout else ""
         block.set_output(output, proc.returncode or 0)
+        self._scroll_to_bottom()
         self._current_turn = None
