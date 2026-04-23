@@ -14,7 +14,7 @@ from textual.widgets import ContentSwitcher, Footer
 from textual.worker import Worker, WorkerState
 
 from synth_acp.broker.broker import ACPBroker
-from synth_acp.models.agent import AgentMode, AgentModel, AgentState
+from synth_acp.models.agent import AgentMode, AgentModel, AgentState, css_id
 from synth_acp.models.commands import LaunchAgent, RespondPermission, TerminateAgent
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
@@ -206,7 +206,7 @@ class SynthApp(App):
                 except Exception:
                     self.log.error(f"Failed to add tile for {event.agent_id}", exc_info=True)
             try:
-                tile = self.query_one(f"#tile-{event.agent_id}", AgentTile)
+                tile = self.query_one(f"#tile-{css_id(event.agent_id)}", AgentTile)
                 if event.new_state == AgentState.TERMINATED:
                     self._agent_modes.pop(event.agent_id, None)
                     self._agent_current_mode.pop(event.agent_id, None)
@@ -412,7 +412,7 @@ class SynthApp(App):
         modes = self._agent_modes.get(agent_id, [])
         mode_name = next((m.name for m in modes if m.id == mode_id), None)
         try:
-            tile = self.query_one(f"#tile-{agent_id}", AgentTile)
+            tile = self.query_one(f"#tile-{css_id(agent_id)}", AgentTile)
             tile.update_mode(mode_name)
         except Exception:
             log.debug("Agent tile not found for mode update: %s", agent_id, exc_info=True)
@@ -498,7 +498,7 @@ class SynthApp(App):
                 if dyn:
                     harness = dyn.harness
                     cwd = cwd or dyn.cwd
-            feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, cwd=cwd, id=f"feed-{agent_id}")
+            feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, cwd=cwd, id=f"feed-{css_id(agent_id)}")
             self._panels[agent_id] = feed
             await self.query_one("#right").mount(feed)
             for event in self._event_buffers.get(agent_id, []):
@@ -520,7 +520,7 @@ class SynthApp(App):
                     pass
 
         switcher = self.query_one("#right", ContentSwitcher)
-        if self.selected_agent == agent_id and switcher.current != f"feed-{agent_id}":
+        if self.selected_agent == agent_id and switcher.current != f"feed-{css_id(agent_id)}":
             self.watch_selected_agent(agent_id)
         else:
             self.selected_agent = agent_id
@@ -533,7 +533,7 @@ class SynthApp(App):
         """
         if not agent_id:
             return
-        self.query_one(ContentSwitcher).current = f"feed-{agent_id}"
+        self.query_one(ContentSwitcher).current = f"feed-{css_id(agent_id)}"
         for tile in self.query(AgentTile):
             tile.set_class(tile._agent_id == agent_id, "tile-active")
         try:
@@ -549,7 +549,7 @@ class SynthApp(App):
         if switcher.current == "messages":
             # Close messages panel — return to selected agent
             if self.selected_agent:
-                switcher.current = f"feed-{self.selected_agent}"
+                switcher.current = f"feed-{css_id(self.selected_agent)}"
                 self.watch_selected_agent(self.selected_agent)
             return
 
@@ -638,7 +638,7 @@ class SynthApp(App):
                 for agent in self.config.agents:
                     if agent.agent_id not in restored_ids:
                         try:
-                            tile = self.query_one(f"#tile-{agent.agent_id}", AgentTile)
+                            tile = self.query_one(f"#tile-{css_id(agent.agent_id)}", AgentTile)
                             tile.remove()
                         except Exception:
                             pass

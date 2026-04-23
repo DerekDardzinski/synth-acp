@@ -10,6 +10,15 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
+def css_id(agent_id: str) -> str:
+    """Sanitize an agent ID for use as a Textual CSS identifier.
+
+    Textual widget IDs only allow letters, digits, hyphens, and underscores.
+    Dots (valid in agent IDs) are replaced with hyphens.
+    """
+    return agent_id.replace(".", "-")
+
+
 class AgentState(StrEnum):
     """ACP session lifecycle states."""
 
@@ -109,10 +118,10 @@ class AgentConfig(BaseModel, frozen=True):
     @classmethod
     def validate_agent_id(cls, v: str) -> str:
         """Validate agent_id matches the allowed identifier pattern."""
-        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", v):
+        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$", v):
             raise ValueError(
                 f"Agent ID '{v}' must start with alphanumeric and contain only "
-                f"letters, digits, hyphens, underscores"
+                f"letters, digits, hyphens, underscores, dots"
             )
         return v
 

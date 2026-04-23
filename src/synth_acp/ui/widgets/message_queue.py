@@ -11,6 +11,7 @@ from textual.markup import escape
 from textual.widgets import Static
 from textual.widgets.markdown import Markdown
 
+from synth_acp.models.agent import css_id
 from synth_acp.models.events import McpMessageDelivered
 
 log = logging.getLogger(__name__)
@@ -75,7 +76,7 @@ class ThreadItem(Static):
         content = (
             f"[$primary bold]{escape(a)}[/] [dim]→[/dim] [$primary bold]{escape(b)}[/]\n{preview_line}"
         )
-        key_id = f"titem-{a}-{b}"
+        key_id = f"titem-{css_id(a)}-{css_id(b)}"
         super().__init__(content, id=key_id, classes="thread-item")
 
     def on_click(self) -> None:
@@ -158,7 +159,7 @@ class MessageQueue(Vertical):
         # Highlight selected
         a, b = thread_key
         try:
-            self.query_one(f"#titem-{a}-{b}", ThreadItem).add_class("thread-active")
+            self.query_one(f"#titem-{css_id(a)}-{css_id(b)}", ThreadItem).add_class("thread-active")
         except Exception:
             log.debug("Thread item highlight failed", exc_info=True)
         # Populate detail

@@ -8,7 +8,7 @@ from textual.markup import escape
 from textual.message import Message
 from textual.widgets import Static
 
-from synth_acp.models.agent import AgentState
+from synth_acp.models.agent import AgentState, css_id
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
 
 STATUS_DOT: dict[AgentState, str] = {
@@ -78,7 +78,7 @@ class AgentTile(Vertical):
         self._agent_task = task
         self._parent_agent = parent
         self._current_mode: str | None = None
-        super().__init__(id=f"tile-{agent_id}")
+        super().__init__(id=f"tile-{css_id(agent_id)}")
         if state == AgentState.AWAITING_PERMISSION:
             self.add_class("tile-permission")
 
