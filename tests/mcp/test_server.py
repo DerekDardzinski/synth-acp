@@ -114,7 +114,7 @@ class TestLaunchAgent:
         assert payload["agent_id"] == "worker-1"
         assert payload["harness"] == "kiro"
 
-    async def test_launch_agent_when_at_capacity_returns_queued(self, db_path: Path, mcp_factory) -> None:
+    async def test_launch_agent_when_at_capacity_returns_error(self, db_path: Path, mcp_factory) -> None:
         _register_agents(db_path, [("agent-a", None, None)])
         server = mcp_factory()
         launch_agent = _get_tool(server, "launch_agent")
@@ -123,8 +123,8 @@ class TestLaunchAgent:
             result = json.loads(
                 await launch_agent(agent_id="worker-1", harness="kiro", message="Start working")
             )
-        assert result["ok"] is True
-        assert result["queued"] is True
+        assert "error" in result
+        assert "Max agents" in result["error"]
 
 
 class TestListAgents:

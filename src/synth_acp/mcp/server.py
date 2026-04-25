@@ -187,6 +187,17 @@ def create_mcp_server(
         """
         async with _db_conn() as conn:
             await _ensure_registered(conn)
+
+            max_agents = int(os.environ.get("SYNTH_MAX_AGENTS", "10"))
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM agents WHERE session_id = ? AND status = 'active'",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+            active = row[0] if row else 0
+            if active >= max_agents:
+                return json.dumps({"error": f"Max agents ({max_agents}) reached"})
+
             now = int(time.time() * 1000)
             payload = json.dumps(
                 {
@@ -198,22 +209,29 @@ def create_mcp_server(
                     "message": message,
                 }
             )
-            await conn.execute(
+            cursor = await conn.execute(
                 "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) VALUES (?, ?, 'launch', ?, 'pending', ?)",
                 (session_id, _caller_id, payload, now),
             )
+            cmd_id = cursor.lastrowid
             await conn.commit()
-
-            max_agents = int(os.environ.get("SYNTH_MAX_AGENTS", "10"))
-            cursor = await conn.execute(
-                "SELECT COUNT(*) FROM agents WHERE session_id = ? AND status = 'active'",
-                (session_id,),
-            )
-            row = await cursor.fetchone()
         await notify()
-        active = row[0] if row else 0
-        if active >= max_agents:
-            return json.dumps({"ok": True, "agent_id": agent_id, "queued": True})
+
+        # Poll for the broker to process the command so we can return
+        # the actual result (processed/rejected) instead of a blind ok.
+        for _ in range(10):
+            await asyncio.sleep(0.3)
+            async with _db_conn() as conn:
+                cursor = await conn.execute(
+                    "SELECT status, error FROM agent_commands WHERE id = ?",
+                    (cmd_id,),
+                )
+                row = await cursor.fetchone()
+            if row and row[0] != "pending":
+                if row[0] == "rejected":
+                    return json.dumps({"error": row[1] or "Launch rejected"})
+                return json.dumps({"ok": True, "agent_id": agent_id})
+
         return json.dumps({"ok": True, "agent_id": agent_id})
 
     @mcp.tool()

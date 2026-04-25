@@ -302,6 +302,7 @@ class AgentLifecycle:
 
         max_agents = int(os.environ.get("SYNTH_MAX_AGENTS", "10"))
         if self._registry.active_count() >= max_agents:
+            await self.update_command_status(cmd_id, "rejected", f"Max agents ({max_agents}) reached")
             return
 
         entry = next((e for e in self._harness_registry if e.short_name == harness), None)

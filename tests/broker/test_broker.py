@@ -372,7 +372,7 @@ class TestProcessCommands:
             if broker._lifecycle:
                 await broker._lifecycle.close_db()
 
-    async def test_process_commands_when_slot_opens_processes_queued_launch(
+    async def test_process_commands_when_at_capacity_rejects_with_error(
         self, tmp_path: Path
     ) -> None:
         broker = _make_broker("orchestrator", tmp_path=tmp_path)
@@ -398,29 +398,13 @@ class TestProcessCommands:
             )
             cmd_id = self._insert_command(broker, "orchestrator", "launch", payload)
 
-            # At capacity — should leave as pending
+            # At capacity — should reject with descriptive error
             with patch.dict("os.environ", {"SYNTH_MAX_AGENTS": "1"}):
                 await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
 
-            status, _ = self._get_command_status(broker, cmd_id)
-            assert status == "pending"
-
-            # Terminate the active agent to free a slot
-            mock_active.state = AgentState.TERMINATED
-
-            mock_new = AsyncMock()
-            mock_new.state = AgentState.IDLE
-            mock_new.run = AsyncMock()
-
-            with (
-                patch.dict("os.environ", {"SYNTH_MAX_AGENTS": "1"}),
-                patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_new),
-            ):
-                await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
-
-            assert "worker-1" in broker._registry._sessions
-            status, _ = self._get_command_status(broker, cmd_id)
-            assert status == "processed"
+            status, error = self._get_command_status(broker, cmd_id)
+            assert status == "rejected"
+            assert "Max agents" in error
         finally:
             if broker._message_bus:
                 await broker._message_bus.stop()
