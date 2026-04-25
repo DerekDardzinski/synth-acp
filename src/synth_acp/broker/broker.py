@@ -168,7 +168,7 @@ class ACPBroker:
                 conn.execute("PRAGMA journal_mode=WAL")
                 return conn.execute(
                     "SELECT agent_id, acp_session_id, harness, agent_mode, cwd, parent "
-                    "FROM agents WHERE session_id = ? AND status = 'restorable' "
+                    "FROM agents WHERE session_id = ? AND status IN ('restorable', 'active') "
                     "ORDER BY parent NULLS FIRST",
                     (broker_session_id,),
                 ).fetchall()
@@ -243,7 +243,7 @@ class ACPBroker:
                 rows = conn.execute(
                     "SELECT session_id, GROUP_CONCAT(agent_id) as agents, "
                     "MAX(registered) as last_active, COUNT(*) as agent_count "
-                    "FROM agents WHERE status = 'restorable' "
+                    "FROM agents WHERE status IN ('restorable', 'active') "
                     "GROUP BY session_id ORDER BY MAX(registered) DESC"
                 ).fetchall()
                 return [
@@ -653,15 +653,15 @@ class ACPBroker:
         try:
             try:
                 if self._lifecycle:
-                    await self._lifecycle.shutdown()
-            except Exception:
-                log.debug("Lifecycle shutdown error", exc_info=True)
-
-            try:
-                if self._lifecycle:
                     await self._lifecycle.mark_agents_restorable()
             except Exception:
                 log.debug("mark_agents_restorable error", exc_info=True)
+
+            try:
+                if self._lifecycle:
+                    await self._lifecycle.shutdown()
+            except Exception:
+                log.debug("Lifecycle shutdown error", exc_info=True)
 
             try:
                 if self._message_bus:

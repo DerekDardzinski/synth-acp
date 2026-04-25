@@ -680,6 +680,11 @@ class SynthApp(App):
             # Guarantee DB cleanup even if shutdown was interrupted —
             # an unclosed aiosqlite connection keeps a non-daemon thread
             # alive, hanging the process after the event loop exits.
+            if self.broker._message_bus:
+                try:
+                    await self.broker._message_bus.stop()
+                except Exception:
+                    pass
             if self.broker._lifecycle:
                 try:
                     await self.broker._lifecycle.close_db()
