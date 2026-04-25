@@ -292,7 +292,7 @@ class AgentLifecycle:
         task = data.get("task", "")
         message = data.get("message", "")
 
-        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", agent_id):
+        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$", agent_id):
             await self.update_command_status(cmd_id, "rejected", "Invalid agent_id")
             return
 
