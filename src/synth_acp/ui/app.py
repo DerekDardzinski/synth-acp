@@ -533,7 +533,13 @@ class SynthApp(App):
         """
         if not agent_id:
             return
-        self.query_one(ContentSwitcher).current = f"feed-{css_id(agent_id)}"
+        feed_id = f"feed-{css_id(agent_id)}"
+        switcher = self.query_one(ContentSwitcher)
+        try:
+            switcher.get_child_by_id(feed_id)
+        except Exception:
+            return
+        switcher.current = feed_id
         for tile in self.query(AgentTile):
             tile.set_class(tile._agent_id == agent_id, "tile-active")
         try:
@@ -549,8 +555,7 @@ class SynthApp(App):
         if switcher.current == "messages":
             # Close messages panel — return to selected agent
             if self.selected_agent:
-                switcher.current = f"feed-{css_id(self.selected_agent)}"
-                self.watch_selected_agent(self.selected_agent)
+                await self.select_agent(self.selected_agent)
             return
 
         for tile in self.query(AgentTile):
@@ -570,8 +575,8 @@ class SynthApp(App):
         switcher.current = "messages"
 
     async def action_next_agent(self) -> None:
-        """Cycle to the next agent in config order."""
-        ids = [a.agent_id for a in self.config.agents]
+        """Cycle to the next live agent, skipping terminated ones."""
+        ids = [aid for aid, state in self._agent_states.items() if state != AgentState.TERMINATED]
         if not ids:
             return
         idx = ids.index(self.selected_agent) if self.selected_agent in ids else -1
