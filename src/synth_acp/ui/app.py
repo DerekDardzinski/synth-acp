@@ -707,3 +707,11 @@ class SynthApp(App):
                     await self.broker._lifecycle.close_db()
                 except Exception:
                     pass
+            # Shut down the default thread pool executor so its non-daemon
+            # worker threads (from asyncio.to_thread calls) don't keep the
+            # process alive after the event loop exits.
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.shutdown_default_executor()
+            except Exception:
+                pass
