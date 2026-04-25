@@ -217,6 +217,18 @@ class SynthApp(App):
                     tile.update_state(event.new_state)
             except Exception:
                 log.debug("Agent tile not found for %s", event.agent_id, exc_info=True)
+            if event.new_state == AgentState.TERMINATED:
+                feed = self._panels.pop(event.agent_id, None)
+                if feed is not None:
+                    await feed.remove()
+                self._event_buffers.pop(event.agent_id, None)
+                self._dynamic_agents.pop(event.agent_id, None)
+                if self.selected_agent == event.agent_id:
+                    live = [aid for aid, st in self._agent_states.items() if st != AgentState.TERMINATED]
+                    if live:
+                        await self.select_agent(live[0])
+                    else:
+                        self.selected_agent = ""
 
         if isinstance(event, AgentModesReceived):
             self._agent_modes[event.agent_id] = event.available_modes
