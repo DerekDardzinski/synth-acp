@@ -140,6 +140,7 @@ class SynthApp(App):
         self._agent_current_mode: dict[str, str] = {}
         self._agent_models: dict[str, list[AgentModel]] = {}
         self._agent_current_model: dict[str, str] = {}
+        self._tiles: dict[str, AgentTile] = {}
 
     def _handle_exception(self, error: Exception) -> None:
         """Log unhandled exceptions to file before Textual's default handling."""
@@ -162,6 +163,8 @@ class SynthApp(App):
     async def on_mount(self) -> None:
         """Launch all agents, select the first, and start the broker event consumer."""
         self.theme = "catppuccin-mocha"
+        for tile in self.query(AgentTile):
+            self._tiles[tile._agent_id] = tile
         for agent in self.config.agents:
             self._event_buffers[agent.agent_id] = []
         if self._restore_mode:
@@ -206,7 +209,7 @@ class SynthApp(App):
             recipient = event.to_agent
             if recipient in self._panels:
                 feed = self._panels[recipient]
-                feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
+                await feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
             elif recipient in self._event_buffers:
                 self._event_buffers[recipient].append(event)
             return
@@ -234,21 +237,21 @@ class SynthApp(App):
                 self._event_buffers.setdefault(event.agent_id, [])
                 try:
                     agent_list = self.query_one(AgentList)
-                    agent_list.add_agent_tile(event.agent_id, parent=parent)
+                    tile = agent_list.add_agent_tile(event.agent_id, parent=parent)
+                    self._tiles[event.agent_id] = tile
                 except Exception:
                     self.log.error(f"Failed to add tile for {event.agent_id}", exc_info=True)
-            try:
-                tile = self.query_one(f"#tile-{css_id(event.agent_id)}", AgentTile)
+            tile = self._tiles.get(event.agent_id)
+            if tile is not None:
                 if event.new_state == AgentState.TERMINATED:
                     self._agent_modes.pop(event.agent_id, None)
                     self._agent_current_mode.pop(event.agent_id, None)
                     self._agent_models.pop(event.agent_id, None)
                     self._agent_current_model.pop(event.agent_id, None)
+                    self._tiles.pop(event.agent_id, None)
                     tile.remove()
                 else:
                     tile.update_state(event.new_state)
-            except Exception:
-                log.debug("Agent tile not found for %s", event.agent_id, exc_info=True)
             if event.new_state == AgentState.TERMINATED:
                 feed = self._panels.pop(event.agent_id, None)
                 if feed is not None:
@@ -420,7 +423,7 @@ class SynthApp(App):
             if feed.input_bar is not None:
                 feed.input_bar.update_slash_commands(event.commands)
         elif isinstance(event, McpMessageDelivered):
-            feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
+            await feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
         elif isinstance(event, HookFired):
             feed.add_hook_notification(event.hook_name)
         elif isinstance(event, InitialPromptDelivered):
@@ -455,11 +458,9 @@ class SynthApp(App):
         mode_id = self._agent_current_mode.get(agent_id)
         modes = self._agent_modes.get(agent_id, [])
         mode_name = next((m.name for m in modes if m.id == mode_id), None)
-        try:
-            tile = self.query_one(f"#tile-{css_id(agent_id)}", AgentTile)
+        tile = self._tiles.get(agent_id)
+        if tile is not None:
             tile.update_mode(mode_name)
-        except Exception:
-            log.debug("Agent tile not found for mode update: %s", agent_id, exc_info=True)
 
     def _get_input_bar(self, agent_id: str) -> InputBar | None:
         """Return the InputBar for an agent, or None."""
@@ -544,15 +545,17 @@ class SynthApp(App):
                     cwd = cwd or dyn.cwd
             feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, cwd=cwd, id=f"feed-{css_id(agent_id)}")
             self._panels[agent_id] = feed
-            await self.query_one("#right").mount(feed)
+            await self.query_one("#right", ContentSwitcher).add_content(feed, set_current=False)
+            tile = self._tiles.get(agent_id)
+            if tile is not None:
+                tile.subscribe_feed(feed)
             with self.batch_update():
                 for event in _coalesce_events(self._event_buffers.get(agent_id, [])):
                     await self._replay_event(feed, event)
             self._event_buffers[agent_id] = []
             # Scroll to bottom after replay so restored sessions show latest messages.
-            # Use set_timer to let the deferred batch_update layout fully settle.
-            feed._follow = True
-            self.set_timer(0.2, lambda: feed._scroll.scroll_end(animate=False) if feed._scroll else None)
+            if feed._scroll:
+                feed._scroll.anchor()
             # Hide spinner if agent already passed INITIALIZING while buffered
             state = self._agent_states.get(agent_id)
             if state not in {AgentState.INITIALIZING, AgentState.BUSY, AgentState.CONFIGURING}:
@@ -589,7 +592,7 @@ class SynthApp(App):
         except Exception:
             return
         switcher.current = feed_id
-        for tile in self.query(AgentTile):
+        for tile in self._tiles.values():
             tile.set_class(tile._agent_id == agent_id, "tile-active")
         try:
             self.query_one("#mcp-btn", MCPButton).remove_class("btn-active")
@@ -607,7 +610,7 @@ class SynthApp(App):
                 await self.select_agent(self.selected_agent)
             return
 
-        for tile in self.query(AgentTile):
+        for tile in self._tiles.values():
             tile.remove_class("tile-active")
         try:
             self.query_one("#mcp-btn", MCPButton).add_class("btn-active")
@@ -617,7 +620,7 @@ class SynthApp(App):
         if self._mcp_panel is None:
             panel = MessageQueue(self._mcp_threads, id="messages")
             self._mcp_panel = panel
-            await switcher.mount(panel)
+            await switcher.add_content(panel, set_current=False)
         else:
             await self._mcp_panel.update_threads(self._mcp_threads)
 
@@ -647,7 +650,8 @@ class SynthApp(App):
             self._dynamic_agents[result.agent_id] = DynamicAgentInfo(parent=None, task="", harness=result.harness, cwd=result.cwd)
             self._event_buffers[result.agent_id] = []
             try:
-                self.query_one(AgentList).add_agent_tile(result.agent_id)
+                tile = self.query_one(AgentList).add_agent_tile(result.agent_id)
+                self._tiles[result.agent_id] = tile
             except Exception:
                 log.debug("Failed to add tile for %s", result.agent_id, exc_info=True)
             await self.select_agent(result.agent_id)
@@ -691,11 +695,9 @@ class SynthApp(App):
                 restored_ids = set(session_info["agents"])
                 for agent in self.config.agents:
                     if agent.agent_id not in restored_ids:
-                        try:
-                            tile = self.query_one(f"#tile-{css_id(agent.agent_id)}", AgentTile)
+                        tile = self._tiles.pop(agent.agent_id, None)
+                        if tile is not None:
                             tile.remove()
-                        except Exception:
-                            pass
 
             # Load journal events into buffers BEFORE creating panels.
             # select_agent will drain them through _replay_event after

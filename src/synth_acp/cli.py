@@ -453,7 +453,13 @@ def _run_tui(config: SessionConfig, style: str = "default", restore: bool = Fals
         style: CSS style variant name.
         restore: Whether to show the session picker on startup.
     """
+    from textual.geometry import Region
+
     from synth_acp.ui.app import SynthApp
+    if type(Region).__module__ != "builtins":
+        logging.getLogger("synth_acp").warning(
+            "textual-speedups not active — install textual-speedups for better performance"
+        )
 
     broker = ACPBroker(config)
     css_path = _STYLE_CSS.get(style, _STYLE_CSS["default"])

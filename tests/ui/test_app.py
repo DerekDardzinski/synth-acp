@@ -185,17 +185,17 @@ class TestShowMessagesContentSwitcher:
         """First call creates MessageQueue with id='messages' and mounts it."""
         app = _make_app("agent-1")
 
-        mock_switcher = SimpleNamespace(current=None, mount=AsyncMock())
+        mock_switcher = SimpleNamespace(current=None, add_content=AsyncMock())
         with (
             patch.object(app, "query_one", return_value=mock_switcher),
-            patch.object(app, "query", return_value=[]),
+            patch.object(app, "_tiles", {}),
         ):
             await app.show_messages()
 
         assert app._mcp_panel is not None
         assert isinstance(app._mcp_panel, MessageQueue)
-        mock_switcher.mount.assert_called_once()
-        mounted = mock_switcher.mount.call_args[0][0]
+        mock_switcher.add_content.assert_called_once()
+        mounted = mock_switcher.add_content.call_args[0][0]
         assert mounted.id == "messages"
         assert mock_switcher.current == "messages"
 

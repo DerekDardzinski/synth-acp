@@ -5,28 +5,17 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Vertical
 from textual.content import Content
 from textual.highlight import highlight
-from textual.widgets import Label, Markdown, Rule, Static
+from textual.lazy import Lazy
+from textual.widgets import Label, Markdown, RichLog, Rule, Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.widgets.copy_button import CopyButton
 from synth_acp.ui.widgets.diff_view import DiffView
 
 _ANSI_RE = re.compile(r"\x1b\[[\d;]*[A-Za-z]")
-
-
-def _render_output(text: str, language: str | None) -> Content:
-    """Render output text, interpreting ANSI escapes when present."""
-    if _ANSI_RE.search(text):
-        from rich.ansi import AnsiDecoder
-
-        decoder = AnsiDecoder()
-        lines = list(decoder.decode(text))
-        parts = [Content.from_rich_text(line) for line in lines]
-        return Content("\n").join(parts)
-    return highlight(text, language=language)
 
 
 TOOL_KIND_STYLE: dict[str, tuple[str, str]] = {
@@ -157,14 +146,24 @@ class ToolCallBlock(Vertical, can_focus=False):
         )
 
     def compose(self):
-        """Compose header and initial content widgets."""
+        """Compose header and initial content widgets.
+
+        DiffView is not wrapped in Lazy because prepare() requires await
+        and compose() must be synchronous. DiffView computes its diff
+        lazily on first access instead.
+        """
         yield CopyButton(lambda: "\n".join(self._copyable_parts))
         yield Static(self._build_markup(), id="tc-header")
-        yield from self._location_widgets(self._initial_locations)
-        yield from self._raw_input_widgets(self._initial_raw_input)
-        yield from self._text_widgets(self._initial_text_content)
-        yield from self._diff_widgets(self._initial_diffs)
-        yield from self._raw_output_widgets(self._initial_raw_output)
+        for w in self._location_widgets(self._initial_locations):
+            yield w
+        for w in self._raw_input_widgets(self._initial_raw_input):
+            yield Lazy(w)
+        for w in self._text_widgets(self._initial_text_content):
+            yield w
+        for w in self._diff_widgets(self._initial_diffs):
+            yield w
+        for w in self._raw_output_widgets(self._initial_raw_output):
+            yield w
 
     def _location_widgets(self, locations: list[ToolCallLocation] | None) -> list[Static]:
         """Build location widget if applicable."""
@@ -208,7 +207,7 @@ class ToolCallBlock(Vertical, can_focus=False):
             for d in diffs
         ]
 
-    def _raw_output_widgets(self, raw_output: Any) -> list[Static | Label | VerticalScroll | Rule]:
+    def _raw_output_widgets(self, raw_output: Any) -> list[Rule | RichLog]:
         """Build raw output widget for execute/search/fetch kinds."""
         if self._kind not in {"execute", "search", "fetch"}:
             return []
@@ -219,13 +218,16 @@ class ToolCallBlock(Vertical, can_focus=False):
             return []
         self._raw_output_rendered = True
         self._copyable_parts.append(text)
-        widgets: list[Static | Label | VerticalScroll | Rule] = []
+        widgets: list[Rule | RichLog] = []
         widgets.append(Rule(line_style="dashed", id="tc-output-sep"))
-        lang = "bash" if self._kind == "execute" else None
-        content = _render_output(text, language=lang)
-        label = Label(content, id="tc-raw-output-label")
-        scroll = VerticalScroll(label, id="tc-raw-output")
-        widgets.append(scroll)
+        log = RichLog(id="tc-raw-output", highlight=True, markup=False, max_lines=2000)
+        if _ANSI_RE.search(text):
+            from rich.text import Text
+
+            log.write(Text.from_ansi(text))
+        else:
+            log.write(text)
+        widgets.append(log)
         exit_status = _extract_exit_status(raw_output)
         if exit_status is not None:
             exit_style = "success" if exit_status == 0 else "error"
@@ -259,7 +261,7 @@ class ToolCallBlock(Vertical, can_focus=False):
             diffs: File edit diffs extracted from the tool call.
             text_content: Extracted text content from the tool call.
         """
-        widgets: list[Static | Label | Markdown | DiffView | VerticalScroll | Rule] = []
+        widgets: list[Static | Label | Markdown | DiffView | RichLog | Rule] = []
         widgets.extend(self._location_widgets(locations))
         widgets.extend(self._raw_input_widgets(raw_input))
         widgets.extend(self._text_widgets(text_content))
@@ -268,8 +270,8 @@ class ToolCallBlock(Vertical, can_focus=False):
             await dv.prepare()
         widgets.extend(diff_views)
         widgets.extend(self._raw_output_widgets(raw_output))
-        for w in widgets:
-            await self.mount(w)
+        if widgets:
+            await self.mount_compose(iter(widgets))
         if hasattr(self, "_exit_style"):
             try:
                 self.query_one("#tc-output-sep").add_class(f"shell-exit-{self._exit_style}")

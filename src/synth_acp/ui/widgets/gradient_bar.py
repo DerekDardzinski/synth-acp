@@ -8,7 +8,6 @@ from time import monotonic
 from rich.segment import Segment
 from rich.style import Style as RichStyle
 from textual.color import Color, Gradient
-from textual.css.query import NoMatches
 from textual.css.styles import RulesMap
 from textual.reactive import reactive
 from textual.strip import Strip
@@ -122,23 +121,22 @@ class ActivityBar(Widget):
     ActivityBar > GradientBar {
         height: 1;
         hatch: none;
+        display: none;
     }
     ActivityBar > .activity-bar-bg {
         height: 1;
+        display: block;
+    }
+    ActivityBar.activity-active > GradientBar {
+        display: block;
+    }
+    ActivityBar.activity-active > .activity-bar-bg {
         display: none;
     }
     """
 
-    active: reactive[bool] = reactive(True)
+    active: reactive[bool] = reactive(True, toggle_class="activity-active")
 
     def compose(self):
         yield GradientBar()
         yield Static("", classes="activity-bar-bg")
-
-    def watch_active(self, value: bool) -> None:
-        """Toggle gradient vs static fallback."""
-        try:
-            self.query_one(GradientBar).display = value
-            self.query_one(".activity-bar-bg").display = not value
-        except NoMatches:
-            pass

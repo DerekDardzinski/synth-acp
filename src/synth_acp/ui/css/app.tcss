@@ -115,7 +115,7 @@ ConversationFeed {
     scrollbar-size-vertical: 1;
     scrollbar-color: $scrollbar;
     scrollbar-background: transparent;
-    align-vertical: bottom;
+    layout: stream;
     hatch: right $panel 60%;
 }
 

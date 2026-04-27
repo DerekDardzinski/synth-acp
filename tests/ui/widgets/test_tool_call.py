@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-from textual.widgets import Static
+from textual.widgets import RichLog, Static
 
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
@@ -103,15 +103,17 @@ class TestToolCallBlockContent:
     async def test_tool_call_block_renders_raw_output_for_execute_kind(self) -> None:
         """raw_output with execute kind renders the output widget."""
         app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)):
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
             feed = await _get_feed(app)
             await feed.add_tool_call(
                 "tc5", "Run", "execute", "completed",
                 raw_output={"output": "hello"},
             )
+            await pilot.pause()
             block = app.query_one("#tool-tc5", ToolCallBlock)
-            ro = block.query_one("#tc-raw-output-label")
-            assert "hello" in ro.content.plain
+            log = block.query_one("#tc-raw-output", RichLog)
+            text = "\n".join(s.text for s in log.lines)
+            assert "hello" in text
 
     async def test_tool_call_block_does_not_render_raw_output_for_read_kind(self) -> None:
         """raw_output with read kind is suppressed."""
@@ -123,31 +125,34 @@ class TestToolCallBlockContent:
                 raw_output={"output": "content"},
             )
             block = app.query_one("#tool-tc6", ToolCallBlock)
-            assert len(block.query("#tc-raw-output")) == 0
+            assert len(block.query(RichLog)) == 0
 
     async def test_tool_call_block_long_raw_output_is_scrollable(self) -> None:
         """Long output is in a scrollable container, not truncated."""
         app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)):
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
             feed = await _get_feed(app)
             await feed.add_tool_call(
                 "tc7", "Run", "execute", "completed",
                 raw_output={"output": "\n".join(["x"] * 300)},
             )
+            await pilot.pause()
             block = app.query_one("#tool-tc7", ToolCallBlock)
-            block.query_one("#tc-raw-output")  # scrollable container exists
-            label = block.query_one("#tc-raw-output-label")
-            assert "x" in label.content.plain
+            log = block.query_one("#tc-raw-output", RichLog)
+            text = "\n".join(s.text for s in log.lines)
+            assert "x" in text
 
     async def test_tool_call_block_renders_kiro_nested_raw_output(self) -> None:
         """Kiro's items[].Json.stdout format is extracted and rendered."""
         app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)):
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
             feed = await _get_feed(app)
             await feed.add_tool_call(
                 "tc8", "Run", "execute", "completed",
                 raw_output={"items": [{"Json": {"exit_status": "exit status: 0", "stdout": "hello world\n", "stderr": ""}}]},
             )
+            await pilot.pause()
             block = app.query_one("#tool-tc8", ToolCallBlock)
-            ro = block.query_one("#tc-raw-output-label")
-            assert "hello world" in ro.content.plain
+            log = block.query_one("#tc-raw-output", RichLog)
+            text = "\n".join(s.text for s in log.lines)
+            assert "hello world" in text
