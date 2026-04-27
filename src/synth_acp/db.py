@@ -124,7 +124,7 @@ async def _migrate_schema_async(conn) -> None:
 
 
 _EXPIRE_SQL = (
-    "DELETE FROM agents WHERE status = 'restorable'"
+    "DELETE FROM agents WHERE status IN ('restorable', 'active')"
     " AND registered < ?"
 )
 _EXPIRE_ORPHAN_MESSAGES = (

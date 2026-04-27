@@ -653,12 +653,6 @@ class ACPBroker:
         try:
             try:
                 if self._lifecycle:
-                    await self._lifecycle.mark_agents_restorable()
-            except Exception:
-                log.debug("mark_agents_restorable error", exc_info=True)
-
-            try:
-                if self._lifecycle:
                     await self._lifecycle.shutdown()
             except Exception:
                 log.debug("Lifecycle shutdown error", exc_info=True)

@@ -433,6 +433,11 @@ async def _run(config: SessionConfig) -> None:
             await broker.shutdown()
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.shutdown_default_executor()
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------

@@ -413,8 +413,7 @@ class AgentLifecycle:
     async def _on_acp_session_created(self, agent_id: str, acp_session_id: str) -> None:
         """Write back the ACP session ID after the agent process creates it.
 
-        Also transitions status from 'restorable' to 'active' at this point,
-        so only fully-connected agents are considered active.
+        Sets status to 'active' so only fully-connected agents are considered active.
 
         Uses asyncio.to_thread + sync sqlite3 because this callback fires
         from a background agent task and can race with shutdown.  A sync
@@ -437,21 +436,6 @@ class AgentLifecycle:
             await asyncio.to_thread(_write)
         except Exception:
             log.debug("Failed to persist acp_session_id for %s", agent_id, exc_info=True)
-
-    async def mark_agents_restorable(self) -> None:
-        """Mark all active agents in this session as restorable.
-
-        Called during broker shutdown before close_db(). Uses the DB directly
-        rather than the in-memory registry, which may be incomplete if agents
-        were still initialising when shutdown was triggered.
-        """
-        db = await self._ensure_db()
-        await db.execute(
-            "UPDATE agents SET status = 'restorable' "
-            "WHERE session_id = ? AND status = 'active'",
-            (self._session_id,),
-        )
-        await db.commit()
 
     async def restore(
         self,
