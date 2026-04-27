@@ -103,11 +103,11 @@ class TestViewportVisibility:
             await pilot.pause()
 
             # First turns should be hidden (far above viewport)
-            assert feed._turns[0].styles.display == "none"
-            assert feed._turns[1].styles.display == "none"
+            assert feed._turns[0].styles.visibility == "hidden"
+            assert feed._turns[1].styles.visibility == "hidden"
             # Last turns should be visible (near scroll position)
-            assert feed._turns[-1].styles.display != "none"
-            assert feed._turns[-2].styles.display != "none"
+            assert feed._turns[-1].styles.visibility != "hidden"
+            assert feed._turns[-2].styles.visibility != "hidden"
 
     async def test_current_turn_always_visible(self) -> None:
         """The active streaming turn stays display=block even when outside viewport."""
@@ -128,4 +128,4 @@ class TestViewportVisibility:
             await pilot.pause()
 
             # First turn would normally be hidden, but it's current_turn
-            assert feed._current_turn.styles.display == "block"
+            assert feed._current_turn.styles.visibility == "visible"

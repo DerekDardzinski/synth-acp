@@ -100,11 +100,11 @@ class ConversationFeed(Vertical):
         for turn in self._turns:
             r = turn.virtual_region
             if r.y + r.height < buf_top or r.y > buf_bottom:
-                turn.styles.display = "none"
+                turn.styles.visibility = "hidden"
             else:
-                turn.styles.display = "block"
+                turn.styles.visibility = "visible"
         if self._current_turn is not None:
-            self._current_turn.styles.display = "block"
+            self._current_turn.styles.visibility = "visible"
 
     @property
     def _mount_target(self) -> TurnContainer | ScrollableContainer | None:
