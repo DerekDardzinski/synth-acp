@@ -1,4 +1,4 @@
-"""Tests for ConversationFeed terminal mounting."""
+"""Tests for ConversationFeed terminal mounting and viewport visibility."""
 
 from __future__ import annotations
 
@@ -82,3 +82,50 @@ class TestConversationTerminal:
             block = app.query_one("#tool-tc2", ToolCallBlock)
             terminals = block.query(Terminal)
             assert len(terminals) == 1
+
+
+class TestViewportVisibility:
+    async def test_offscreen_turns_get_display_none(self) -> None:
+        """Turns far from viewport get display=none; near-viewport turns stay visible."""
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            feed = await _get_feed(app)
+            # Create enough turns to exceed viewport (each prompt adds height)
+            for i in range(30):
+                feed.add_prompt(f"Message {i}\n" * 5)
+            await pilot.pause()
+
+            # Scroll to bottom so early turns are far off-screen
+            feed._scroll.scroll_end(animate=False)
+            await pilot.pause()
+
+            feed._update_turn_visibility()
+            await pilot.pause()
+
+            # First turns should be hidden (far above viewport)
+            assert feed._turns[0].styles.display == "none"
+            assert feed._turns[1].styles.display == "none"
+            # Last turns should be visible (near scroll position)
+            assert feed._turns[-1].styles.display != "none"
+            assert feed._turns[-2].styles.display != "none"
+
+    async def test_current_turn_always_visible(self) -> None:
+        """The active streaming turn stays display=block even when outside viewport."""
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            feed = await _get_feed(app)
+            for i in range(30):
+                feed.add_prompt(f"Message {i}\n" * 5)
+            await pilot.pause()
+
+            # Set current_turn to the first turn (scrolled far off-screen)
+            feed._current_turn = feed._turns[0]
+            # Scroll to bottom so first turn is far away
+            feed._scroll.scroll_end(animate=False)
+            await pilot.pause()
+
+            feed._update_turn_visibility()
+            await pilot.pause()
+
+            # First turn would normally be hidden, but it's current_turn
+            assert feed._current_turn.styles.display == "block"
