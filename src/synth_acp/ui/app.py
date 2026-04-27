@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import ClassVar, NamedTuple
 
@@ -53,6 +54,37 @@ from synth_acp.ui.widgets.message_queue import MessageQueue
 _DISABLED_STATES = {AgentState.BUSY, AgentState.CONFIGURING, AgentState.AWAITING_PERMISSION}
 
 log = logging.getLogger(__name__)
+
+
+def _coalesce_events(events: list[BrokerEvent]) -> list[BrokerEvent]:
+    """Merge consecutive MessageChunkReceived/AgentThoughtReceived events.
+
+    Consecutive events of the same type and agent_id are collapsed into a
+    single event with concatenated chunks.  All other event types pass
+    through unchanged.
+
+    Args:
+        events: Raw event buffer to coalesce.
+
+    Returns:
+        New list with consecutive streamable events merged.
+    """
+    if not events:
+        return []
+    result: list[BrokerEvent] = []
+    for event in events:
+        if (
+            isinstance(event, (MessageChunkReceived, AgentThoughtReceived))
+            and result
+            and type(result[-1]) is type(event)
+            and result[-1].agent_id == event.agent_id
+        ):
+            prev = result[-1]
+            assert isinstance(prev, (MessageChunkReceived, AgentThoughtReceived))
+            result[-1] = prev.model_copy(update={"chunk": prev.chunk + event.chunk})
+        else:
+            result.append(event)
+    return result
 
 
 class DynamicAgentInfo(NamedTuple):
@@ -513,9 +545,14 @@ class SynthApp(App):
             feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, cwd=cwd, id=f"feed-{css_id(agent_id)}")
             self._panels[agent_id] = feed
             await self.query_one("#right").mount(feed)
-            for event in self._event_buffers.get(agent_id, []):
-                await self._replay_event(feed, event)
+            with self.batch_update():
+                for event in _coalesce_events(self._event_buffers.get(agent_id, [])):
+                    await self._replay_event(feed, event)
             self._event_buffers[agent_id] = []
+            # Scroll to bottom after replay so restored sessions show latest messages.
+            # Use set_timer to let the deferred batch_update layout fully settle.
+            feed._follow = True
+            self.set_timer(0.2, lambda: feed._scroll.scroll_end(animate=False) if feed._scroll else None)
             # Hide spinner if agent already passed INITIALIZING while buffered
             state = self._agent_states.get(agent_id)
             if state not in {AgentState.INITIALIZING, AgentState.BUSY, AgentState.CONFIGURING}:
