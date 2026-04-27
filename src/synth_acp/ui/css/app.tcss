@@ -88,15 +88,14 @@ AgentTile.tile-permission.tile-active { border-top: tall $warning; }
 }
 
 /* ── Right panels ── */
-#right { height: 1fr; width: 1fr; hatch: right $panel 60%; }
+#right { height: 1fr; width: 1fr; }
 
-ContentSwitcher > * { height: 1fr; hatch: right $panel 60%; }
+ContentSwitcher > * { height: 1fr; }
 
 .right-panel {
     height: 1fr;
     width: 1fr;
     layout: vertical;
-    hatch: right $panel 60%;
 }
 
 /* ── Panel header ── */
@@ -342,7 +341,6 @@ LaunchButton:hover {
     scrollbar-size-vertical: 0;
     scrollbar-color: $scrollbar;
     scrollbar-background: transparent;
-    hatch: left $panel 60%;
 }
 .thread-item {
     height: auto;
@@ -368,13 +366,11 @@ LaunchButton:hover {
 ThreadDetail {
     height: 1fr;
     layout: vertical;
-    hatch: right $panel 60%;
 }
 
 #msg-title-dock {
     dock: top;
     height: auto;
-    hatch: left $panel 60%;
     padding-bottom: 1;
 }
 #msg-title {
