@@ -103,7 +103,7 @@ def _extract_exit_status(raw_output: Any) -> int | None:
     return None
 
 
-class ToolCallBlock(Vertical):
+class ToolCallBlock(Vertical, can_focus=False):
     """Displays a tool call with kind icon, title, status badge, and content.
 
     Args:

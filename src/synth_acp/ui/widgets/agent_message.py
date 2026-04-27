@@ -9,7 +9,7 @@ from textual.widgets.markdown import Markdown, MarkdownStream
 from synth_acp.ui.widgets.copy_button import CopyButton
 
 
-class AgentMessage(Vertical):
+class AgentMessage(Vertical, can_focus=False):
     """Agent response rendered as streaming markdown.
 
     Args:

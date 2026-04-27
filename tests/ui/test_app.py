@@ -16,9 +16,11 @@ from synth_acp.models.events import (
     AgentStateChanged,
     AgentThoughtReceived,
     BrokerEvent,
+    MessageChunkReceived,
+    ToolCallUpdated,
     UsageUpdated,
 )
-from synth_acp.ui.app import SynthApp
+from synth_acp.ui.app import SynthApp, _coalesce_events
 from synth_acp.ui.messages import BrokerEventMessage
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
 from synth_acp.ui.widgets.message_queue import MessageQueue
@@ -303,3 +305,49 @@ class TestReplayEventSkipsSpinner:
         await app._replay_event(feed, event)
 
         feed.query_one.assert_not_called()
+
+
+class TestCoalesceEvents:
+    def test_consecutive_message_chunks_merged(self) -> None:
+        """Consecutive MCR events with same agent_id merge into one."""
+        events: list[BrokerEvent] = [
+            MessageChunkReceived(agent_id="a", chunk="x"),
+            MessageChunkReceived(agent_id="a", chunk="y"),
+            ToolCallUpdated(agent_id="a", tool_call_id="t1", title="t", kind="read", status="completed"),
+            MessageChunkReceived(agent_id="a", chunk="z"),
+        ]
+        result = _coalesce_events(events)
+        assert len(result) == 3
+        assert isinstance(result[0], MessageChunkReceived)
+        assert result[0].chunk == "xy"
+        assert isinstance(result[1], ToolCallUpdated)
+        assert isinstance(result[2], MessageChunkReceived)
+        assert result[2].chunk == "z"
+
+    def test_consecutive_thought_chunks_merged(self) -> None:
+        """Consecutive ATR events with same agent_id merge into one."""
+        events: list[BrokerEvent] = [
+            AgentThoughtReceived(agent_id="a", chunk="p"),
+            AgentThoughtReceived(agent_id="a", chunk="q"),
+            MessageChunkReceived(agent_id="a", chunk="r"),
+        ]
+        result = _coalesce_events(events)
+        assert len(result) == 2
+        assert isinstance(result[0], AgentThoughtReceived)
+        assert result[0].chunk == "pq"
+        assert isinstance(result[1], MessageChunkReceived)
+        assert result[1].chunk == "r"
+
+    def test_empty_buffer_returns_empty(self) -> None:
+        assert _coalesce_events([]) == []
+
+    def test_different_agent_ids_not_merged(self) -> None:
+        """MCR events with different agent_ids stay separate."""
+        events: list[BrokerEvent] = [
+            MessageChunkReceived(agent_id="a", chunk="x"),
+            MessageChunkReceived(agent_id="b", chunk="y"),
+        ]
+        result = _coalesce_events(events)
+        assert len(result) == 2
+        assert result[0].chunk == "x"  # type: ignore[union-attr]
+        assert result[1].chunk == "y"  # type: ignore[union-attr]
