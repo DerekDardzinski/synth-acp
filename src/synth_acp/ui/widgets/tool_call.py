@@ -158,7 +158,7 @@ class ToolCallBlock(Vertical, can_focus=False):
             yield w
         for w in self._raw_input_widgets(self._initial_raw_input):
             yield Lazy(w)
-        for w in self._text_widgets(self._initial_text_content):
+        for w in self._text_widgets(self._initial_text_content, raw_output=self._initial_raw_output):
             yield w
         for w in self._diff_widgets(self._initial_diffs):
             yield w
@@ -190,9 +190,11 @@ class ToolCallBlock(Vertical, can_focus=False):
         content = highlight(f"$ {cmd}", language="bash")
         return [Label(content, id="tc-raw-input")]
 
-    def _text_widgets(self, text_content: str | None) -> list[Markdown]:
+    def _text_widgets(self, text_content: str | None, *, raw_output: Any = None) -> list[Markdown]:
         """Build text content widget if applicable."""
         if not text_content or self._text_rendered:
+            return []
+        if self._kind in {"execute", "search", "fetch"} and raw_output is not None:
             return []
         self._text_rendered = True
         self._copyable_parts.append(text_content)
@@ -220,7 +222,7 @@ class ToolCallBlock(Vertical, can_focus=False):
         self._copyable_parts.append(text)
         widgets: list[Rule | RichLog] = []
         widgets.append(Rule(line_style="dashed", id="tc-output-sep"))
-        log = RichLog(id="tc-raw-output", highlight=True, markup=False, max_lines=2000)
+        log = RichLog(id="tc-raw-output", highlight=True, markup=False, max_lines=2000, wrap=True)
         if _ANSI_RE.search(text):
             from rich.text import Text
 
@@ -264,7 +266,7 @@ class ToolCallBlock(Vertical, can_focus=False):
         widgets: list[Static | Label | Markdown | DiffView | RichLog | Rule] = []
         widgets.extend(self._location_widgets(locations))
         widgets.extend(self._raw_input_widgets(raw_input))
-        widgets.extend(self._text_widgets(text_content))
+        widgets.extend(self._text_widgets(text_content, raw_output=raw_output))
         diff_views = self._diff_widgets(diffs)
         for dv in diff_views:
             await dv.prepare()
