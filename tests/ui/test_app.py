@@ -325,11 +325,8 @@ class TestFirstRunEmptyConfig:
             patch.object(app, "push_screen_wait", new_callable=AsyncMock, return_value=None),
             patch.object(app, "exit") as mock_exit,
         ):
-            launched = await app._do_launch()
-            if not launched:
-                app.exit()
+            await SynthApp._do_first_run.__wrapped__(app)
 
-        assert launched is False
         mock_exit.assert_called_once()
 
 
