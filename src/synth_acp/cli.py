@@ -244,7 +244,7 @@ def _resolve_config(
         print("No config found. Run without --headless for interactive setup.", file=sys.stderr)
         raise typer.Exit(1)
 
-    return _first_run_picker()
+    return SessionConfig(project=Path.cwd().name, agents=[])
 
 
 # ------------------------------------------------------------------

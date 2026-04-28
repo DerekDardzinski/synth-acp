@@ -176,6 +176,8 @@ class SynthApp(App):
             if self.config.agents:
                 await self.select_agent(self.config.agents[0].agent_id)
             self.run_worker(self._consume_broker_events(), exit_on_error=False, name="broker-consumer")
+            if not self.config.agents:
+                self._do_first_run()
 
     async def _consume_broker_events(self) -> None:
         """Consume broker events and post them as Textual messages."""
@@ -643,8 +645,12 @@ class SynthApp(App):
         """Open the launch agent modal and launch the selected agent."""
         await self._do_launch()
 
-    async def _do_launch(self) -> None:
-        """Launch modal logic, separated for testability."""
+    async def _do_launch(self) -> bool:
+        """Launch modal logic, separated for testability.
+
+        Returns:
+            True if an agent was launched, False if the modal was cancelled.
+        """
         result = await self.push_screen_wait(LaunchAgentScreen())
         if result is not None:
             self._dynamic_agents[result.agent_id] = DynamicAgentInfo(parent=None, task="", harness=result.harness, cwd=result.cwd)
@@ -656,6 +662,15 @@ class SynthApp(App):
                 log.debug("Failed to add tile for %s", result.agent_id, exc_info=True)
             await self.select_agent(result.agent_id)
             await self.broker.handle(LaunchAgent(agent_id=result.agent_id, config=result))
+            return True
+        return False
+
+    @work
+    async def _do_first_run(self) -> None:
+        """Show launch modal on first run with no config; exit on cancel."""
+        launched = await self._do_launch()
+        if not launched:
+            self.exit()
 
     @work
     async def action_restore(self) -> None:

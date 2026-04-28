@@ -22,6 +22,7 @@ from synth_acp.models.events import (
 )
 from synth_acp.ui.app import SynthApp, _coalesce_events
 from synth_acp.ui.messages import BrokerEventMessage
+from synth_acp.ui.screens.launch import LaunchAgentScreen
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
 from synth_acp.ui.widgets.message_queue import MessageQueue
 
@@ -305,6 +306,31 @@ class TestReplayEventSkipsSpinner:
         await app._replay_event(feed, event)
 
         feed.query_one.assert_not_called()
+
+
+class TestFirstRunEmptyConfig:
+    async def test_empty_agents_pushes_launch_screen_on_mount(self) -> None:
+        """When config has no agents, LaunchAgentScreen is pushed on mount."""
+        app = SynthApp(_make_broker(), _make_config())
+
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert any(isinstance(s, LaunchAgentScreen) for s in app.screen_stack)
+
+    async def test_first_run_cancel_exits_app(self) -> None:
+        """Cancelling the launch modal on first run exits the app."""
+        app = _make_app()
+
+        with (
+            patch.object(app, "push_screen_wait", new_callable=AsyncMock, return_value=None),
+            patch.object(app, "exit") as mock_exit,
+        ):
+            launched = await app._do_launch()
+            if not launched:
+                app.exit()
+
+        assert launched is False
+        mock_exit.assert_called_once()
 
 
 class TestCoalesceEvents:
