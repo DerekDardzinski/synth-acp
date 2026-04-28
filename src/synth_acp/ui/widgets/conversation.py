@@ -23,8 +23,6 @@ from synth_acp.ui.widgets.thought_block import ThoughtBlock
 from synth_acp.ui.widgets.tool_call import ToolCallBlock
 
 if TYPE_CHECKING:
-    from textual.timer import Timer
-
     from synth_acp.terminal.manager import TerminalProcess
 
 log = logging.getLogger(__name__)
@@ -66,8 +64,6 @@ class ConversationFeed(Vertical):
         self._scroll: ScrollableContainer | None = None
         self.input_bar: InputBar | None = None
         self._pending_terminals: dict[str, TerminalProcess] = {}
-        self._turns: list[TurnContainer] = []
-        self._visibility_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         """Yield the scrollable container and input bar."""
@@ -82,30 +78,6 @@ class ConversationFeed(Vertical):
         self.input_bar = self.query_one(InputBar)
         self.streaming_signal: Signal[bool] = Signal(self, "streaming")
 
-    def on_scroll(self) -> None:
-        """Dispatch turn visibility update on scroll."""
-        if self._visibility_timer is not None:
-            self._visibility_timer.stop()
-        self._visibility_timer = self.set_timer(0.1, self._update_turn_visibility)
-
-    def _update_turn_visibility(self) -> None:
-        """Toggle display on TurnContainers based on scroll viewport."""
-        self._turns = [t for t in self._turns if t.parent is not None]
-        if self._scroll is None:
-            return
-        scroll_y = self._scroll.scroll_y
-        height = self._scroll.size.height
-        buf_top = scroll_y - 2 * height
-        buf_bottom = scroll_y + 3 * height
-        for turn in self._turns:
-            r = turn.virtual_region
-            if r.y + r.height < buf_top or r.y > buf_bottom:
-                turn.styles.visibility = "hidden"
-            else:
-                turn.styles.visibility = "visible"
-        if self._current_turn is not None:
-            self._current_turn.styles.visibility = "visible"
-
     @property
     def _mount_target(self) -> TurnContainer | ScrollableContainer | None:
         """Return the current turn container, creating one lazily if needed."""
@@ -119,9 +91,7 @@ class ConversationFeed(Vertical):
             return None
         turn = TurnContainer(classes="turn-container")
         self._current_turn = turn
-        self._turns.append(turn)
         self._scroll.mount(turn)
-        self._update_turn_visibility()
         return turn
 
     def add_prompt(self, text: str) -> None:
