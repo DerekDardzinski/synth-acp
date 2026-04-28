@@ -18,6 +18,25 @@ from synth_acp.ui.widgets.diff_view import DiffView
 _ANSI_RE = re.compile(r"\x1b\[[\d;]*[A-Za-z]")
 
 
+class _ReflowRichLog(RichLog):
+    """RichLog that re-renders content when the widget is resized."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._source_content: Any = None
+
+    def write_reflow(self, content: Any) -> None:
+        """Write content and store it for reflow on resize."""
+        self._source_content = content
+        self.write(content)
+
+    def on_resize(self, event: Any) -> None:
+        super().on_resize(event)
+        if self._source_content is not None and self._size_known:
+            self.clear()
+            self.write(self._source_content)
+
+
 TOOL_KIND_STYLE: dict[str, tuple[str, str]] = {
     "read": ("◎", "#3b82f6"),
     "edit": ("✎", "#a78bfa"),
@@ -158,7 +177,7 @@ class ToolCallBlock(Vertical, can_focus=False):
             yield w
         for w in self._raw_input_widgets(self._initial_raw_input):
             yield Lazy(w)
-        for w in self._text_widgets(self._initial_text_content, raw_output=self._initial_raw_output):
+        for w in self._text_widgets(self._initial_text_content):
             yield w
         for w in self._diff_widgets(self._initial_diffs):
             yield w
@@ -190,11 +209,11 @@ class ToolCallBlock(Vertical, can_focus=False):
         content = highlight(f"$ {cmd}", language="bash")
         return [Label(content, id="tc-raw-input")]
 
-    def _text_widgets(self, text_content: str | None, *, raw_output: Any = None) -> list[Markdown]:
+    def _text_widgets(self, text_content: str | None) -> list[Markdown]:
         """Build text content widget if applicable."""
         if not text_content or self._text_rendered:
             return []
-        if self._kind in {"execute", "search", "fetch"} and raw_output is not None:
+        if self._kind in {"execute", "search", "fetch"}:
             return []
         self._text_rendered = True
         self._copyable_parts.append(text_content)
@@ -213,7 +232,7 @@ class ToolCallBlock(Vertical, can_focus=False):
         """Build raw output widget for execute/search/fetch kinds."""
         if self._kind not in {"execute", "search", "fetch"}:
             return []
-        if raw_output is None or self._raw_output_rendered:
+        if raw_output is None or self._raw_output_rendered or self._terminal_id is not None:
             return []
         text = _extract_raw_output_text(raw_output)
         if not text:
@@ -222,13 +241,13 @@ class ToolCallBlock(Vertical, can_focus=False):
         self._copyable_parts.append(text)
         widgets: list[Rule | RichLog] = []
         widgets.append(Rule(line_style="dashed", id="tc-output-sep"))
-        log = RichLog(id="tc-raw-output", highlight=True, markup=False, max_lines=2000, wrap=True)
+        log = _ReflowRichLog(id="tc-raw-output", highlight=True, markup=False, max_lines=2000, wrap=True, min_width=0)
         if _ANSI_RE.search(text):
             from rich.text import Text
 
-            log.write(Text.from_ansi(text))
+            log.write_reflow(Text.from_ansi(text))
         else:
-            log.write(text)
+            log.write_reflow(text)
         widgets.append(log)
         exit_status = _extract_exit_status(raw_output)
         if exit_status is not None:
@@ -266,7 +285,7 @@ class ToolCallBlock(Vertical, can_focus=False):
         widgets: list[Static | Label | Markdown | DiffView | RichLog | Rule] = []
         widgets.extend(self._location_widgets(locations))
         widgets.extend(self._raw_input_widgets(raw_input))
-        widgets.extend(self._text_widgets(text_content, raw_output=raw_output))
+        widgets.extend(self._text_widgets(text_content))
         diff_views = self._diff_widgets(diffs)
         for dv in diff_views:
             await dv.prepare()
