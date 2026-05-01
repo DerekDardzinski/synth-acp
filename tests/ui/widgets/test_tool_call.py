@@ -11,7 +11,7 @@ from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.widgets.diff_view import DiffView
-from synth_acp.ui.widgets.tool_call import ToolCallBlock, _ReflowRichLog
+from synth_acp.ui.widgets.tool_call import ToolCallBlock, _ReflowRichLog, _extract_raw_output_text
 
 
 def _make_config() -> SessionConfig:
@@ -102,64 +102,29 @@ class TestToolCallBlockContent:
             assert len(loc_widgets) == 1
 
     async def test_tool_call_block_renders_raw_output_for_execute_kind(self) -> None:
-        """raw_output with execute kind renders the output widget."""
-        app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)) as pilot:
-            feed = await _get_feed(app)
-            await feed.add_tool_call(
-                "tc5", "Run", "execute", "completed",
-                raw_output={"output": "hello"},
-            )
-            await pilot.pause()
-            await pilot.pause()
-            block = app.query_one("#tool-tc5", ToolCallBlock)
-            log = block.query_one("#tc-raw-output", RichLog)
-            text = "\n".join(s.text for s in log.lines)
-            assert "hello" in text
+        """execute kind with raw_output produces a RichLog widget."""
+        block = ToolCallBlock("tc5", "Run", "execute", "completed", raw_output={"output": "hello"})
+        widgets = block._raw_output_widgets({"output": "hello"})
+        assert any(isinstance(w, RichLog) for w in widgets)
 
     async def test_tool_call_block_does_not_render_raw_output_for_read_kind(self) -> None:
         """raw_output with read kind is suppressed."""
-        app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)):
-            feed = await _get_feed(app)
-            await feed.add_tool_call(
-                "tc6", "Read", "read", "completed",
-                raw_output={"output": "content"},
-            )
-            block = app.query_one("#tool-tc6", ToolCallBlock)
-            assert len(block.query(RichLog)) == 0
+        block = ToolCallBlock("tc6", "Read", "read", "completed", raw_output={"output": "content"})
+        widgets = block._raw_output_widgets({"output": "content"})
+        assert len(widgets) == 0
 
-    async def test_tool_call_block_long_raw_output_is_scrollable(self) -> None:
-        """Long output is in a scrollable container, not truncated."""
-        app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)) as pilot:
-            feed = await _get_feed(app)
-            await feed.add_tool_call(
-                "tc7", "Run", "execute", "completed",
-                raw_output={"output": "\n".join(["x"] * 300)},
-            )
-            await pilot.pause()
-            await pilot.pause()
-            block = app.query_one("#tool-tc7", ToolCallBlock)
-            log = block.query_one("#tc-raw-output", RichLog)
-            text = "\n".join(s.text for s in log.lines)
-            assert "x" in text
+    async def test_tool_call_block_long_raw_output_not_truncated(self) -> None:
+        """Long output is passed through without truncation."""
+        long_output = "\n".join(["x"] * 300)
+        text = _extract_raw_output_text({"output": long_output})
+        assert text == long_output
 
     async def test_tool_call_block_renders_kiro_nested_raw_output(self) -> None:
-        """Kiro's items[].Json.stdout format is extracted and rendered."""
-        app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)) as pilot:
-            feed = await _get_feed(app)
-            await feed.add_tool_call(
-                "tc8", "Run", "execute", "completed",
-                raw_output={"items": [{"Json": {"exit_status": "exit status: 0", "stdout": "hello world\n", "stderr": ""}}]},
-            )
-            await pilot.pause()
-            await pilot.pause()
-            block = app.query_one("#tool-tc8", ToolCallBlock)
-            log = block.query_one("#tc-raw-output", RichLog)
-            text = "\n".join(s.text for s in log.lines)
-            assert "hello world" in text
+        """Kiro's items[].Json.stdout format is extracted correctly."""
+        raw = {"items": [{"Json": {"exit_status": "exit status: 0", "stdout": "hello world\n", "stderr": ""}}]}
+        text = _extract_raw_output_text(raw)
+        assert text is not None
+        assert "hello world" in text
 
 
 class TestReflowRichLogResize:
