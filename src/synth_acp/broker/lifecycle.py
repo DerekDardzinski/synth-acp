@@ -90,7 +90,13 @@ class AgentLifecycle:
     def _make_prompt_task(self, agent_id: str, coro: Coroutine[object, object, None]) -> asyncio.Task[None]:
         key = f"prompt-{agent_id}"
         task = asyncio.create_task(coro, name=key)
-        task.add_done_callback(lambda _: self._tasks.pop(key, None))
+
+        def _on_done(t: asyncio.Task[None]) -> None:
+            self._tasks.pop(key, None)
+            if not t.cancelled() and (exc := t.exception()):
+                log.error("prompt task for %s raised", agent_id, exc_info=exc)
+
+        task.add_done_callback(_on_done)
         return task
 
     async def launch(self, agent_id: str, *, adhoc_config: AgentConfig | None = None) -> None:
@@ -286,7 +292,7 @@ class AgentLifecycle:
         task = data.get("task", "")
         message = data.get("message", "")
 
-        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", agent_id):
+        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.\-]*$", agent_id):
             await self.update_command_status(cmd_id, "rejected", "Invalid agent_id")
             return
 
@@ -296,6 +302,7 @@ class AgentLifecycle:
 
         max_agents = int(os.environ.get("SYNTH_MAX_AGENTS", "10"))
         if self._registry.active_count() >= max_agents:
+            await self.update_command_status(cmd_id, "rejected", f"Max agents ({max_agents}) reached")
             return
 
         entry = next((e for e in self._harness_registry if e.short_name == harness), None)
@@ -379,58 +386,108 @@ class AgentLifecycle:
         await self.terminate(agent_id)
         await self.update_command_status(cmd_id, "processed")
 
-    async def shutdown(self) -> None:
-        """Shutdown all agents."""
-        for session in self._registry.all_sessions().values():
-            if session.state == AgentState.BUSY:
-                await session.cancel()
-            elif session.state == AgentState.AWAITING_PERMISSION:
-                try:
-                    await asyncio.wait_for(session.terminate(), timeout=self._terminate_timeout)
-                except TimeoutError:
-                    log.warning("session.terminate() timed out for %s", session.agent_id)
+    async def resurrect(self, agent_id: str) -> None:
+        """Re-launch a terminated agent by reconnecting to its previous ACP session."""
+        db = await self._ensure_db()
+        cursor = await db.execute(
+            "SELECT acp_session_id, harness, agent_mode, cwd, parent, task, status "
+            "FROM agents WHERE agent_id = ? AND session_id = ?",
+            (agent_id, self._session_id),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            await self._sink(BrokerError(agent_id=agent_id, message=f"Agent '{agent_id}' not found"))
+            return
+        acp_session_id, harness, agent_mode, cwd, parent, task, status = row
+        if status != "inactive":
+            await self._sink(
+                BrokerError(agent_id=agent_id, message=f"Agent '{agent_id}' is {status}, not inactive")
+            )
+            return
 
+        # Clean up old terminated session from registry
+        old = self._registry.get_session(agent_id)
+        if old:
+            self._registry.unregister(agent_id)
+            t = self._tasks.pop(agent_id, None)
+            if t and not t.done():
+                t.cancel()
+
+        await self.restore(
+            agent_id=agent_id,
+            acp_session_id=acp_session_id,
+            harness=harness,
+            agent_mode=agent_mode,
+            cwd=cwd or ".",
+            parent=parent,
+        )
+        await db.execute(
+            "UPDATE agents SET status = 'active' WHERE agent_id = ? AND session_id = ?",
+            (agent_id, self._session_id),
+        )
+        await db.commit()
+        await self._fire_message_hook(
+            self._config.settings.hooks.on_agent_join, agent_id, task or "", parent, "on_agent_join",
+        )
+
+    async def handle_resurrect_command(
+        self, cmd_id: int, from_agent: str, data: dict[str, str]
+    ) -> None:
+        """Handle a resurrect command from an agent."""
+        agent_id = data["agent_id"]
+        db = await self._ensure_db()
+        cursor = await db.execute(
+            "SELECT parent FROM agents WHERE agent_id = ? AND session_id = ?",
+            (agent_id, self._session_id),
+        )
+        row = await cursor.fetchone()
+        parent = row[0] if row else None
+        if parent != from_agent:
+            await self.update_command_status(
+                cmd_id, "rejected",
+                f"Not authorized: {from_agent} is not parent of {agent_id}",
+            )
+            return
+        await self.resurrect(agent_id)
+        await self.update_command_status(cmd_id, "processed")
+
+    async def shutdown(self) -> None:
+        """Shutdown all agents: SIGKILL all process groups, then cancel tasks."""
         for session in self._registry.all_sessions().values():
-            if session.state != AgentState.TERMINATED:
-                try:
-                    await asyncio.wait_for(session.terminate(), timeout=self._terminate_timeout)
-                except TimeoutError:
-                    log.warning("session.terminate() timed out for %s", session.agent_id)
+            session.force_kill()
 
         for task in self._tasks.values():
             if not task.done():
                 task.cancel()
         if self._tasks:
-            await asyncio.wait(self._tasks.values(), timeout=2.0)
+            await asyncio.wait(self._tasks.values(), timeout=3.0)
 
     async def _on_acp_session_created(self, agent_id: str, acp_session_id: str) -> None:
         """Write back the ACP session ID after the agent process creates it.
 
-        Also transitions status from 'restorable' to 'active' at this point,
-        so only fully-connected agents are considered active.
-        """
-        db = await self._ensure_db()
-        await db.execute(
-            "UPDATE agents SET acp_session_id = ?, status = 'active' "
-            "WHERE agent_id = ? AND session_id = ?",
-            (acp_session_id, agent_id, self._session_id),
-        )
-        await db.commit()
+        Sets status to 'active' so only fully-connected agents are considered active.
 
-    async def mark_agents_restorable(self) -> None:
-        """Mark all active agents in this session as restorable.
-
-        Called during broker shutdown before close_db(). Uses the DB directly
-        rather than the in-memory registry, which may be incomplete if agents
-        were still initialising when shutdown was triggered.
+        Uses asyncio.to_thread + sync sqlite3 because this callback fires
+        from a background agent task and can race with shutdown.  A sync
+        write on a daemon pool thread cannot keep the process alive.
         """
-        db = await self._ensure_db()
-        await db.execute(
-            "UPDATE agents SET status = 'restorable' "
-            "WHERE session_id = ? AND status = 'active'",
-            (self._session_id,),
-        )
-        await db.commit()
+        def _write() -> None:
+            conn = sqlite3.connect(str(self._db_path))
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    "UPDATE agents SET acp_session_id = ?, status = 'active' "
+                    "WHERE agent_id = ? AND session_id = ?",
+                    (acp_session_id, agent_id, self._session_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception:
+            log.debug("Failed to persist acp_session_id for %s", agent_id, exc_info=True)
 
     async def restore(
         self,

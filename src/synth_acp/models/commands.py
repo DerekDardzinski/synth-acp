@@ -24,6 +24,12 @@ class TerminateAgent(BrokerCommand):
     agent_id: str
 
 
+class ResurrectAgent(BrokerCommand):
+    """Resurrect a terminated agent."""
+
+    agent_id: str
+
+
 class SendPrompt(BrokerCommand):
     """Send a user prompt to an agent."""
 

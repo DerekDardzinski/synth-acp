@@ -16,3 +16,4 @@ synth-debug.log
 .dolt/
 *.db
 .beads-credential-key
+builder-ycib.1/

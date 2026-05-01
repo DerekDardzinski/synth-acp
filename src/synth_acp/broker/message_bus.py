@@ -69,6 +69,8 @@ class MessageBus:
 
     async def stop(self, timeout: float = 2.0) -> None:
         """Stop all listeners and cancel tasks."""
+        if self._stopped:
+            return
         self._stopped = True
         self._wake_event.set()
         if self._server:

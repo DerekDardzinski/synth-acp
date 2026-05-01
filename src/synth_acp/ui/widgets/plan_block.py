@@ -5,6 +5,7 @@ from __future__ import annotations
 from acp.schema import PlanEntry
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.markup import escape
 from textual.widgets import Static
 
 _STATUS_ICON: dict[str, str] = {
@@ -58,6 +59,6 @@ class PlanBlock(Vertical):
         for entry in self._entries:
             icon = _STATUS_ICON.get(entry.status, "[dim]·[/dim]")
             priority = _PRIORITY_BADGE.get(entry.priority, "")
-            text = f"{icon} {entry.content}{priority}"
+            text = f"{icon} {escape(entry.content)}{priority}"
             classes = f"plan-entry {entry.status}"
             yield Static(text, classes=classes)

@@ -119,21 +119,16 @@ async def _spawn_isolated_agent(
     try:
         yield conn, process
     finally:
-        await conn.close()
-        # Graceful stdin close, then escalate.
+        if process.returncode is None:
+            try:
+                pgid = os.getpgid(process.pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(process.wait(), timeout=1.0)
         if process.stdin and not process.stdin.is_closing():
             process.stdin.close()
-            with contextlib.suppress(Exception):
-                await process.stdin.wait_closed()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
-        except TimeoutError:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
 
 
 class ACPSession:
@@ -173,6 +168,7 @@ class ACPSession:
         self._suppress_history_replay: bool = False
         self._accumulator = SessionAccumulator()
         self._unsubscribe: Callable[[], None] = self._accumulator.subscribe(self._on_snapshot)
+        self._pending_emissions: set[asyncio.Task[None]] = set()
         self._terminals: dict[str, TerminalProcess] = {}
         self._terminal_count: int = 0
         self._on_session_created: Callable[[str, str], Awaitable[None]] | None = None
@@ -193,6 +189,18 @@ class ACPSession:
         _sm directly to maintain encapsulation.
         """
         await self._sm.force_terminal()
+
+    def force_kill(self) -> None:
+        """SIGKILL the process group and close stdin. For bulk shutdown only."""
+        if self._proc is None or self._proc.returncode is not None:
+            return
+        try:
+            pgid = os.getpgid(self._proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+        if self._proc.stdin and not self._proc.stdin.is_closing():
+            self._proc.stdin.close()
 
     async def _on_state_transition(self, old: AgentState, new: AgentState) -> None:
         """Callback fired by the state machine after every transition."""
@@ -327,6 +335,8 @@ class ACPSession:
         finally:
             for t in self._terminals.values():
                 t.kill()
+                if t._task is not None and not t._task.done():
+                    t._task.cancel()
             for fut in self._permission_futures.values():
                 if not fut.done():
                     fut.cancel()
@@ -477,6 +487,8 @@ class ACPSession:
         finally:
             for t in self._terminals.values():
                 t.kill()
+                if t._task is not None and not t._task.done():
+                    t._task.cancel()
             for fut in self._permission_futures.values():
                 if not fut.done():
                     fut.cancel()
@@ -493,10 +505,19 @@ class ACPSession:
             response = await self._conn.prompt(
                 session_id=self._session_id, prompt=[text_block(text)]
             )
+            await self._drain_pending_emissions()
             await self._event_sink(
                 TurnComplete(
                     agent_id=self.agent_id,
                     stop_reason=response.stop_reason if response else "unknown",
+                )
+            )
+        except ConnectionError:
+            log.warning("Connection lost for %s during prompt", self.agent_id)
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=f"Connection lost to {self.agent_id}",
                 )
             )
         finally:
@@ -614,6 +635,8 @@ class ACPSession:
         self._permission_futures.clear()
         for t in self._terminals.values():
             t.kill()
+            if t._task is not None and not t._task.done():
+                t._task.cancel()
         if self._proc is None:
             return
         try:
@@ -679,12 +702,27 @@ class ACPSession:
         """Subscriber callback fired by SessionAccumulator after apply().
 
         Checks suppress flag, then dispatches async event emission via
-        create_task with a done-callback that logs exceptions.
+        create_task with a done-callback that logs exceptions.  Tasks are
+        tracked in ``_pending_emissions`` so that ``prompt()`` can drain
+        them before emitting ``TurnComplete``, guaranteeing all streaming
+        events are enqueued in order.
         """
         if self._suppress_history_replay:
             return
         task = asyncio.create_task(self._emit_from_notification(notification))
+        self._pending_emissions.add(task)
+        task.add_done_callback(self._pending_emissions.discard)
         task.add_done_callback(self._log_task_exception)
+
+    async def _drain_pending_emissions(self) -> None:
+        """Await all in-flight ``_emit_from_notification`` tasks.
+
+        Called before emitting ``TurnComplete`` to guarantee every
+        ``MessageChunkReceived`` / ``ToolCallUpdated`` event reaches the
+        broker queue before the turn-end marker.
+        """
+        if self._pending_emissions:
+            await asyncio.gather(*self._pending_emissions, return_exceptions=True)
 
     @staticmethod
     def _log_task_exception(task: asyncio.Task[None]) -> None:

@@ -25,6 +25,7 @@ from synth_acp.models.commands import (
     LaunchAgent,
     RespondPermission,
     RestoreSession,
+    ResurrectAgent,
     SendPrompt,
     SetAgentMode,
     SetAgentModel,
@@ -77,6 +78,11 @@ class ACPBroker:
         self._expired: bool = False
         self._journal_seq: dict[str, int] = {}  # agent_id → next sequence number
 
+    @property
+    def session_id(self) -> str:
+        """The current broker session ID."""
+        return self._session_id
+
     # ------------------------------------------------------------------
     # Command dispatch
     # ------------------------------------------------------------------
@@ -90,6 +96,9 @@ class ACPBroker:
                 await lifecycle.launch(aid, adhoc_config=cfg)
             case TerminateAgent(agent_id=aid):
                 await lifecycle.terminate(aid)
+            case ResurrectAgent(agent_id=aid):
+                await self._start_message_bus()
+                await lifecycle.resurrect(aid)
             case SendPrompt(agent_id=aid, text=text):
                 await self._sink(UserPromptSubmitted(agent_id=aid, text=text))
                 await lifecycle.prompt(aid, text)
@@ -168,7 +177,7 @@ class ACPBroker:
                 conn.execute("PRAGMA journal_mode=WAL")
                 return conn.execute(
                     "SELECT agent_id, acp_session_id, harness, agent_mode, cwd, parent "
-                    "FROM agents WHERE session_id = ? AND status = 'restorable' "
+                    "FROM agents WHERE session_id = ? AND status IN ('restorable', 'active') "
                     "ORDER BY parent NULLS FIRST",
                     (broker_session_id,),
                 ).fetchall()
@@ -243,7 +252,7 @@ class ACPBroker:
                 rows = conn.execute(
                     "SELECT session_id, GROUP_CONCAT(agent_id) as agents, "
                     "MAX(registered) as last_active, COUNT(*) as agent_count "
-                    "FROM agents WHERE status = 'restorable' "
+                    "FROM agents WHERE status IN ('restorable', 'active') "
                     "GROUP BY session_id ORDER BY MAX(registered) DESC"
                 ).fetchall()
                 return [
@@ -366,7 +375,6 @@ class ACPBroker:
         self._active_permission.pop(agent_id, None)
         self._permission_queue.pop(agent_id, None)
         self._permission_counter.pop(agent_id, None)
-        self._journal_seq.pop(agent_id, None)
 
     # ------------------------------------------------------------------
     # Event journal for session restore
@@ -608,6 +616,8 @@ class ACPBroker:
                     await lifecycle.handle_launch_command(cmd_id, from_agent, data)
                 elif command == "terminate":
                     await lifecycle.handle_terminate_command(cmd_id, from_agent, data)
+                elif command == "resurrect":
+                    await lifecycle.handle_resurrect_command(cmd_id, from_agent, data)
                 else:
                     await lifecycle.update_command_status(cmd_id, "rejected", f"Unknown command: {command}")
             except Exception as exc:
@@ -656,12 +666,6 @@ class ACPBroker:
                     await self._lifecycle.shutdown()
             except Exception:
                 log.debug("Lifecycle shutdown error", exc_info=True)
-
-            try:
-                if self._lifecycle:
-                    await self._lifecycle.mark_agents_restorable()
-            except Exception:
-                log.debug("mark_agents_restorable error", exc_info=True)
 
             try:
                 if self._message_bus:

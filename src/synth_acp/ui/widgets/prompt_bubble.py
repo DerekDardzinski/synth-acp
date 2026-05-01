@@ -10,7 +10,7 @@ from textual.widgets.markdown import Markdown
 from synth_acp.ui.widgets.copy_button import CopyButton
 
 
-class PromptBubble(Vertical):
+class PromptBubble(Vertical, can_focus=False):
     """Right-aligned user prompt with $primary border and markdown rendering.
 
     Args:

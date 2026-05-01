@@ -1,4 +1,4 @@
-"""Tests for ConversationFeed terminal mounting."""
+"""Tests for ConversationFeed terminal mounting and viewport visibility."""
 
 from __future__ import annotations
 

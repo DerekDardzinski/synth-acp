@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from typing import ClassVar, NamedTuple
 
 from textual import work
@@ -14,7 +16,7 @@ from textual.widgets import ContentSwitcher, Footer
 from textual.worker import Worker, WorkerState
 
 from synth_acp.broker.broker import ACPBroker
-from synth_acp.models.agent import AgentMode, AgentModel, AgentState
+from synth_acp.models.agent import AgentMode, AgentModel, AgentState, css_id
 from synth_acp.models.commands import LaunchAgent, RespondPermission, TerminateAgent
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
@@ -53,6 +55,37 @@ from synth_acp.ui.widgets.message_queue import MessageQueue
 _DISABLED_STATES = {AgentState.BUSY, AgentState.CONFIGURING, AgentState.AWAITING_PERMISSION}
 
 log = logging.getLogger(__name__)
+
+
+def _coalesce_events(events: list[BrokerEvent]) -> list[BrokerEvent]:
+    """Merge consecutive MessageChunkReceived/AgentThoughtReceived events.
+
+    Consecutive events of the same type and agent_id are collapsed into a
+    single event with concatenated chunks.  All other event types pass
+    through unchanged.
+
+    Args:
+        events: Raw event buffer to coalesce.
+
+    Returns:
+        New list with consecutive streamable events merged.
+    """
+    if not events:
+        return []
+    result: list[BrokerEvent] = []
+    for event in events:
+        if (
+            isinstance(event, (MessageChunkReceived, AgentThoughtReceived))
+            and result
+            and type(result[-1]) is type(event)
+            and result[-1].agent_id == event.agent_id
+        ):
+            prev = result[-1]
+            assert isinstance(prev, (MessageChunkReceived, AgentThoughtReceived))
+            result[-1] = prev.model_copy(update={"chunk": prev.chunk + event.chunk})
+        else:
+            result.append(event)
+    return result
 
 
 class DynamicAgentInfo(NamedTuple):
@@ -108,6 +141,7 @@ class SynthApp(App):
         self._agent_current_mode: dict[str, str] = {}
         self._agent_models: dict[str, list[AgentModel]] = {}
         self._agent_current_model: dict[str, str] = {}
+        self._tiles: dict[str, AgentTile] = {}
 
     def _handle_exception(self, error: Exception) -> None:
         """Log unhandled exceptions to file before Textual's default handling."""
@@ -130,6 +164,8 @@ class SynthApp(App):
     async def on_mount(self) -> None:
         """Launch all agents, select the first, and start the broker event consumer."""
         self.theme = "catppuccin-mocha"
+        for tile in self.query(AgentTile):
+            self._tiles[tile._agent_id] = tile
         for agent in self.config.agents:
             self._event_buffers[agent.agent_id] = []
         if self._restore_mode:
@@ -141,6 +177,8 @@ class SynthApp(App):
             if self.config.agents:
                 await self.select_agent(self.config.agents[0].agent_id)
             self.run_worker(self._consume_broker_events(), exit_on_error=False, name="broker-consumer")
+            if not self.config.agents:
+                self._do_first_run()
 
     async def _consume_broker_events(self) -> None:
         """Consume broker events and post them as Textual messages."""
@@ -174,7 +212,7 @@ class SynthApp(App):
             recipient = event.to_agent
             if recipient in self._panels:
                 feed = self._panels[recipient]
-                feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
+                await feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
             elif recipient in self._event_buffers:
                 self._event_buffers[recipient].append(event)
             return
@@ -194,7 +232,27 @@ class SynthApp(App):
             self._event_buffers[event.agent_id].append(event)
 
         if isinstance(event, AgentStateChanged):
+            prev_state = self._agent_states.get(event.agent_id)
             self._agent_states[event.agent_id] = event.new_state
+            # Resurrection: agent was TERMINATED in the UI but a new session
+            # started (UNSTARTED → INITIALIZING). Reload journal so the
+            # previous conversation is visible, and re-create the tile.
+            if prev_state == AgentState.TERMINATED and event.new_state == AgentState.INITIALIZING:
+                aid = event.agent_id
+                self._event_buffers.setdefault(aid, [])
+                try:
+                    journal = await self.broker.load_journal(aid, self.broker.session_id)
+                    self._event_buffers[aid] = journal + self._event_buffers[aid]
+                except Exception:
+                    log.debug("Failed to load journal for resurrected agent %s", aid, exc_info=True)
+                if aid not in self._tiles:
+                    try:
+                        agent_list = self.query_one(AgentList)
+                        parent = self.broker.get_agent_parent(aid)
+                        tile = agent_list.add_agent_tile(aid, parent=parent)
+                        self._tiles[aid] = tile
+                    except Exception:
+                        log.debug("Failed to re-create tile for %s", aid, exc_info=True)
             if event.agent_id not in self._dynamic_agents and event.agent_id not in {a.agent_id for a in self.config.agents}:
                 parent = self.broker.get_agent_parent(event.agent_id)
                 harness = self.broker.get_agent_harness(event.agent_id)
@@ -202,21 +260,33 @@ class SynthApp(App):
                 self._event_buffers.setdefault(event.agent_id, [])
                 try:
                     agent_list = self.query_one(AgentList)
-                    agent_list.add_agent_tile(event.agent_id, parent=parent)
+                    tile = agent_list.add_agent_tile(event.agent_id, parent=parent)
+                    self._tiles[event.agent_id] = tile
                 except Exception:
                     self.log.error(f"Failed to add tile for {event.agent_id}", exc_info=True)
-            try:
-                tile = self.query_one(f"#tile-{event.agent_id}", AgentTile)
+            tile = self._tiles.get(event.agent_id)
+            if tile is not None:
                 if event.new_state == AgentState.TERMINATED:
                     self._agent_modes.pop(event.agent_id, None)
                     self._agent_current_mode.pop(event.agent_id, None)
                     self._agent_models.pop(event.agent_id, None)
                     self._agent_current_model.pop(event.agent_id, None)
+                    self._tiles.pop(event.agent_id, None)
                     tile.remove()
                 else:
                     tile.update_state(event.new_state)
-            except Exception:
-                log.debug("Agent tile not found for %s", event.agent_id, exc_info=True)
+            if event.new_state == AgentState.TERMINATED:
+                feed = self._panels.pop(event.agent_id, None)
+                if feed is not None:
+                    await feed.remove()
+                self._event_buffers.pop(event.agent_id, None)
+                self._dynamic_agents.pop(event.agent_id, None)
+                if self.selected_agent == event.agent_id:
+                    live = [aid for aid, st in self._agent_states.items() if st != AgentState.TERMINATED]
+                    if live:
+                        await self.select_agent(live[0])
+                    else:
+                        self.selected_agent = ""
 
         if isinstance(event, AgentModesReceived):
             self._agent_modes[event.agent_id] = event.available_modes
@@ -376,7 +446,7 @@ class SynthApp(App):
             if feed.input_bar is not None:
                 feed.input_bar.update_slash_commands(event.commands)
         elif isinstance(event, McpMessageDelivered):
-            feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
+            await feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
         elif isinstance(event, HookFired):
             feed.add_hook_notification(event.hook_name)
         elif isinstance(event, InitialPromptDelivered):
@@ -411,11 +481,9 @@ class SynthApp(App):
         mode_id = self._agent_current_mode.get(agent_id)
         modes = self._agent_modes.get(agent_id, [])
         mode_name = next((m.name for m in modes if m.id == mode_id), None)
-        try:
-            tile = self.query_one(f"#tile-{agent_id}", AgentTile)
+        tile = self._tiles.get(agent_id)
+        if tile is not None:
             tile.update_mode(mode_name)
-        except Exception:
-            log.debug("Agent tile not found for mode update: %s", agent_id, exc_info=True)
 
     def _get_input_bar(self, agent_id: str) -> InputBar | None:
         """Return the InputBar for an agent, or None."""
@@ -498,12 +566,19 @@ class SynthApp(App):
                 if dyn:
                     harness = dyn.harness
                     cwd = cwd or dyn.cwd
-            feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, cwd=cwd, id=f"feed-{agent_id}")
+            feed = ConversationFeed(agent_id, agent_name, self.config.project, harness=harness, cwd=cwd, id=f"feed-{css_id(agent_id)}")
             self._panels[agent_id] = feed
-            await self.query_one("#right").mount(feed)
-            for event in self._event_buffers.get(agent_id, []):
-                await self._replay_event(feed, event)
+            await self.query_one("#right", ContentSwitcher).add_content(feed, set_current=False)
+            tile = self._tiles.get(agent_id)
+            if tile is not None:
+                tile.subscribe_feed(feed)
+            with self.batch_update():
+                for event in _coalesce_events(self._event_buffers.get(agent_id, [])):
+                    await self._replay_event(feed, event)
             self._event_buffers[agent_id] = []
+            # Scroll to bottom after replay so restored sessions show latest messages.
+            if feed._scroll:
+                feed._scroll.anchor()
             # Hide spinner if agent already passed INITIALIZING while buffered
             state = self._agent_states.get(agent_id)
             if state not in {AgentState.INITIALIZING, AgentState.BUSY, AgentState.CONFIGURING}:
@@ -520,7 +595,7 @@ class SynthApp(App):
                     pass
 
         switcher = self.query_one("#right", ContentSwitcher)
-        if self.selected_agent == agent_id and switcher.current != f"feed-{agent_id}":
+        if self.selected_agent == agent_id and switcher.current != f"feed-{css_id(agent_id)}":
             self.watch_selected_agent(agent_id)
         else:
             self.selected_agent = agent_id
@@ -533,8 +608,14 @@ class SynthApp(App):
         """
         if not agent_id:
             return
-        self.query_one(ContentSwitcher).current = f"feed-{agent_id}"
-        for tile in self.query(AgentTile):
+        feed_id = f"feed-{css_id(agent_id)}"
+        switcher = self.query_one(ContentSwitcher)
+        try:
+            switcher.get_child_by_id(feed_id)
+        except Exception:
+            return
+        switcher.current = feed_id
+        for tile in self._tiles.values():
             tile.set_class(tile._agent_id == agent_id, "tile-active")
         try:
             self.query_one("#mcp-btn", MCPButton).remove_class("btn-active")
@@ -549,11 +630,10 @@ class SynthApp(App):
         if switcher.current == "messages":
             # Close messages panel — return to selected agent
             if self.selected_agent:
-                switcher.current = f"feed-{self.selected_agent}"
-                self.watch_selected_agent(self.selected_agent)
+                await self.select_agent(self.selected_agent)
             return
 
-        for tile in self.query(AgentTile):
+        for tile in self._tiles.values():
             tile.remove_class("tile-active")
         try:
             self.query_one("#mcp-btn", MCPButton).add_class("btn-active")
@@ -563,15 +643,15 @@ class SynthApp(App):
         if self._mcp_panel is None:
             panel = MessageQueue(self._mcp_threads, id="messages")
             self._mcp_panel = panel
-            await switcher.mount(panel)
+            await switcher.add_content(panel, set_current=False)
         else:
             await self._mcp_panel.update_threads(self._mcp_threads)
 
         switcher.current = "messages"
 
     async def action_next_agent(self) -> None:
-        """Cycle to the next agent in config order."""
-        ids = [a.agent_id for a in self.config.agents]
+        """Cycle to the next live agent, skipping terminated ones."""
+        ids = [aid for aid, state in self._agent_states.items() if state != AgentState.TERMINATED]
         if not ids:
             return
         idx = ids.index(self.selected_agent) if self.selected_agent in ids else -1
@@ -586,18 +666,32 @@ class SynthApp(App):
         """Open the launch agent modal and launch the selected agent."""
         await self._do_launch()
 
-    async def _do_launch(self) -> None:
-        """Launch modal logic, separated for testability."""
+    async def _do_launch(self) -> bool:
+        """Launch modal logic, separated for testability.
+
+        Returns:
+            True if an agent was launched, False if the modal was cancelled.
+        """
         result = await self.push_screen_wait(LaunchAgentScreen())
         if result is not None:
             self._dynamic_agents[result.agent_id] = DynamicAgentInfo(parent=None, task="", harness=result.harness, cwd=result.cwd)
             self._event_buffers[result.agent_id] = []
             try:
-                self.query_one(AgentList).add_agent_tile(result.agent_id)
+                tile = self.query_one(AgentList).add_agent_tile(result.agent_id)
+                self._tiles[result.agent_id] = tile
             except Exception:
                 log.debug("Failed to add tile for %s", result.agent_id, exc_info=True)
             await self.select_agent(result.agent_id)
             await self.broker.handle(LaunchAgent(agent_id=result.agent_id, config=result))
+            return True
+        return False
+
+    @work
+    async def _do_first_run(self) -> None:
+        """Show launch modal on first run with no config; exit on cancel."""
+        launched = await self._do_launch()
+        if not launched:
+            self.exit()
 
     @work
     async def action_restore(self) -> None:
@@ -637,11 +731,9 @@ class SynthApp(App):
                 restored_ids = set(session_info["agents"])
                 for agent in self.config.agents:
                     if agent.agent_id not in restored_ids:
-                        try:
-                            tile = self.query_one(f"#tile-{agent.agent_id}", AgentTile)
+                        tile = self._tiles.pop(agent.agent_id, None)
+                        if tile is not None:
                             tile.remove()
-                        except Exception:
-                            pass
 
             # Load journal events into buffers BEFORE creating panels.
             # select_agent will drain them through _replay_event after
@@ -672,16 +764,19 @@ class SynthApp(App):
 
     async def on_unmount(self) -> None:
         """Terminate all agent subprocesses during Textual shutdown."""
+        import threading
+        watchdog = threading.Timer(5.0, os._exit, args=(0,))
+        watchdog.daemon = True
+        watchdog.start()
         try:
             await self.broker.shutdown()
         except Exception:
             log.debug("Broker shutdown error", exc_info=True)
         finally:
-            # Guarantee DB cleanup even if shutdown was interrupted —
-            # an unclosed aiosqlite connection keeps a non-daemon thread
-            # alive, hanging the process after the event loop exits.
-            if self.broker._lifecycle:
-                try:
-                    await self.broker._lifecycle.close_db()
-                except Exception:
-                    pass
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.shutdown_default_executor(1)
+                loop._default_executor = None  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            watchdog.cancel()

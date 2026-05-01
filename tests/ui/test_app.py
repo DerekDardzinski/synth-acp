@@ -16,10 +16,13 @@ from synth_acp.models.events import (
     AgentStateChanged,
     AgentThoughtReceived,
     BrokerEvent,
+    MessageChunkReceived,
+    ToolCallUpdated,
     UsageUpdated,
 )
-from synth_acp.ui.app import SynthApp
+from synth_acp.ui.app import SynthApp, _coalesce_events
 from synth_acp.ui.messages import BrokerEventMessage
+from synth_acp.ui.screens.launch import LaunchAgentScreen
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
 from synth_acp.ui.widgets.message_queue import MessageQueue
 
@@ -183,17 +186,17 @@ class TestShowMessagesContentSwitcher:
         """First call creates MessageQueue with id='messages' and mounts it."""
         app = _make_app("agent-1")
 
-        mock_switcher = SimpleNamespace(current=None, mount=AsyncMock())
+        mock_switcher = SimpleNamespace(current=None, add_content=AsyncMock())
         with (
             patch.object(app, "query_one", return_value=mock_switcher),
-            patch.object(app, "query", return_value=[]),
+            patch.object(app, "_tiles", {}),
         ):
             await app.show_messages()
 
         assert app._mcp_panel is not None
         assert isinstance(app._mcp_panel, MessageQueue)
-        mock_switcher.mount.assert_called_once()
-        mounted = mock_switcher.mount.call_args[0][0]
+        mock_switcher.add_content.assert_called_once()
+        mounted = mock_switcher.add_content.call_args[0][0]
         assert mounted.id == "messages"
         assert mock_switcher.current == "messages"
 
@@ -303,3 +306,71 @@ class TestReplayEventSkipsSpinner:
         await app._replay_event(feed, event)
 
         feed.query_one.assert_not_called()
+
+
+class TestFirstRunEmptyConfig:
+    async def test_empty_agents_pushes_launch_screen_on_mount(self) -> None:
+        """When config has no agents, LaunchAgentScreen is pushed on mount."""
+        app = SynthApp(_make_broker(), _make_config())
+
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert any(isinstance(s, LaunchAgentScreen) for s in app.screen_stack)
+
+    async def test_first_run_cancel_exits_app(self) -> None:
+        """Cancelling the launch modal on first run exits the app."""
+        app = _make_app()
+
+        with (
+            patch.object(app, "push_screen_wait", new_callable=AsyncMock, return_value=None),
+            patch.object(app, "exit") as mock_exit,
+        ):
+            await SynthApp._do_first_run.__wrapped__(app)
+
+        mock_exit.assert_called_once()
+
+
+class TestCoalesceEvents:
+    def test_consecutive_message_chunks_merged(self) -> None:
+        """Consecutive MCR events with same agent_id merge into one."""
+        events: list[BrokerEvent] = [
+            MessageChunkReceived(agent_id="a", chunk="x"),
+            MessageChunkReceived(agent_id="a", chunk="y"),
+            ToolCallUpdated(agent_id="a", tool_call_id="t1", title="t", kind="read", status="completed"),
+            MessageChunkReceived(agent_id="a", chunk="z"),
+        ]
+        result = _coalesce_events(events)
+        assert len(result) == 3
+        assert isinstance(result[0], MessageChunkReceived)
+        assert result[0].chunk == "xy"
+        assert isinstance(result[1], ToolCallUpdated)
+        assert isinstance(result[2], MessageChunkReceived)
+        assert result[2].chunk == "z"
+
+    def test_consecutive_thought_chunks_merged(self) -> None:
+        """Consecutive ATR events with same agent_id merge into one."""
+        events: list[BrokerEvent] = [
+            AgentThoughtReceived(agent_id="a", chunk="p"),
+            AgentThoughtReceived(agent_id="a", chunk="q"),
+            MessageChunkReceived(agent_id="a", chunk="r"),
+        ]
+        result = _coalesce_events(events)
+        assert len(result) == 2
+        assert isinstance(result[0], AgentThoughtReceived)
+        assert result[0].chunk == "pq"
+        assert isinstance(result[1], MessageChunkReceived)
+        assert result[1].chunk == "r"
+
+    def test_empty_buffer_returns_empty(self) -> None:
+        assert _coalesce_events([]) == []
+
+    def test_different_agent_ids_not_merged(self) -> None:
+        """MCR events with different agent_ids stay separate."""
+        events: list[BrokerEvent] = [
+            MessageChunkReceived(agent_id="a", chunk="x"),
+            MessageChunkReceived(agent_id="b", chunk="y"),
+        ]
+        result = _coalesce_events(events)
+        assert len(result) == 2
+        assert result[0].chunk == "x"  # type: ignore[union-attr]
+        assert result[1].chunk == "y"  # type: ignore[union-attr]

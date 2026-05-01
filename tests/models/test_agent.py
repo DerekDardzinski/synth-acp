@@ -9,13 +9,17 @@ from synth_acp.models.agent import (
     TRANSITIONS,
     AgentConfig,
     AgentState,
+    css_id,
 )
 
 
 class TestAgentConfigValidation:
-    def test_rejects_dots_in_agent_id(self):
-        with pytest.raises(ValidationError, match="must start with alphanumeric"):
-            AgentConfig(agent_id="my.agent", harness="kiro")
+    def test_accepts_dots_in_agent_id(self):
+        cfg = AgentConfig(agent_id="my.agent", harness="kiro")
+        assert cfg.agent_id == "my.agent"
+
+    def test_dots_sanitized_in_css_id(self):
+        assert css_id("my.agent") == "my-agent"
 
     def test_rejects_empty_harness(self):
         with pytest.raises(ValidationError, match="harness must not be empty"):

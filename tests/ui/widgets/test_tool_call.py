@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from textual.widgets import Static
+from textual.geometry import Size
+from textual.widgets import RichLog, Static
 
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.widgets.diff_view import DiffView
-from synth_acp.ui.widgets.tool_call import ToolCallBlock
+from synth_acp.ui.widgets.tool_call import ToolCallBlock, _ReflowRichLog
 
 
 def _make_config() -> SessionConfig:
@@ -103,15 +104,17 @@ class TestToolCallBlockContent:
     async def test_tool_call_block_renders_raw_output_for_execute_kind(self) -> None:
         """raw_output with execute kind renders the output widget."""
         app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)):
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
             feed = await _get_feed(app)
             await feed.add_tool_call(
                 "tc5", "Run", "execute", "completed",
                 raw_output={"output": "hello"},
             )
+            await pilot.pause()
             block = app.query_one("#tool-tc5", ToolCallBlock)
-            ro = block.query_one("#tc-raw-output-label")
-            assert "hello" in ro.content.plain
+            log = block.query_one("#tc-raw-output", RichLog)
+            text = "\n".join(s.text for s in log.lines)
+            assert "hello" in text
 
     async def test_tool_call_block_does_not_render_raw_output_for_read_kind(self) -> None:
         """raw_output with read kind is suppressed."""
@@ -123,31 +126,69 @@ class TestToolCallBlockContent:
                 raw_output={"output": "content"},
             )
             block = app.query_one("#tool-tc6", ToolCallBlock)
-            assert len(block.query("#tc-raw-output")) == 0
+            assert len(block.query(RichLog)) == 0
 
     async def test_tool_call_block_long_raw_output_is_scrollable(self) -> None:
         """Long output is in a scrollable container, not truncated."""
         app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)):
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
             feed = await _get_feed(app)
             await feed.add_tool_call(
                 "tc7", "Run", "execute", "completed",
                 raw_output={"output": "\n".join(["x"] * 300)},
             )
+            await pilot.pause()
             block = app.query_one("#tool-tc7", ToolCallBlock)
-            block.query_one("#tc-raw-output")  # scrollable container exists
-            label = block.query_one("#tc-raw-output-label")
-            assert "x" in label.content.plain
+            log = block.query_one("#tc-raw-output", RichLog)
+            text = "\n".join(s.text for s in log.lines)
+            assert "x" in text
 
     async def test_tool_call_block_renders_kiro_nested_raw_output(self) -> None:
         """Kiro's items[].Json.stdout format is extracted and rendered."""
         app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)):
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
             feed = await _get_feed(app)
             await feed.add_tool_call(
                 "tc8", "Run", "execute", "completed",
                 raw_output={"items": [{"Json": {"exit_status": "exit status: 0", "stdout": "hello world\n", "stderr": ""}}]},
             )
+            await pilot.pause()
             block = app.query_one("#tool-tc8", ToolCallBlock)
-            ro = block.query_one("#tc-raw-output-label")
-            assert "hello world" in ro.content.plain
+            log = block.query_one("#tc-raw-output", RichLog)
+            text = "\n".join(s.text for s in log.lines)
+            assert "hello world" in text
+
+
+class TestReflowRichLogResize:
+    def test_first_resize_records_width_without_clear_write(self) -> None:
+        """First resize (width 0 → 80) should record width, not clear+write."""
+        log = _ReflowRichLog()
+        log._source_content = "hello"
+        log._size_known = True
+
+        event = MagicMock()
+        event.size = Size(80, 24)
+
+        with patch.object(RichLog, "on_resize"), patch.object(log, "clear") as mock_clear, patch.object(log, "write") as mock_write:
+            log.on_resize(event)
+
+        assert log._last_render_width == 80
+        mock_clear.assert_not_called()
+        mock_write.assert_not_called()
+
+    def test_subsequent_resize_triggers_clear_write(self) -> None:
+        """Resize after first (width 80 → 120) should clear and re-render."""
+        log = _ReflowRichLog()
+        log._source_content = "hello"
+        log._size_known = True
+        log._last_render_width = 80
+
+        event = MagicMock()
+        event.size = Size(120, 24)
+
+        with patch.object(RichLog, "on_resize"), patch.object(log, "clear") as mock_clear, patch.object(log, "write") as mock_write:
+            log.on_resize(event)
+
+        assert log._last_render_width == 120
+        mock_clear.assert_called_once()
+        mock_write.assert_called_once_with("hello")

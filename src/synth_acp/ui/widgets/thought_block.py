@@ -8,7 +8,7 @@ from textual.widgets.markdown import Markdown, MarkdownStream
 from synth_acp.ui.widgets.copy_button import CopyButton
 
 
-class ThoughtBlock(Collapsible):
+class ThoughtBlock(Collapsible, can_focus=False):
     """Collapsible block for agent reasoning/thought chunks.
 
     Displays "Thinking…" while streaming, collapses with title "Thought"

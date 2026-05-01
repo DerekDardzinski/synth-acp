@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
+import os
 import shutil
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,19 @@ from synth_acp.models.events import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _force_exit_if_threads_linger() -> None:
+    """Last-resort exit if non-daemon threads keep the process alive."""
+    non_daemon = [
+        t for t in threading.enumerate()
+        if t.is_alive() and not t.daemon and t is not threading.main_thread()
+    ]
+    if non_daemon:
+        os._exit(0)
+
+
+atexit.register(_force_exit_if_threads_linger)
 
 app = typer.Typer(invoke_without_command=True)
 
@@ -244,7 +260,7 @@ def _resolve_config(
         print("No config found. Run without --headless for interactive setup.", file=sys.stderr)
         raise typer.Exit(1)
 
-    return _first_run_picker()
+    return SessionConfig(project=Path.cwd().name, agents=[])
 
 
 # ------------------------------------------------------------------
@@ -424,6 +440,9 @@ async def _run(config: SessionConfig) -> None:
         pass
     finally:
         print("\n[synth] Shutting down...")
+        watchdog = threading.Timer(5.0, os._exit, args=(0,))
+        watchdog.daemon = True
+        watchdog.start()
         event_task.cancel()
         try:
             await event_task
@@ -433,6 +452,13 @@ async def _run(config: SessionConfig) -> None:
             await broker.shutdown()
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.shutdown_default_executor(1)
+            loop._default_executor = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        watchdog.cancel()
 
 
 # ------------------------------------------------------------------
@@ -453,7 +479,13 @@ def _run_tui(config: SessionConfig, style: str = "default", restore: bool = Fals
         style: CSS style variant name.
         restore: Whether to show the session picker on startup.
     """
+    from textual.geometry import Region
+
     from synth_acp.ui.app import SynthApp
+    if type(Region).__module__ != "builtins":
+        logging.getLogger("synth_acp").warning(
+            "textual-speedups not active — install textual-speedups for better performance"
+        )
 
     broker = ACPBroker(config)
     css_path = _STYLE_CSS.get(style, _STYLE_CSS["default"])

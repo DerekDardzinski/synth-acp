@@ -88,15 +88,14 @@ AgentTile.tile-permission.tile-active { border-top: tall $warning; }
 }
 
 /* ── Right panels ── */
-#right { height: 1fr; width: 1fr; hatch: right $panel 60%; }
+#right { height: 1fr; width: 1fr; }
 
-ContentSwitcher > * { height: 1fr; hatch: right $panel 60%; }
+ContentSwitcher > * { height: 1fr; }
 
 .right-panel {
     height: 1fr;
     width: 1fr;
     layout: vertical;
-    hatch: right $panel 60%;
 }
 
 /* ── Panel header ── */
@@ -106,7 +105,7 @@ ConversationFeed {
     height: 1fr;
     width: 1fr;
     layout: vertical;
-    hatch: right $panel 60%;
+    /* hatch: right $panel 60%; */
 }
 
 /* ── Conversation scroll area ── */
@@ -117,7 +116,7 @@ ConversationFeed {
     scrollbar-color: $scrollbar;
     scrollbar-background: transparent;
     align-vertical: bottom;
-    hatch: right $panel 60%;
+    /* hatch: right $panel 60%; */
 }
 
 /* ── Turn container ── */
@@ -172,7 +171,7 @@ ToolCallBlock.tool-permission {
 /* ── ToolCallBlock content ── */
 #tc-location { color: $text-muted; text-style: italic; padding-left: 2; }
 #tc-raw-input { background: $background; padding: 0 1; }
-#tc-raw-output { background: $background; padding: 0 1; height: auto; max-height: 20; }
+#tc-raw-output { background: $background; padding: 0 1; height: auto; max-height: 20; overflow-x: hidden; scrollbar-size-vertical: 1; }
 #tc-raw-output-label { width: 1fr; }
 #tc-text { padding-left: 2; }
 
@@ -232,7 +231,7 @@ _OptionRow {
     border: none;
     margin-bottom: 1;
     color: $text-muted;
-    hatch: right $panel 60%;
+    /* hatch: right $panel 60%; */
 }
 .input-bar:focus-within {
     border: none;
@@ -342,7 +341,6 @@ LaunchButton:hover {
     scrollbar-size-vertical: 0;
     scrollbar-color: $scrollbar;
     scrollbar-background: transparent;
-    hatch: left $panel 60%;
 }
 .thread-item {
     height: auto;
@@ -368,13 +366,11 @@ LaunchButton:hover {
 ThreadDetail {
     height: 1fr;
     layout: vertical;
-    hatch: right $panel 60%;
 }
 
 #msg-title-dock {
     dock: top;
     height: auto;
-    hatch: left $panel 60%;
     padding-bottom: 1;
 }
 #msg-title {
@@ -395,7 +391,7 @@ ThreadDetail {
     scrollbar-size-vertical: 1;
     scrollbar-color: $scrollbar;
     scrollbar-background: transparent;
-    hatch: right $panel 60%;
+    /* hatch: right $panel 60%; */
 }
 #thread-detail-scroll .mcp-msg {
     margin: 1 0 0 0;

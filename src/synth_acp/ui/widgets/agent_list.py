@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from textual.app import ComposeResult
 from textual.containers import ScrollableContainer, Vertical
 from textual.markup import escape
 from textual.message import Message
+from textual.reactive import var
 from textual.widgets import Static
 
-from synth_acp.models.agent import AgentState
+from synth_acp.models.agent import AgentState, css_id
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
+
+if TYPE_CHECKING:
+    from synth_acp.ui.widgets.conversation import ConversationFeed
 
 STATUS_DOT: dict[AgentState, str] = {
     AgentState.INITIALIZING: "[$accent]●[/]",
@@ -58,6 +64,8 @@ class AgentTile(Vertical):
         state: Initial agent state.
     """
 
+    has_permission: var[bool] = var(False, toggle_class="tile-permission")
+
     class TerminateClicked(Message):
         """Posted when the close button is clicked on a tile."""
 
@@ -78,9 +86,8 @@ class AgentTile(Vertical):
         self._agent_task = task
         self._parent_agent = parent
         self._current_mode: str | None = None
-        super().__init__(id=f"tile-{agent_id}")
-        if state == AgentState.AWAITING_PERMISSION:
-            self.add_class("tile-permission")
+        super().__init__(id=f"tile-{css_id(agent_id)}")
+        self.has_permission = state == AgentState.AWAITING_PERMISSION
 
     def compose(self) -> ComposeResult:
         yield Static(self._build_markup(), classes="tile-label")
@@ -122,10 +129,7 @@ class AgentTile(Vertical):
         self._state = new_state
         self.query_one(".tile-label", Static).update(self._build_markup())
         self.query_one(ActivityBar).active = new_state in _BUSY_STATES
-        if new_state == AgentState.AWAITING_PERMISSION:
-            self.add_class("tile-permission")
-        else:
-            self.remove_class("tile-permission")
+        self.has_permission = new_state == AgentState.AWAITING_PERMISSION
 
     def update_mode(self, mode_name: str | None) -> None:
         """Update the mode badge shown in the tile.
@@ -146,6 +150,18 @@ class AgentTile(Vertical):
         if not isinstance(app, SynthApp):
                     return
         app.run_worker(app.select_agent(self._agent_id))
+
+    def subscribe_feed(self, feed: ConversationFeed) -> None:
+        """Subscribe to a feed's streaming signal for activity bar updates.
+
+        Args:
+            feed: The conversation feed to subscribe to.
+        """
+        feed.streaming_signal.subscribe(self, self._on_streaming_changed, immediate=True)
+
+    def _on_streaming_changed(self, streaming: bool) -> None:
+        """Update the activity bar when streaming state changes."""
+        self.query_one(ActivityBar).active = streaming
 
 
 class LaunchButton(Static):
@@ -218,13 +234,17 @@ class AgentList(Vertical):
 
     def add_agent_tile(
         self, agent_id: str, *, task: str = "", parent: str | None = None
-    ) -> None:
+    ) -> AgentTile:
         """Mount a new agent tile into the scrollable container.
 
         Args:
             agent_id: Unique agent identifier.
             task: Optional task description.
             parent: Optional parent agent ID.
+
+        Returns:
+            The newly created AgentTile.
         """
         tile = AgentTile(agent_id, task=task, parent=parent)
         self.query_one("#agent-list", ScrollableContainer).mount(tile)
+        return tile
