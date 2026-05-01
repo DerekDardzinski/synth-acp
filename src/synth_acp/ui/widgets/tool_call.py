@@ -30,11 +30,27 @@ class _ReflowRichLog(RichLog):
         super().__init__(**kwargs)
         self._source_content: Any = None
         self._last_render_width: int = 0
+        self._pending_write: Any = None
 
     def write_reflow(self, content: Any) -> None:
         """Write content and store it for reflow on resize."""
         self._source_content = content
-        self.write(content)
+        if self._dom_ready:
+            self.write(content)
+        else:
+            self._pending_write = content
+
+    @property
+    def _dom_ready(self) -> bool:
+        try:
+            return self.app is not None
+        except Exception:
+            return False
+
+    def on_mount(self) -> None:
+        if self._pending_write is not None:
+            self.write(self._pending_write)
+            self._pending_write = None
 
     def on_resize(self, event: Any) -> None:
         super().on_resize(event)
