@@ -111,6 +111,7 @@ class TestToolCallBlockContent:
                 raw_output={"output": "hello"},
             )
             await pilot.pause()
+            await pilot.pause()
             block = app.query_one("#tool-tc5", ToolCallBlock)
             log = block.query_one("#tc-raw-output", RichLog)
             text = "\n".join(s.text for s in log.lines)
@@ -138,6 +139,7 @@ class TestToolCallBlockContent:
                 raw_output={"output": "\n".join(["x"] * 300)},
             )
             await pilot.pause()
+            await pilot.pause()
             block = app.query_one("#tool-tc7", ToolCallBlock)
             log = block.query_one("#tc-raw-output", RichLog)
             text = "\n".join(s.text for s in log.lines)
@@ -152,6 +154,7 @@ class TestToolCallBlockContent:
                 "tc8", "Run", "execute", "completed",
                 raw_output={"items": [{"Json": {"exit_status": "exit status: 0", "stdout": "hello world\n", "stderr": ""}}]},
             )
+            await pilot.pause()
             await pilot.pause()
             block = app.query_one("#tool-tc8", ToolCallBlock)
             log = block.query_one("#tc-raw-output", RichLog)
