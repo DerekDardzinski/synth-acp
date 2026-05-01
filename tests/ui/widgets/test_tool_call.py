@@ -11,7 +11,7 @@ from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.widgets.diff_view import DiffView
-from synth_acp.ui.widgets.tool_call import ToolCallBlock, _ReflowRichLog, _extract_raw_output_text
+from synth_acp.ui.widgets.tool_call import ToolCallBlock, _extract_raw_output_text, _ReflowRichLog
 
 
 def _make_config() -> SessionConfig:
