@@ -171,7 +171,7 @@ def fuzzy_score(query: str, path: str) -> int | None:
         prev_run = curr_run
 
     result = prev_m[n - 1]
-    return result if result != neg_inf else None
+    return int(result) if result != neg_inf else None
 
 
 def filter_files(query: str, files: list[FileEntry], limit: int = 15) -> list[FileEntry]:

@@ -79,7 +79,7 @@ class SessionPickerScreen(ModalScreen[str | None]):
         """Populate the initial table."""
         self._do_search("")
 
-    def on_resize(self, event: Resize) -> None:
+    def on_resize(self, event: Resize) -> None:  # noqa: ARG002
         """Recalculate Message column width when container is sized."""
         container = self.query_one("#picker-container")
         # Available width minus padding (2*2), border (2), other columns, separators

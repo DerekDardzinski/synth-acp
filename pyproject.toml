@@ -1,6 +1,6 @@
 [project]
 name = "synth-acp"
-version = "0.3.0"
+version = "0.4.0"
 description = "SYNTH — Synchronized Network of Teamed Harnesses over ACP"
 requires-python = ">=3.12"
 license = "AGPL-3.0-only"
@@ -117,4 +117,30 @@ include = ["src/synth_acp/ui/ansi/*"]
 [tool.ty.overrides.rules]
 invalid-return-type = "ignore"
 invalid-assignment = "ignore"
+invalid-argument-type = "ignore"
+
+# Textual UI layer — ty cannot resolve reactive types, App generics, or **kwargs forwarding
+[[tool.ty.overrides]]
+include = ["src/synth_acp/ui/*"]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
+invalid-assignment = "ignore"
+invalid-method-override = "ignore"
+unresolved-attribute = "ignore"
+missing-argument = "ignore"
+too-many-positional-arguments = "ignore"
+
+# Pydantic BaseModel(frozen=True) is not a frozen dataclass
+[[tool.ty.overrides]]
+include = ["src/synth_acp/models/*"]
+
+[tool.ty.overrides.rules]
+invalid-frozen-dataclass-subclass = "ignore"
+
+# ACP SDK types — ty cannot resolve union narrowing for mcp_servers parameter
+[[tool.ty.overrides]]
+include = ["src/synth_acp/acp/*"]
+
+[tool.ty.overrides.rules]
 invalid-argument-type = "ignore"
