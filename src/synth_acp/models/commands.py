@@ -51,12 +51,23 @@ class CancelTurn(BrokerCommand):
     agent_id: str
 
 
-class SetAgentMode(BrokerCommand):
-    """Request the broker to switch an agent's active mode.
+class SetConfigOption(BrokerCommand):
+    """Request the broker to change a session config option.
 
     Only valid when the agent is IDLE. The broker forwards this to
-    session.set_mode(), which calls set_session_mode() on the ACP connection.
-    The agent confirms via a current_mode_update stream event.
+    lifecycle.set_config_option(), which delegates to session.set_config_option().
+    """
+
+    agent_id: str
+    config_id: str
+    value: str | bool
+
+
+class SetAgentMode(BrokerCommand):
+    """Deprecated: use SetConfigOption(config_id='mode', value=mode_id) instead.
+
+    Still functional for backward compatibility. The broker routes this
+    through set_config_option internally.
     """
 
     agent_id: str
@@ -64,12 +75,10 @@ class SetAgentMode(BrokerCommand):
 
 
 class SetAgentModel(BrokerCommand):
-    """Request the broker to switch an agent's active model.
+    """Deprecated: use SetConfigOption(config_id='model', value=model_id) instead.
 
-    Only valid when the agent is IDLE. The broker forwards this to
-    session.set_model(), which calls set_session_model() on the ACP connection.
-    AgentModelChanged is emitted immediately after the call returns (no ACP
-    push notification exists for model changes).
+    Still functional for backward compatibility. The broker routes this
+    through set_config_option internally.
     """
 
     agent_id: str
@@ -80,3 +89,15 @@ class RestoreSession(BrokerCommand):
     """Restore a previously saved SYNTH session."""
 
     broker_session_id: str
+
+
+class HoldDelivery(BrokerCommand):
+    """Hold MCP message delivery for an agent. Messages go to UI queue instead."""
+
+    agent_id: str
+
+
+class ReleaseDelivery(BrokerCommand):
+    """Release MCP delivery hold. Future messages deliver directly to agent."""
+
+    agent_id: str

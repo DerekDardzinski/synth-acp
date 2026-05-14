@@ -17,30 +17,36 @@ from synth_acp.broker.lifecycle import AgentLifecycle
 from synth_acp.broker.message_bus import MessageBus
 from synth_acp.broker.permissions import PermissionEngine
 from synth_acp.broker.registry import AgentRegistry
-from synth_acp.db import ensure_schema_async
+from synth_acp.db import ensure_schema_sync
 from synth_acp.models.agent import AgentConfig, AgentMode, AgentModel, AgentState
 from synth_acp.models.commands import (
     BrokerCommand,
     CancelTurn,
+    HoldDelivery,
     LaunchAgent,
+    ReleaseDelivery,
     RespondPermission,
     RestoreSession,
     ResurrectAgent,
     SendPrompt,
     SetAgentMode,
     SetAgentModel,
+    SetConfigOption,
     TerminateAgent,
 )
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
     AgentStateChanged,
+    AgentThoughtReceived,
+    BrokerError,
     BrokerEvent,
-    HookFired,
-    InitialPromptDelivered,
     McpMessageDelivered,
+    McpMessageHeld,
     MessageChunkReceived,
     PermissionAutoResolved,
     PermissionRequested,
+    ToolCallUpdated,
+    TurnComplete,
     UsageUpdated,
     UserPromptSubmitted,
 )
@@ -55,10 +61,12 @@ class ACPBroker:
     def __init__(
         self,
         config: SessionConfig,
+        initial_agent: AgentConfig,
         db_path: Path | None = None,
         event_queue_maxsize: int = 2000,
     ) -> None:
         self._config = config
+        self._initial_agent = initial_agent
         self._db_path = db_path or Path.home() / ".synth" / "synth.db"
         self._session_id = f"{config.project}-{uuid.uuid4().hex[:8]}"
         self._event_queue: asyncio.Queue[BrokerEvent] = asyncio.Queue(maxsize=event_queue_maxsize)
@@ -72,11 +80,16 @@ class ACPBroker:
         self._active_permission: dict[str, str] = {}  # agent_id → active request_id
         self._permission_queue: dict[str, list[PermissionRequested]] = {}  # agent_id → queued events
         self._permission_counter: dict[str, tuple[int, int]] = {}  # agent_id → (current, total)
-        self._registry = AgentRegistry(config)
+        self._registry = AgentRegistry()
         self._message_bus: MessageBus | None = None
+        self._message_bus_starting: bool = False
         self._lifecycle: AgentLifecycle | None = None
         self._expired: bool = False
         self._journal_seq: dict[str, int] = {}  # agent_id → next sequence number
+        self._turn_buffer: dict[str, list[tuple[int, BrokerEvent]]] = {}
+        self._turn_buffer_tool_index: dict[str, dict[str, int]] = {}
+        self._pending_flushes: set[asyncio.Task] = set()
+        self._delivery_held: set[str] = set()
 
     @property
     def session_id(self) -> str:
@@ -92,8 +105,11 @@ class ACPBroker:
         lifecycle = await self._ensure_lifecycle()
         match command:
             case LaunchAgent(agent_id=aid, config=cfg):
-                await self._start_message_bus()
-                await lifecycle.launch(aid, adhoc_config=cfg)
+                if cfg is None:
+                    await self._sink(BrokerError(agent_id=aid, message=f"LaunchAgent requires config for '{aid}'"))
+                else:
+                    await self._start_message_bus()
+                    await lifecycle.launch(aid, adhoc_config=cfg)
             case TerminateAgent(agent_id=aid):
                 await lifecycle.terminate(aid)
             case ResurrectAgent(agent_id=aid):
@@ -107,11 +123,17 @@ class ACPBroker:
             case CancelTurn(agent_id=aid):
                 await lifecycle.cancel(aid)
             case SetAgentMode(agent_id=aid, mode_id=mid):
-                await lifecycle.set_mode(aid, mid)
+                await lifecycle.set_config_option(aid, "mode", mid)
             case SetAgentModel(agent_id=aid, model_id=mid):
-                await lifecycle.set_model(aid, mid)
+                await lifecycle.set_config_option(aid, "model", mid)
+            case SetConfigOption(agent_id=aid, config_id=cid, value=val):
+                await lifecycle.set_config_option(aid, cid, val)
             case RestoreSession(broker_session_id=sid):
                 await self.restore_session(sid)
+            case HoldDelivery(agent_id=aid):
+                self._delivery_held.add(aid)
+            case ReleaseDelivery(agent_id=aid):
+                self._delivery_held.discard(aid)
 
     # ------------------------------------------------------------------
     # State queries (thin delegations to registry)
@@ -119,9 +141,6 @@ class ACPBroker:
 
     def get_agent_states(self) -> dict[str, AgentState]:
         return self._registry.get_states()
-
-    def get_agent_configs(self) -> list[AgentConfig]:
-        return self._registry.get_configs()
 
     def get_usage(self, agent_id: str) -> UsageUpdated | None:
         return self._registry.get_usage(agent_id)
@@ -206,7 +225,7 @@ class ACPBroker:
         has_history = await asyncio.to_thread(_agents_with_history)
 
         # Start message bus without register_agents — rows already exist in SQLite.
-        await self._start_message_bus(skip_register=True)
+        await self._start_message_bus()
         lifecycle = await self._ensure_lifecycle()
 
         for row in rows:
@@ -244,25 +263,82 @@ class ACPBroker:
 
     @staticmethod
     async def list_restorable_sessions(db_path: Path) -> list[dict]:
-        """Return restorable sessions grouped by session_id."""
+        """Return restorable sessions grouped by session_id with enriched metadata."""
         def _query() -> list[dict]:
             conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
-                rows = conn.execute(
-                    "SELECT session_id, GROUP_CONCAT(agent_id) as agents, "
-                    "MAX(registered) as last_active, COUNT(*) as agent_count "
+                # Get sessions that have at least one restorable/active agent
+                sessions = conn.execute(
+                    "SELECT session_id, MAX(registered) as last_active, "
+                    "COUNT(*) as agent_count "
                     "FROM agents WHERE status IN ('restorable', 'active') "
                     "GROUP BY session_id ORDER BY MAX(registered) DESC"
                 ).fetchall()
+
+                if not sessions:
+                    return []
+
+                sids = [s["session_id"] for s in sessions]
+                placeholders = ",".join("?" * len(sids))
+
+                # Bulk: all agents for these sessions
+                all_agents: dict[str, list[str]] = {sid: [] for sid in sids}
+                for r in conn.execute(
+                    f"SELECT session_id, agent_id FROM agents WHERE session_id IN ({placeholders})",
+                    sids,
+                ).fetchall():
+                    all_agents[r["session_id"]].append(r["agent_id"])
+
+                # Bulk: CWD of root agent per session
+                all_cwds: dict[str, str | None] = dict.fromkeys(sids)
+                for r in conn.execute(
+                    f"SELECT a.session_id, a.cwd FROM agents a "
+                    f"INNER JOIN (SELECT session_id, MIN(registered) as min_reg FROM agents "
+                    f"WHERE session_id IN ({placeholders}) GROUP BY session_id) sub "
+                    f"ON a.session_id = sub.session_id AND a.registered = sub.min_reg",
+                    sids,
+                ).fetchall():
+                    all_cwds[r["session_id"]] = r["cwd"]
+
+                # Bulk: tasks
+                all_tasks: dict[str, list[str]] = {sid: [] for sid in sids}
+                for r in conn.execute(
+                    f"SELECT session_id, task FROM agents WHERE session_id IN ({placeholders}) AND task IS NOT NULL",
+                    sids,
+                ).fetchall():
+                    all_tasks[r["session_id"]].append(r["task"])
+
+                # Bulk: first messages (use window function to get top 3 per session)
+                all_messages: dict[str, list[str]] = {sid: [] for sid in sids}
+                msg_rows = conn.execute(
+                    f"SELECT session_id, payload FROM ("
+                    f"  SELECT session_id, payload, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY seq) as rn"
+                    f"  FROM ui_events WHERE session_id IN ({placeholders}) AND event_type = 'UserPromptSubmitted'"
+                    f") WHERE rn <= 3",
+                    sids,
+                ).fetchall()
+                for r in msg_rows:
+                    try:
+                        data = json.loads(r["payload"])
+                        text = data.get("text", "")
+                        if text:
+                            all_messages[r["session_id"]].append(text)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
                 return [
                     {
-                        "session_id": r[0],
-                        "agents": r[1].split(","),
-                        "last_active": r[2],
-                        "agent_count": r[3],
+                        "session_id": s["session_id"],
+                        "agents": all_agents[s["session_id"]],
+                        "last_active": s["last_active"],
+                        "agent_count": s["agent_count"],
+                        "cwd": all_cwds[s["session_id"]],
+                        "tasks": all_tasks[s["session_id"]],
+                        "first_messages": all_messages[s["session_id"]],
                     }
-                    for r in rows
+                    for s in sessions
                 ]
             finally:
                 conn.close()
@@ -342,26 +418,11 @@ class ACPBroker:
             await self._event_queue.put(event)
 
         # Journal UI-visible events for session restore.
-        await self._journal_event(event)
+        self._buffer_journal_event(event)
 
         if isinstance(event, AgentStateChanged) and event.new_state == AgentState.IDLE:
-            if self._message_bus and self._lifecycle:
-                pending = self._message_bus.pop_pending(event.agent_id)
-                if pending:
-                    original = self._registry.pop_initial_message(event.agent_id)
-                    if original:
-                        parent = self._registry.get_parent(event.agent_id)
-                        await self._sink(
-                            InitialPromptDelivered(
-                                agent_id=event.agent_id,
-                                from_agent=parent or "system",
-                                text=original,
-                            )
-                        )
-                        await self._sink(
-                            HookFired(agent_id=event.agent_id, hook_name="on_agent_prompt")
-                        )
-                    await self._lifecycle.prompt(event.agent_id, pending)
+            if self._message_bus:
+                self._message_bus.wake(event.agent_id)
 
     # ------------------------------------------------------------------
     # Agent state cleanup
@@ -392,27 +453,118 @@ class ACPBroker:
         "UserPromptSubmitted",
     })
 
-    async def _journal_event(self, event: BrokerEvent) -> None:
-        """Persist a UI-visible event to the journal table."""
+    def _buffer_journal_event(self, event: BrokerEvent) -> None:
+        """Accumulate a journalable event into the per-agent turn buffer.
+
+        Seq numbers are allocated at buffer time so monotonic ordering is
+        structural.  Merge-or-update operations preserve the original seq.
+        """
         event_type = type(event).__name__
         if event_type not in self._JOURNALABLE:
             return
-        if self._lifecycle is None or self._lifecycle._db is None:
-            return
-        try:
-            db = self._lifecycle._db
-            seq = self._journal_seq.get(event.agent_id, 0)
-            self._journal_seq[event.agent_id] = seq + 1
-            now = int(time.time() * 1000)
-            payload = event.model_dump_json()
-            await db.execute(
-                "INSERT INTO ui_events (session_id, agent_id, seq, event_type, payload, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (self._session_id, event.agent_id, seq, event_type, payload, now),
+
+        aid = event.agent_id
+        buf = self._turn_buffer.setdefault(aid, [])
+        tool_idx = self._turn_buffer_tool_index.setdefault(aid, {})
+
+        def _next_seq() -> int:
+            seq = self._journal_seq.get(aid, 0)
+            self._journal_seq[aid] = seq + 1
+            return seq
+
+        if isinstance(event, MessageChunkReceived):
+            if buf and isinstance((prev := buf[-1][1]), MessageChunkReceived):
+                buf[-1] = (
+                    buf[-1][0],
+                    prev.model_copy(
+                        update={"chunk": prev.chunk + event.chunk}
+                    ),
+                )
+            else:
+                buf.append((_next_seq(), event))
+
+        elif isinstance(event, AgentThoughtReceived):
+            if buf and isinstance((prev := buf[-1][1]), AgentThoughtReceived):
+                buf[-1] = (
+                    buf[-1][0],
+                    prev.model_copy(
+                        update={"chunk": prev.chunk + event.chunk}
+                    ),
+                )
+            else:
+                buf.append((_next_seq(), event))
+
+        elif isinstance(event, ToolCallUpdated):
+            existing_pos = tool_idx.get(event.tool_call_id)
+            if existing_pos is not None:
+                prev_seq, _ = buf[existing_pos]
+                buf[existing_pos] = (prev_seq, event)
+            else:
+                tool_idx[event.tool_call_id] = len(buf)
+                buf.append((_next_seq(), event))
+
+        elif isinstance(event, TurnComplete):
+            buf.append((_next_seq(), event))
+            rows_to_flush = list(buf)
+            buf.clear()
+            tool_idx.clear()
+            task = asyncio.create_task(
+                self._flush_turn_buffer(aid, rows_to_flush),
+                name=f"journal-flush-{aid}",
             )
-            await db.commit()
+            self._pending_flushes.add(task)
+            task.add_done_callback(self._pending_flushes.discard)
+
+        else:
+            buf.append((_next_seq(), event))
+
+    async def _flush_turn_buffer(
+        self, agent_id: str, events: list[tuple[int, BrokerEvent]]
+    ) -> None:
+        """Write a completed turn's events to SQLite in one executemany call."""
+        if not events or self._lifecycle is None:
+            return
+        now = int(time.time() * 1000)
+        rows: list[tuple[str, str, int, str, str, int]] = [
+            (
+                self._session_id,
+                agent_id,
+                seq,
+                type(event).__name__,
+                event.model_dump_json(),
+                now,
+            )
+            for seq, event in events
+        ]
+        try:
+            await self._lifecycle.journal_ui_events(rows)
         except Exception:
-            log.debug("Failed to journal event %s for %s", event_type, event.agent_id, exc_info=True)
+            log.debug(
+                "Failed to flush journal for %s (%d events)",
+                agent_id, len(events), exc_info=True,
+            )
+
+    async def _flush_turn_buffer_all(self) -> None:
+        """Drain unflushed buffers and await all in-flight flush tasks."""
+        if self._lifecycle is None:
+            return
+
+        for agent_id, buf in list(self._turn_buffer.items()):
+            if buf:
+                events = list(buf)
+                buf.clear()
+                self._turn_buffer_tool_index.get(agent_id, {}).clear()
+                task = asyncio.create_task(
+                    self._flush_turn_buffer(agent_id, events),
+                    name=f"journal-flush-final-{agent_id}",
+                )
+                self._pending_flushes.add(task)
+                task.add_done_callback(self._pending_flushes.discard)
+
+        if self._pending_flushes:
+            await asyncio.gather(
+                *list(self._pending_flushes), return_exceptions=True
+            )
 
     async def load_journal(self, agent_id: str, session_id: str) -> list[BrokerEvent]:
         """Load journaled events for an agent from SQLite.
@@ -517,12 +669,18 @@ class ACPBroker:
 
         Auto-resolves queued permissions that match persisted rules,
         draining until one needs manual resolution or the queue is empty.
+
+        While processing an entry — especially across the await on
+        ``self._event_queue.put`` for an auto-resolved emission — we hold
+        the active-permission slot so that any concurrent
+        ``PermissionRequested`` arriving via ``_sink`` gets queued instead
+        of racing to claim the slot.
         """
         queue = self._permission_queue.get(agent_id)
         while queue:
             nxt = queue.pop(0)
-            if not queue:
-                del self._permission_queue[agent_id]
+            # Reserve the active slot for the duration of this iteration.
+            self._active_permission[agent_id] = nxt.request_id
             # Try auto-approve by tool pattern
             if self._should_auto_approve(nxt):
                 session = self._registry.get_session(nxt.agent_id)
@@ -540,6 +698,8 @@ class ACPBroker:
                         )
                         cur, total = self._permission_counter.get(agent_id, (1, 1))
                         self._permission_counter[agent_id] = (cur + 1, total)
+                        if self._active_permission.get(agent_id) == nxt.request_id:
+                            self._active_permission.pop(agent_id, None)
                         continue
             # Try auto-resolve by persisted rule
             decision = self._permission_engine.check(nxt.agent_id, nxt.kind, self._session_id)
@@ -559,14 +719,16 @@ class ACPBroker:
                         )
                         cur, total = self._permission_counter.get(agent_id, (1, 1))
                         self._permission_counter[agent_id] = (cur + 1, total)
+                        if self._active_permission.get(agent_id) == nxt.request_id:
+                            self._active_permission.pop(agent_id, None)
                         continue
-            # Needs manual resolution — forward to UI
-            self._active_permission[agent_id] = nxt.request_id
+            # Needs manual resolution — forward to UI. Slot is already set above.
             cur, total = self._permission_counter.get(agent_id, (1, 1))
             self._permission_counter[agent_id] = (cur + 1, total)
             await self._event_queue.put(nxt)
             return
         # Queue fully drained
+        self._permission_queue.pop(agent_id, None)
         self._permission_counter.pop(agent_id, None)
 
     # ------------------------------------------------------------------
@@ -585,15 +747,13 @@ class ACPBroker:
             )
         return self._lifecycle
 
-    async def _start_message_bus(self, *, skip_register: bool = False) -> None:
-        if self._message_bus is None:
+    async def _start_message_bus(self) -> None:
+        if self._message_bus is not None or self._message_bus_starting:
+            return
+        self._message_bus_starting = True
+        try:
             lifecycle = await self._ensure_lifecycle()
-            if skip_register:
-                # Schema must exist for the message bus even without registration.
-                db = await lifecycle._ensure_db()
-                await ensure_schema_async(db)
-            else:
-                await lifecycle.register_agents()
+            await lifecycle._db_op(ensure_schema_sync)
             if not self._expired:
                 self._expired = True
                 await lifecycle.expire_old_sessions()
@@ -602,6 +762,8 @@ class ACPBroker:
             )
             await self._message_bus.start()
             lifecycle.set_message_bus(self._message_bus.socket_path, self._message_bus.enqueue_pending, self._message_bus.enqueue_raw)
+        finally:
+            self._message_bus_starting = False
 
     # ------------------------------------------------------------------
     # Command processing
@@ -625,16 +787,24 @@ class ACPBroker:
 
     async def _deliver_message(self, agent_id: str, text: str, from_agents: list[str]) -> bool:
         """Deliver a message to an agent. Non-blocking — dispatches prompt as a task."""
+        if agent_id in self._delivery_held:
+            for sender in from_agents:
+                await self._sink(
+                    McpMessageHeld(agent_id=agent_id, from_agent=sender, preview=text)
+                )
+            return True
         session = self._registry.get_session(agent_id)
         if not session or session.state != AgentState.IDLE:
             return False
         try:
+            if self._lifecycle:
+                success = await self._lifecycle.prompt(agent_id, text)
+                if not success:
+                    return False
             for sender in from_agents:
                 await self._sink(
                     McpMessageDelivered(agent_id=agent_id, from_agent=sender, to_agent=agent_id, preview=text)
                 )
-            if self._lifecycle:
-                await self._lifecycle.prompt(agent_id, text)
             return True
         except Exception:
             return False
@@ -672,15 +842,12 @@ class ACPBroker:
                     await self._message_bus.stop()
             except Exception:
                 log.debug("MessageBus stop error", exc_info=True)
-        finally:
-            # close_db and _shutdown_event.set MUST run — an unclosed
-            # aiosqlite connection keeps a non-daemon thread alive.
-            try:
-                if self._lifecycle:
-                    await self._lifecycle.close_db()
-            except Exception:
-                log.debug("close_db error", exc_info=True)
 
+            try:
+                await self._flush_turn_buffer_all()
+            except Exception:
+                log.debug("Journal flush error", exc_info=True)
+        finally:
             self._shutdown_event.set()
 
         # Backward-compat sessions.json

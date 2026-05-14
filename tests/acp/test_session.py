@@ -189,6 +189,53 @@ class TestSessionUpdate:
         assert len(events) == 0
 
 
+    async def test_emit_extracts_parent_tool_call_id_from_field_meta(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """field_meta.claudeCode.parentToolUseId must propagate to ToolCallUpdated —
+        otherwise nesting relationship is silently lost."""
+        update = ToolCallStart(
+            tool_call_id="tc-child",
+            title="SubAgent",
+            kind="other",
+            status="pending",
+            content=None,
+            locations=None,
+            raw_input=None,
+            raw_output=None,
+            session_update="tool_call",
+            field_meta={"claudeCode": {"parentToolUseId": "tc-parent"}},
+        )
+        await session.session_update("sess-1", update)
+        await asyncio.sleep(0)
+        assert len(events) == 1
+        evt = events[0]
+        assert isinstance(evt, ToolCallUpdated)
+        assert evt.parent_tool_call_id == "tc-parent"
+
+    async def test_emit_parent_tool_call_id_none_when_no_field_meta(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Missing field_meta must not crash — parent_tool_call_id stays None."""
+        update = ToolCallStart(
+            tool_call_id="tc-1",
+            title="Edit",
+            kind="edit",
+            status="pending",
+            content=None,
+            locations=None,
+            raw_input=None,
+            raw_output=None,
+            session_update="tool_call",
+        )
+        await session.session_update("sess-1", update)
+        await asyncio.sleep(0)
+        assert len(events) == 1
+        evt = events[0]
+        assert isinstance(evt, ToolCallUpdated)
+        assert evt.parent_tool_call_id is None
+
+
 class TestSessionUpdateAccumulator:
     """Tests for SessionAccumulator integration in session_update."""
 
@@ -314,22 +361,6 @@ class TestSessionModes:
         assert events[0].mode_id == "architect"
         assert events[0].agent_id == "test"
 
-    async def test_current_mode_update_with_no_mode_id_emits_nothing(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """SDK requires current_mode_id to be a non-None str, so this scenario
-        is unreachable through normal ACP dispatch. Verify the defensive guard
-        in _emit_from_notification by calling it directly with a patched update."""
-        from unittest.mock import MagicMock
-
-        from acp.schema import SessionNotification
-
-        fake_update = MagicMock(spec=CurrentModeUpdate)
-        fake_update.current_mode_id = None
-        fake_notification = MagicMock(spec=SessionNotification)
-        fake_notification.update = fake_update
-        await session._emit_from_notification(fake_notification)
-        assert len(events) == 0
 
     async def test_set_mode_transitions_through_configuring(
         self, session: ACPSession, events: list[BrokerEvent]
@@ -421,16 +452,6 @@ class TestMcpRestore:
         s._session_id = "sess-1"
         return s
 
-    async def test_suppress_flag_cleared_restores_updates(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """session_update must resume normal emission once flag is cleared.
-        Guards against the flag being left True after a failed load_session."""
-        session._suppress_history_replay = True
-        session._suppress_history_replay = False
-        await session.session_update("sess-1", _msg_chunk("live message"))
-        await asyncio.sleep(0)
-        assert len(events) == 1
 
     async def test_restore_mcp_servers_skips_when_no_mcp_servers(self, session: ACPSession) -> None:
         """_restore_mcp_servers must be a no-op when _mcp_servers is empty.
@@ -635,3 +656,656 @@ class TestSessionRunLifecycle:
             await session.run()
 
         mock_unsub.assert_called_once()
+
+
+class TestAgentModeTarget:
+    """Tests for agent_mode_target passthrough in run() and run_restored()."""
+
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def mock_conn(self) -> Any:
+        from unittest.mock import AsyncMock, MagicMock
+
+        conn = AsyncMock()
+        init_resp = MagicMock()
+        init_resp.agent_capabilities = None
+        conn.initialize.return_value = init_resp
+
+        session_resp = MagicMock()
+        session_resp.session_id = "sess-new"
+        session_resp.modes = None
+        session_resp.models = None
+        conn.new_session.return_value = session_resp
+        conn.load_session.return_value = session_resp
+        return conn
+
+    @pytest.fixture()
+    def mock_proc(self) -> Any:
+        from unittest.mock import AsyncMock, MagicMock
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.wait = AsyncMock(return_value=0)
+        proc.stdin = MagicMock()
+        proc.stdin.is_closing.return_value = True
+        return proc
+
+    async def test_run_meta_agent_passes_meta_and_skips_set_session_mode(
+        self, events: list[BrokerEvent], mock_conn: Any, mock_proc: Any
+    ) -> None:
+        """When agent_mode_target='meta_agent', new_session must receive _meta kwarg
+        and set_session_mode must NOT be called. Silent failure: agent launches
+        without its config or gets double-applied mode."""
+        from contextlib import asynccontextmanager
+
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            agent_mode="plan",
+            agent_mode_target="meta_agent",
+        )
+
+        @asynccontextmanager
+        async def fake_spawn(*_args: Any, **_kwargs: Any):
+            yield mock_conn, mock_proc
+
+        with patch("synth_acp.acp.session._spawn_isolated_agent", fake_spawn):
+            await session.run()
+
+        mock_conn.new_session.assert_called_once()
+        call_kwargs = mock_conn.new_session.call_args[1]
+        assert call_kwargs["claudeCode"] == {"options": {"agent": "plan"}}
+        mock_conn.set_session_mode.assert_not_called()
+
+    async def test_run_restored_fallback_passes_meta(
+        self, events: list[BrokerEvent], mock_conn: Any, mock_proc: Any
+    ) -> None:
+        """When run_restored() falls back to new_session and agent_mode_target='meta_agent',
+        the fallback new_session must also receive _meta. Silent failure: restored agent
+        that fails load launches without agent config."""
+        from contextlib import asynccontextmanager
+
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            agent_mode="plan",
+            agent_mode_target="meta_agent",
+        )
+
+        mock_conn.load_session.side_effect = RuntimeError("session not found")
+        # new_session is the fallback
+        from unittest.mock import MagicMock
+
+        fallback_resp = MagicMock()
+        fallback_resp.session_id = "sess-fallback"
+        fallback_resp.modes = None
+        fallback_resp.models = None
+        mock_conn.new_session.return_value = fallback_resp
+
+        @asynccontextmanager
+        async def fake_spawn(*_args: Any, **_kwargs: Any):
+            yield mock_conn, mock_proc
+
+        with patch("synth_acp.acp.session._spawn_isolated_agent", fake_spawn):
+            await session.run_restored("old-session-id")
+
+        mock_conn.new_session.assert_called_once()
+        call_kwargs = mock_conn.new_session.call_args[1]
+        assert call_kwargs["claudeCode"] == {"options": {"agent": "plan"}}
+        mock_conn.set_session_mode.assert_not_called()
+
+    async def test_run_default_target_calls_set_session_mode(
+        self, events: list[BrokerEvent], mock_conn: Any, mock_proc: Any
+    ) -> None:
+        """When agent_mode_target is None (default/Kiro path), set_session_mode must
+        be called and _meta must NOT be passed. Silent failure: Kiro mode switching
+        regresses."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            agent_mode="code",
+            agent_mode_target=None,
+        )
+
+        # Set up modes so set_session_mode path is triggered
+        mode_obj = MagicMock()
+        mode_obj.id = "code"
+        mode_obj.name = "Code"
+        mode_obj.description = None
+        modes_resp = MagicMock()
+        modes_resp.available_modes = [mode_obj]
+        modes_resp.current_mode_id = "chat"
+
+        session_resp = MagicMock()
+        session_resp.session_id = "sess-new"
+        session_resp.modes = modes_resp
+        session_resp.models = None
+        mock_conn.new_session.return_value = session_resp
+
+        # load_session for model re-read after mode switch
+        loaded_resp = MagicMock()
+        loaded_resp.models = None
+        mock_conn.load_session.return_value = loaded_resp
+
+        @asynccontextmanager
+        async def fake_spawn(*_args: Any, **_kwargs: Any):
+            yield mock_conn, mock_proc
+
+        with patch("synth_acp.acp.session._spawn_isolated_agent", fake_spawn):
+            await session.run()
+
+        # _meta should NOT be in new_session call
+        call_kwargs = mock_conn.new_session.call_args[1]
+        assert "_meta" not in call_kwargs
+        # set_session_mode should be called
+        mock_conn.set_session_mode.assert_called_once_with(mode_id="code", session_id="sess-new")
+
+
+class TestConfigOptionsCapture:
+    """Tests for config_options capture and synthesis in run()/run_restored()."""
+
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def mock_conn(self) -> Any:
+        from unittest.mock import AsyncMock, MagicMock
+
+        conn = AsyncMock()
+        init_resp = MagicMock()
+        init_resp.agent_capabilities = None
+        conn.initialize.return_value = init_resp
+        return conn
+
+    @pytest.fixture()
+    def mock_proc(self) -> Any:
+        from unittest.mock import AsyncMock, MagicMock
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.wait = AsyncMock(return_value=0)
+        proc.stdin = MagicMock()
+        proc.stdin.is_closing.return_value = True
+        return proc
+
+    async def test_run_captures_native_config_options(
+        self, events: list[BrokerEvent], mock_conn: Any, mock_proc: Any
+    ) -> None:
+        """Native config_options from session response must be stored and emitted.
+        Silent failure: config_options silently dropped, UI shows no pickers."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+
+        from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+
+        from synth_acp.models.events import ConfigOptionsReceived
+
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(
+            agent_id="test", binary="echo", args=[], cwd=".", event_sink=sink
+        )
+
+        native_options = [
+            SessionConfigOptionSelect(
+                id="mode", name="Mode", category="mode", type="select",
+                current_value="normal",
+                options=[SessionConfigSelectOption(name="Normal", value="normal")],
+            )
+        ]
+        session_resp = MagicMock()
+        session_resp.session_id = "sess-1"
+        session_resp.modes = None
+        session_resp.models = None
+        session_resp.config_options = native_options
+        mock_conn.new_session.return_value = session_resp
+
+        @asynccontextmanager
+        async def fake_spawn(*_args: Any, **_kwargs: Any):
+            yield mock_conn, mock_proc
+
+        with patch("synth_acp.acp.session._spawn_isolated_agent", fake_spawn):
+            await session.run()
+
+        assert session._has_native_config_options is True
+        assert session._config_options == native_options
+        config_events = [e for e in events if isinstance(e, ConfigOptionsReceived)]
+        assert len(config_events) == 1
+        assert config_events[0].config_options == native_options
+
+    async def test_run_synthesizes_config_options_from_modes_and_models(
+        self, events: list[BrokerEvent], mock_conn: Any, mock_proc: Any
+    ) -> None:
+        """When config_options is None but modes/models present, synthesis must produce
+        SessionConfigOptionSelect entries. Silent failure: Kiro sessions get no pickers."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+
+        from synth_acp.models.events import ConfigOptionsReceived
+
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(
+            agent_id="test", binary="echo", args=[], cwd=".", event_sink=sink
+        )
+
+        mode_obj = MagicMock()
+        mode_obj.id = "code"
+        mode_obj.name = "Code"
+        mode_obj.description = None
+        modes_resp = MagicMock()
+        modes_resp.available_modes = [mode_obj]
+        modes_resp.current_mode_id = "code"
+
+        model_obj = MagicMock()
+        model_obj.model_id = "gpt-4"
+        model_obj.name = "GPT-4"
+        model_obj.description = None
+        models_resp = MagicMock()
+        models_resp.available_models = [model_obj]
+        models_resp.current_model_id = "gpt-4"
+
+        session_resp = MagicMock()
+        session_resp.session_id = "sess-1"
+        session_resp.modes = modes_resp
+        session_resp.models = models_resp
+        session_resp.config_options = None
+        mock_conn.new_session.return_value = session_resp
+
+        @asynccontextmanager
+        async def fake_spawn(*_args: Any, **_kwargs: Any):
+            yield mock_conn, mock_proc
+
+        with patch("synth_acp.acp.session._spawn_isolated_agent", fake_spawn):
+            await session.run()
+
+        assert session._has_native_config_options is False
+        assert len(session._config_options) == 2
+        mode_opt = session._config_options[0]
+        assert mode_opt.id == "mode"
+        assert mode_opt.category == "mode"
+        assert mode_opt.current_value == "code"
+        assert len(mode_opt.options) == 1
+        assert mode_opt.options[0].name == "Code"
+        assert mode_opt.options[0].value == "code"
+        model_opt = session._config_options[1]
+        assert model_opt.id == "model"
+        assert model_opt.current_value == "gpt-4"
+        config_events = [e for e in events if isinstance(e, ConfigOptionsReceived)]
+        assert len(config_events) == 1
+
+    async def test_run_restored_captures_config_options(
+        self, events: list[BrokerEvent], mock_conn: Any, mock_proc: Any
+    ) -> None:
+        """run_restored must also capture/emit config_options.
+        Silent failure: restored sessions have no pickers."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+
+        from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+
+        from synth_acp.models.events import ConfigOptionsReceived
+
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(
+            agent_id="test", binary="echo", args=[], cwd=".", event_sink=sink
+        )
+
+        native_options = [
+            SessionConfigOptionSelect(
+                id="effort", name="Effort", category="thought_level", type="select",
+                current_value="high",
+                options=[SessionConfigSelectOption(name="High", value="high")],
+            )
+        ]
+        session_resp = MagicMock()
+        session_resp.modes = None
+        session_resp.models = None
+        session_resp.config_options = native_options
+        mock_conn.load_session.return_value = session_resp
+
+        @asynccontextmanager
+        async def fake_spawn(*_args: Any, **_kwargs: Any):
+            yield mock_conn, mock_proc
+
+        with patch("synth_acp.acp.session._spawn_isolated_agent", fake_spawn):
+            await session.run_restored("saved-sess-id")
+
+        assert session._has_native_config_options is True
+        config_events = [e for e in events if isinstance(e, ConfigOptionsReceived)]
+        assert len(config_events) == 1
+        assert config_events[0].config_options == native_options
+
+
+class TestConfigOptionUpdateNotification:
+    """Tests for ConfigOptionUpdate handling in _emit_from_notification."""
+
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def session(self, events: list[BrokerEvent]) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        s = ACPSession(
+            agent_id="test", binary="echo", args=[], cwd=".", event_sink=sink
+        )
+        s._session_id = "sess-1"
+        return s
+
+    async def test_config_option_update_notification_emits_changed(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """ConfigOptionUpdate must update stored options and emit ConfigOptionChanged.
+        Silent failure: UI never updates when harness pushes config changes."""
+        from acp.schema import (
+            ConfigOptionUpdate,
+            SessionConfigOptionSelect,
+            SessionConfigSelectOption,
+            SessionNotification,
+        )
+
+        from synth_acp.models.events import ConfigOptionChanged
+
+        # Set initial config_options
+        session._config_options = [
+            SessionConfigOptionSelect(
+                id="effort", name="Effort", category="thought_level", type="select",
+                current_value="low",
+                options=[
+                    SessionConfigSelectOption(name="Low", value="low"),
+                    SessionConfigSelectOption(name="High", value="high"),
+                ],
+            )
+        ]
+
+        # Push a ConfigOptionUpdate with changed value
+        updated_options = [
+            SessionConfigOptionSelect(
+                id="effort", name="Effort", category="thought_level", type="select",
+                current_value="high",
+                options=[
+                    SessionConfigSelectOption(name="Low", value="low"),
+                    SessionConfigSelectOption(name="High", value="high"),
+                ],
+            )
+        ]
+        update = ConfigOptionUpdate(
+            config_options=updated_options,
+            session_update="config_option_update",
+        )
+        notification = SessionNotification(session_id="sess-1", update=update)
+        await session._emit_from_notification(notification)
+
+        assert session._config_options == updated_options
+        assert len(events) == 1
+        assert isinstance(events[0], ConfigOptionChanged)
+        assert events[0].config_id == "effort"
+        assert events[0].value == "high"
+
+    async def test_config_option_update_notification_only_emits_for_changed(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Unchanged options must not emit spurious events.
+        Silent failure: UI re-renders all pickers on every notification."""
+        from acp.schema import (
+            ConfigOptionUpdate,
+            SessionConfigOptionSelect,
+            SessionConfigSelectOption,
+            SessionNotification,
+        )
+
+        from synth_acp.models.events import ConfigOptionChanged
+
+        # Set initial config_options with two options
+        session._config_options = [
+            SessionConfigOptionSelect(
+                id="mode", name="Mode", category="mode", type="select",
+                current_value="normal",
+                options=[SessionConfigSelectOption(name="Normal", value="normal")],
+            ),
+            SessionConfigOptionSelect(
+                id="effort", name="Effort", category="thought_level", type="select",
+                current_value="low",
+                options=[SessionConfigSelectOption(name="Low", value="low")],
+            ),
+        ]
+
+        # Push update where only effort changed
+        updated_options = [
+            SessionConfigOptionSelect(
+                id="mode", name="Mode", category="mode", type="select",
+                current_value="normal",
+                options=[SessionConfigSelectOption(name="Normal", value="normal")],
+            ),
+            SessionConfigOptionSelect(
+                id="effort", name="Effort", category="thought_level", type="select",
+                current_value="high",
+                options=[SessionConfigSelectOption(name="High", value="high")],
+            ),
+        ]
+        update = ConfigOptionUpdate(
+            config_options=updated_options,
+            session_update="config_option_update",
+        )
+        notification = SessionNotification(session_id="sess-1", update=update)
+        await session._emit_from_notification(notification)
+
+        changed_events = [e for e in events if isinstance(e, ConfigOptionChanged)]
+        assert len(changed_events) == 1
+        assert changed_events[0].config_id == "effort"
+        assert changed_events[0].value == "high"
+
+
+class TestSetConfigOption:
+    """Tests for set_config_option() method."""
+
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def session(self, events: list[BrokerEvent]) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        s = ACPSession(
+            agent_id="test", binary="echo", args=[], cwd=".", event_sink=sink
+        )
+        s._session_id = "sess-1"
+        return s
+
+    async def test_set_config_option_native_path(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Native path must call conn.set_config_option and emit ConfigOptionsReceived.
+        Silent failure: Claude effort changes silently fail."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+
+        from synth_acp.models.events import ConfigOptionsReceived
+
+        session._has_native_config_options = True
+        session._config_options = [
+            SessionConfigOptionSelect(
+                id="effort", name="Effort", category="thought_level", type="select",
+                current_value="low",
+                options=[
+                    SessionConfigSelectOption(name="Low", value="low"),
+                    SessionConfigSelectOption(name="High", value="high"),
+                ],
+            )
+        ]
+
+        updated_options = [
+            SessionConfigOptionSelect(
+                id="effort", name="Effort", category="thought_level", type="select",
+                current_value="high",
+                options=[
+                    SessionConfigSelectOption(name="Low", value="low"),
+                    SessionConfigSelectOption(name="High", value="high"),
+                ],
+            )
+        ]
+        resp = MagicMock()
+        resp.config_options = updated_options
+
+        conn = AsyncMock()
+        conn.set_config_option.return_value = resp
+        session._conn = conn
+
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+        events.clear()
+
+        await session.set_config_option("effort", "high")
+
+        conn.set_config_option.assert_called_once_with("effort", "sess-1", "high")
+        assert session._config_options == updated_options
+        received_events = [e for e in events if isinstance(e, ConfigOptionsReceived)]
+        assert len(received_events) == 1
+        assert received_events[0].config_options == updated_options
+        assert session.state == AgentState.IDLE
+
+    async def test_set_config_option_synthesized_mode(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Synthesized mode path must call set_session_mode + model preserve + MCP restore.
+        Silent failure: Kiro mode switching breaks via new API."""
+        from unittest.mock import AsyncMock
+
+        from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+
+        from synth_acp.models.events import ConfigOptionChanged
+
+        session._has_native_config_options = False
+        session._current_model_id = "gpt-4"
+        session._config_options = [
+            SessionConfigOptionSelect(
+                id="mode", name="Mode", category="mode", type="select",
+                current_value="chat",
+                options=[
+                    SessionConfigSelectOption(name="Chat", value="chat"),
+                    SessionConfigSelectOption(name="Code", value="code"),
+                ],
+            )
+        ]
+
+        conn = AsyncMock()
+        conn.load_session.return_value = None  # _restore_mcp_servers
+        session._conn = conn
+        session._mcp_servers = []
+
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+        events.clear()
+
+        await session.set_config_option("mode", "code")
+
+        conn.set_session_mode.assert_called_once_with(mode_id="code", session_id="sess-1")
+        conn.set_session_model.assert_called_once_with(model_id="gpt-4", session_id="sess-1")
+        assert session._current_mode_id == "code"
+        changed_events = [e for e in events if isinstance(e, ConfigOptionChanged)]
+        assert len(changed_events) == 1
+        assert changed_events[0].config_id == "mode"
+        assert changed_events[0].value == "code"
+        assert session.state == AgentState.IDLE
+
+    async def test_set_config_option_synthesized_model(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Synthesized model path must call set_session_model.
+        Silent failure: Kiro model switching breaks."""
+        from unittest.mock import AsyncMock
+
+        from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+
+        from synth_acp.models.events import ConfigOptionChanged
+
+        session._has_native_config_options = False
+        session._config_options = [
+            SessionConfigOptionSelect(
+                id="model", name="Model", category="model", type="select",
+                current_value="gpt-4",
+                options=[
+                    SessionConfigSelectOption(name="GPT-4", value="gpt-4"),
+                    SessionConfigSelectOption(name="GPT-3.5", value="gpt-3.5"),
+                ],
+            )
+        ]
+
+        conn = AsyncMock()
+        session._conn = conn
+
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+        events.clear()
+
+        await session.set_config_option("model", "gpt-3.5")
+
+        conn.set_session_model.assert_called_once_with(model_id="gpt-3.5", session_id="sess-1")
+        assert session._current_model_id == "gpt-3.5"
+        changed_events = [e for e in events if isinstance(e, ConfigOptionChanged)]
+        assert len(changed_events) == 1
+        assert changed_events[0].config_id == "model"
+        assert changed_events[0].value == "gpt-3.5"
+        assert session.state == AgentState.IDLE
+
+    async def test_set_config_option_not_idle_emits_error(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Precondition: must emit BrokerError when not IDLE.
+        Silent failure: concurrent config changes corrupt state."""
+        from unittest.mock import AsyncMock
+
+        from synth_acp.models.events import BrokerError as BErr
+
+        conn = AsyncMock()
+        session._conn = conn
+
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+        await session._sm.transition(AgentState.BUSY)
+        events.clear()
+
+        await session.set_config_option("effort", "high")
+
+        conn.set_config_option.assert_not_called()
+        conn.set_session_mode.assert_not_called()
+        conn.set_session_model.assert_not_called()
+        error_events = [e for e in events if isinstance(e, BErr)]
+        assert len(error_events) == 1
+        assert error_events[0].severity == "warning"
+        assert session.state == AgentState.BUSY

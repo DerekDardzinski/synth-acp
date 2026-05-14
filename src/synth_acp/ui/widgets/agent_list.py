@@ -149,7 +149,7 @@ class AgentTile(Vertical):
         app = self.app
         if not isinstance(app, SynthApp):
                     return
-        app.run_worker(app.select_agent(self._agent_id))
+        app.run_worker(app.select_agent(self._agent_id), name="select-agent")
 
     def subscribe_feed(self, feed: ConversationFeed) -> None:
         """Subscribe to a feed's streaming signal for activity bar updates.
@@ -203,7 +203,7 @@ class MCPButton(Static):
         app = self.app
         if not isinstance(app, SynthApp):
                     return
-        app.run_worker(app.show_messages())
+        app.run_worker(app.show_messages(), name="show-messages")
 
 
 class AgentList(Vertical):

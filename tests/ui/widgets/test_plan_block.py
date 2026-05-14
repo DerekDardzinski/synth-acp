@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from acp.schema import PlanEntry
 
+from synth_acp.models.agent import AgentConfig
 from synth_acp.models.config import SessionConfig
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.widgets.plan_block import PlanBlock
@@ -14,7 +15,6 @@ from synth_acp.ui.widgets.plan_block import PlanBlock
 def _make_config() -> SessionConfig:
     return SessionConfig(
         project="test",
-        agents=[{"agent_id": "a1", "harness": "kiro"}],
     )
 
 
@@ -22,6 +22,7 @@ def _make_broker() -> MagicMock:
     broker = MagicMock()
     broker.handle = AsyncMock()
     broker.shutdown = AsyncMock()
+    broker._initial_agent = AgentConfig(agent_id="a1", harness="kiro")
 
     async def _events():
         return

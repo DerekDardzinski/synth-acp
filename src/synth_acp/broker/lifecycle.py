@@ -6,25 +6,34 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import closing
 from pathlib import Path
+from typing import Any
 
-import aiosqlite
 from acp.schema import EnvVariable, McpServerStdio
 
 from synth_acp.acp.session import ACPSession
 from synth_acp.broker.registry import AgentRegistry
-from synth_acp.db import ensure_schema_async, expire_old_sessions_async
+from synth_acp.db import ensure_schema_sync, expire_old_sessions_sync
 from synth_acp.harnesses import load_harness_registry
 from synth_acp.models.agent import AgentConfig, AgentState
-from synth_acp.models.config import MessageHook, SessionConfig, render_template
-from synth_acp.models.events import BrokerError, BrokerEvent, HookFired
+from synth_acp.models.config import (
+    HarnessEntry,
+    MessageHook,
+    SessionConfig,
+    load_startup_context,
+    render_template,
+)
+from synth_acp.models.events import BrokerError, BrokerEvent, HookFired, InitialPromptDelivered
 from synth_acp.models.visibility import get_visible_agents
 
 log = logging.getLogger(__name__)
 
+RE_FILE_REF = re.compile(r"(?:^|(?<=\s))@(\S+)")
 type EventSink = Callable[[BrokerEvent], Awaitable[None]]
 type EnqueuePendingFn = Callable[[str, str, str], None]
 type EnqueueRawFn = Callable[[str, str], None]
@@ -67,7 +76,6 @@ class AgentLifecycle:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._first_prompted: set[str] = set()
         self._harness_registry = load_harness_registry()
-        self._db: aiosqlite.Connection | None = None
         self._terminate_timeout: float = 5.0
 
     def set_message_bus(self, socket_path: str, enqueue: EnqueuePendingFn, enqueue_raw: EnqueueRawFn) -> None:
@@ -99,17 +107,9 @@ class AgentLifecycle:
         task.add_done_callback(_on_done)
         return task
 
-    async def launch(self, agent_id: str, *, adhoc_config: AgentConfig | None = None) -> None:
-        """Launch an agent by ID from the config, or from an ad-hoc config."""
-        if adhoc_config is not None:
-            agent_cfg = adhoc_config
-        else:
-            agent_cfg = next((a for a in self._config.agents if a.agent_id == agent_id), None)
-        if not agent_cfg:
-            await self._sink(
-                BrokerError(agent_id=agent_id, message=f"No config for agent '{agent_id}'")
-            )
-            return
+    async def launch(self, agent_id: str, *, adhoc_config: AgentConfig) -> None:
+        """Launch an agent from an ad-hoc config."""
+        agent_cfg = adhoc_config
 
         entry = next(
             (e for e in self._harness_registry if e.short_name == agent_cfg.harness), None
@@ -125,6 +125,8 @@ class AgentLifecycle:
             return
 
         cmd = entry.run_cmd.split()
+        if agent_cfg.agent_mode and entry.mode_arg:
+            cmd += [entry.mode_arg, agent_cfg.agent_mode]
         mcp_servers = [
             McpServerStdio(
                 name="synth-mcp",
@@ -154,6 +156,8 @@ class AgentLifecycle:
             event_sink=self._sink,
             mcp_servers=mcp_servers,
             agent_mode=agent_cfg.agent_mode,
+            env=self._resolve_harness_env(entry),
+            agent_mode_target=entry.agent_mode_target,
         )
         session.set_session_created_callback(self._on_acp_session_created)
         self._registry.register(agent_id, session)
@@ -161,51 +165,62 @@ class AgentLifecycle:
         self._tasks[agent_id] = self._make_run_task(agent_id, session)
 
         if adhoc_config is not None:
-            db = await self._ensure_db()
-            await ensure_schema_async(db)
             now = int(time.time() * 1000)
-            await db.execute(
-                "INSERT OR REPLACE INTO agents "
-                "(agent_id, session_id, status, registered, harness, agent_mode, cwd) "
-                "VALUES (?, ?, 'active', ?, ?, ?, ?)",
-                (agent_id, self._session_id, now, agent_cfg.harness, agent_cfg.agent_mode, agent_cfg.cwd),
-            )
-            await db.commit()
+            session_id = self._session_id
+
+            def _sync(conn: sqlite3.Connection) -> None:
+                ensure_schema_sync(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO agents "
+                    "(agent_id, session_id, status, registered, harness, agent_mode, cwd) "
+                    "VALUES (?, ?, 'active', ?, ?, ?, ?)",
+                    (agent_id, session_id, now, agent_cfg.harness, agent_cfg.agent_mode, agent_cfg.cwd),
+                )
+                conn.commit()
+
+            await self._db_op(_sync)
 
     async def terminate(self, agent_id: str) -> None:
         """Terminate a running agent session and clean up SQLite state."""
-        session = self._registry.get_session(agent_id)
-        if not session:
-            await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
-            return
-        if session.state != AgentState.TERMINATED:
-            try:
-                await asyncio.wait_for(session.terminate(), timeout=self._terminate_timeout)
-            except TimeoutError:
-                log.warning("session.terminate() timed out for %s", agent_id)
-            for key in (agent_id, f"prompt-{agent_id}"):
-                task = self._tasks.get(key)
-                if task and not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except (asyncio.CancelledError, ConnectionError, OSError, RuntimeError):
-                        pass
+        async with self._registry.agent_lock(agent_id):
+            session = self._registry.get_session(agent_id)
+            if not session:
+                await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
+                return
+            if session.state != AgentState.TERMINATED:
+                try:
+                    await asyncio.wait_for(session.terminate(), timeout=self._terminate_timeout)
+                except TimeoutError:
+                    log.warning("session.terminate() timed out for %s", agent_id)
+                for key in (agent_id, f"prompt-{agent_id}"):
+                    task = self._tasks.get(key)
+                    if task and not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, ConnectionError, OSError, RuntimeError):
+                            pass
 
-        db = await self._ensure_db()
-        await db.execute(
-            "UPDATE agents SET status = 'inactive' WHERE agent_id = ? AND session_id = ?",
-            (agent_id, self._session_id),
-        )
-        await db.execute(
-            "UPDATE agents SET parent = NULL WHERE parent = ? AND session_id = ?",
-            (agent_id, self._session_id),
-        )
-        await db.execute(
-            "UPDATE messages SET status = 'expired' WHERE to_agent = ? AND session_id = ? AND status = 'pending'",
-            (agent_id, self._session_id),
-        )
-        await db.commit()
+            session_id = self._session_id
+
+            def _sync(conn: sqlite3.Connection) -> None:
+                conn.execute(
+                    "UPDATE agents SET status = 'inactive' WHERE agent_id = ? AND session_id = ?",
+                    (agent_id, session_id),
+                )
+                conn.execute(
+                    "UPDATE agents SET parent = NULL WHERE parent = ? AND session_id = ?",
+                    (agent_id, session_id),
+                )
+                conn.execute(
+                    "UPDATE messages SET status = 'expired' WHERE to_agent = ? AND session_id = ? AND status = 'pending'",
+                    (agent_id, session_id),
+                )
+                conn.commit()
+
+            await self._db_op(_sync)
+        # Keep these OUTSIDE the lock — they don't need serialization against
+        # prompt/set_mode/set_model and shouldn't block other operations.
         task = await self._get_agent_task(agent_id)
         parent = self._registry.get_parent(agent_id)
         await self._fire_message_hook(
@@ -214,30 +229,54 @@ class AgentLifecycle:
         self._registry.orphan_children(agent_id)
         self._first_prompted.discard(agent_id)
 
-    async def prompt(self, agent_id: str, text: str) -> None:
-        """Send a prompt to a running agent."""
-        session = self._registry.get_session(agent_id)
-        if not session:
-            await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
-            return
-        if session.state != AgentState.IDLE:
-            await self._sink(
-                BrokerError(
-                    agent_id=agent_id,
-                    message=f"Agent '{agent_id}' is {session.state}, cannot prompt",
-                    severity="warning",
+    async def prompt(self, agent_id: str, text: str) -> bool:
+        """Send a prompt to a running agent. Returns True if dispatched."""
+        async with self._registry.agent_lock(agent_id):
+            session = self._registry.get_session(agent_id)
+            if not session:
+                await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
+                return False
+            if session.state != AgentState.IDLE:
+                await self._sink(
+                    BrokerError(
+                        agent_id=agent_id,
+                        message=f"Agent '{agent_id}' is {session.state}, cannot prompt",
+                        severity="warning",
+                    )
                 )
-            )
-            return
-        if agent_id not in self._first_prompted:
-            self._first_prompted.add(agent_id)
-            hook = self._config.settings.hooks.on_agent_startup
-            if hook.prepend:
-                rendered = render_template(hook.prepend, {"agent_id": agent_id})
-                log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)
-                text = rendered + text
-                await self._sink(HookFired(agent_id=agent_id, hook_name="on_agent_startup"))
-        self._tasks[f"prompt-{agent_id}"] = self._make_prompt_task(agent_id, session.prompt(text))
+                return False
+            if agent_id not in self._first_prompted:
+                self._first_prompted.add(agent_id)
+                hook = self._config.settings.hooks.on_agent_startup
+                if hook.active:
+                    context = load_startup_context()
+                    rendered = render_template(context, {"agent_id": agent_id, "parent_id": "", "task": ""})
+                    log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)
+                    text = rendered + text
+                    await self._sink(HookFired(agent_id=agent_id, hook_name="on_agent_startup"))
+            # Inject file contents for @path references
+            text = self._inject_file_refs(agent_id, text)
+            self._tasks[f"prompt-{agent_id}"] = self._make_prompt_task(agent_id, session.prompt(text))
+            return True
+
+    def _inject_file_refs(self, agent_id: str, text: str) -> str:
+        """Parse @path references and prepend file contents as XML blocks."""
+        cwd = self._registry.get_cwd(agent_id)
+        if not cwd:
+            return text
+        refs = RE_FILE_REF.findall(text)
+        if not refs:
+            return text
+        blocks: list[str] = []
+        for rel_path in dict.fromkeys(refs):  # deduplicate, preserve order
+            try:
+                contents = (Path(cwd) / rel_path).read_text()
+                blocks.append(f'<file path="{rel_path}">\n{contents}\n</file>')
+            except (OSError, UnicodeDecodeError):
+                log.debug("Could not read file ref: %s", rel_path)
+        if blocks:
+            return "\n".join(blocks) + "\n\n" + text
+        return text
 
     async def cancel(self, agent_id: str) -> None:
         """Cancel the active prompt on an agent."""
@@ -249,37 +288,57 @@ class AgentLifecycle:
 
     async def set_mode(self, agent_id: str, mode_id: str) -> None:
         """Forward a mode-switch request to the agent session."""
-        session = self._registry.get_session(agent_id)
-        if not session:
-            await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
-            return
-        if session.state != AgentState.IDLE:
-            await self._sink(
-                BrokerError(
-                    agent_id=agent_id,
-                    message=f"Agent '{agent_id}' is {session.state}, cannot switch mode",
-                    severity="warning",
+        async with self._registry.agent_lock(agent_id):
+            session = self._registry.get_session(agent_id)
+            if not session:
+                await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
+                return
+            if session.state != AgentState.IDLE:
+                await self._sink(
+                    BrokerError(
+                        agent_id=agent_id,
+                        message=f"Agent '{agent_id}' is {session.state}, cannot switch mode",
+                        severity="warning",
+                    )
                 )
-            )
-            return
-        await session.set_mode(mode_id)
+                return
+            await session.set_mode(mode_id)
 
     async def set_model(self, agent_id: str, model_id: str) -> None:
         """Forward a model-switch request to the agent session."""
-        session = self._registry.get_session(agent_id)
-        if not session:
-            await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
-            return
-        if session.state != AgentState.IDLE:
-            await self._sink(
-                BrokerError(
-                    agent_id=agent_id,
-                    message=f"Agent '{agent_id}' is {session.state}, cannot switch model",
-                    severity="warning",
+        async with self._registry.agent_lock(agent_id):
+            session = self._registry.get_session(agent_id)
+            if not session:
+                await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
+                return
+            if session.state != AgentState.IDLE:
+                await self._sink(
+                    BrokerError(
+                        agent_id=agent_id,
+                        message=f"Agent '{agent_id}' is {session.state}, cannot switch model",
+                        severity="warning",
+                    )
                 )
-            )
-            return
-        await session.set_model(model_id)
+                return
+            await session.set_model(model_id)
+
+    async def set_config_option(self, agent_id: str, config_id: str, value: str | bool) -> None:
+        """Forward a config option change to the agent session."""
+        async with self._registry.agent_lock(agent_id):
+            session = self._registry.get_session(agent_id)
+            if not session:
+                await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
+                return
+            if session.state != AgentState.IDLE:
+                await self._sink(
+                    BrokerError(
+                        agent_id=agent_id,
+                        message=f"Agent '{agent_id}' is {session.state}, cannot change config option",
+                        severity="warning",
+                    )
+                )
+                return
+            await session.set_config_option(config_id, value)
 
     async def handle_launch_command(
         self, cmd_id: int, from_agent: str, data: dict[str, str]
@@ -296,75 +355,89 @@ class AgentLifecycle:
             await self.update_command_status(cmd_id, "rejected", "Invalid agent_id")
             return
 
-        if self._registry.has_session(agent_id):
-            await self.update_command_status(cmd_id, "rejected", f"Agent already exists: {agent_id}")
-            return
+        async with self._registry.agent_lock(agent_id):
+            if self._registry.has_session(agent_id):
+                await self.update_command_status(cmd_id, "rejected", f"Agent already exists: {agent_id}")
+                return
 
-        max_agents = int(os.environ.get("SYNTH_MAX_AGENTS", "10"))
-        if self._registry.active_count() >= max_agents:
-            await self.update_command_status(cmd_id, "rejected", f"Max agents ({max_agents}) reached")
-            return
+            max_agents = int(os.environ.get("SYNTH_MAX_AGENTS", "10"))
+            if self._registry.active_count() >= max_agents:
+                await self.update_command_status(cmd_id, "rejected", f"Max agents ({max_agents}) reached")
+                return
 
-        entry = next((e for e in self._harness_registry if e.short_name == harness), None)
-        if not entry:
-            await self.update_command_status(cmd_id, "rejected", f"Unknown harness: {harness}")
-            return
+            entry = next((e for e in self._harness_registry if e.short_name == harness), None)
+            if not entry:
+                await self.update_command_status(cmd_id, "rejected", f"Unknown harness: {harness}")
+                return
 
-        cmd = entry.run_cmd.split()
-        agent_cfg = AgentConfig(agent_id=agent_id, harness=harness, agent_mode=agent_mode, cwd=cwd)
+            cmd = entry.run_cmd.split()
+            agent_cfg = AgentConfig(agent_id=agent_id, harness=harness, agent_mode=agent_mode, cwd=cwd)
+            if agent_cfg.agent_mode and entry.mode_arg:
+                cmd += [entry.mode_arg, agent_cfg.agent_mode]
 
-        db = await self._ensure_db()
-        now = int(time.time() * 1000)
-        await db.execute(
-            "INSERT OR REPLACE INTO agents "
-            "(agent_id, session_id, status, registered, parent, task, harness, agent_mode, cwd) "
-            "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)",
-            (agent_id, self._session_id, now, from_agent, task, harness, agent_mode, cwd),
-        )
-        await db.commit()
+            now = int(time.time() * 1000)
+            session_id = self._session_id
 
-        self._registry.set_parent(agent_id, from_agent)
-        self._registry.set_harness(agent_id, harness)
+            def _sync(conn: sqlite3.Connection) -> None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO agents "
+                    "(agent_id, session_id, status, registered, parent, task, harness, agent_mode, cwd) "
+                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+                    (agent_id, session_id, now, from_agent, task, harness, agent_mode, cwd),
+                )
+                conn.commit()
 
-        mcp_servers = [
-            McpServerStdio(
-                name="synth-mcp",
-                command="synth-mcp",
-                args=[],
-                env=self._build_mcp_env(agent_id, agent_cfg.env),
+            await self._db_op(_sync)
+
+            self._registry.set_parent(agent_id, from_agent)
+            self._registry.set_harness(agent_id, harness)
+
+            mcp_servers = [
+                McpServerStdio(
+                    name="synth-mcp",
+                    command="synth-mcp",
+                    args=[],
+                    env=self._build_mcp_env(agent_id, agent_cfg.env),
+                )
+            ]
+            session = ACPSession(
+                agent_id=agent_cfg.agent_id,
+                binary=cmd[0],
+                args=cmd[1:],
+                cwd=agent_cfg.cwd,
+                event_sink=self._sink,
+                mcp_servers=mcp_servers,
+                agent_mode=agent_cfg.agent_mode,
+                env=self._resolve_harness_env(entry),
+                agent_mode_target=entry.agent_mode_target,
             )
-        ]
-        session = ACPSession(
-            agent_id=agent_cfg.agent_id,
-            binary=cmd[0],
-            args=cmd[1:],
-            cwd=agent_cfg.cwd,
-            event_sink=self._sink,
-            mcp_servers=mcp_servers,
-            agent_mode=agent_cfg.agent_mode,
-        )
-        session.set_session_created_callback(self._on_acp_session_created)
-        self._registry.register(agent_id, session)
-        self._tasks[agent_id] = self._make_run_task(agent_id, session)
-        self._first_prompted.add(agent_id)
+            session.set_session_created_callback(self._on_acp_session_created)
+            self._registry.register(agent_id, session)
+            self._tasks[agent_id] = self._make_run_task(agent_id, session)
 
         if message and self._enqueue_pending:
+            self._first_prompted.add(agent_id)
             self._registry.set_initial_message(agent_id, message)
-            prompt_hook = self._config.settings.hooks.on_agent_prompt
-            if prompt_hook.prepend:
+            hook = self._config.settings.hooks.on_agent_startup
+            if hook.active:
+                context = load_startup_context()
                 slots = {
                     "agent_id": agent_id,
-                    "task": task,
                     "parent_id": from_agent,
-                    "message": message,
+                    "task": task,
                 }
-                rendered = render_template(prompt_hook.prepend, slots)
-                log.debug("on_agent_prompt hook fired for %s:\n%s", agent_id, rendered)
+                rendered = render_template(context, slots)
+                log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)
                 message = rendered + message
             if self._enqueue_raw:
                 self._enqueue_raw(agent_id, message)
             else:
                 self._enqueue_pending(agent_id, from_agent, message)
+            await self._sink(
+                InitialPromptDelivered(agent_id=agent_id, from_agent=from_agent, text=data.get("message", ""))
+            )
+            if hook.active:
+                await self._sink(HookFired(agent_id=agent_id, hook_name="on_agent_startup"))
 
         await self.update_command_status(cmd_id, "processed")
         await self._fire_message_hook(
@@ -388,44 +461,54 @@ class AgentLifecycle:
 
     async def resurrect(self, agent_id: str) -> None:
         """Re-launch a terminated agent by reconnecting to its previous ACP session."""
-        db = await self._ensure_db()
-        cursor = await db.execute(
-            "SELECT acp_session_id, harness, agent_mode, cwd, parent, task, status "
-            "FROM agents WHERE agent_id = ? AND session_id = ?",
-            (agent_id, self._session_id),
-        )
-        row = await cursor.fetchone()
-        if not row:
-            await self._sink(BrokerError(agent_id=agent_id, message=f"Agent '{agent_id}' not found"))
-            return
-        acp_session_id, harness, agent_mode, cwd, parent, task, status = row
-        if status != "inactive":
-            await self._sink(
-                BrokerError(agent_id=agent_id, message=f"Agent '{agent_id}' is {status}, not inactive")
+        async with self._registry.agent_lock(agent_id):
+            session_id = self._session_id
+
+            def _fetch(conn: sqlite3.Connection) -> tuple | None:
+                return conn.execute(
+                    "SELECT acp_session_id, harness, agent_mode, cwd, parent, task, status "
+                    "FROM agents WHERE agent_id = ? AND session_id = ?",
+                    (agent_id, session_id),
+                ).fetchone()
+
+            row = await self._db_op(_fetch)
+            if not row:
+                await self._sink(BrokerError(agent_id=agent_id, message=f"Agent '{agent_id}' not found"))
+                return
+            acp_session_id, harness, agent_mode, cwd, parent, task, status = row
+            if status != "inactive":
+                await self._sink(
+                    BrokerError(agent_id=agent_id, message=f"Agent '{agent_id}' is {status}, not inactive")
+                )
+                return
+
+            # Clean up old terminated session from registry
+            old = self._registry.get_session(agent_id)
+            if old:
+                self._registry.unregister(agent_id)
+                t = self._tasks.pop(agent_id, None)
+                if t and not t.done():
+                    t.cancel()
+
+            await self.restore(
+                agent_id=agent_id,
+                acp_session_id=acp_session_id,
+                harness=harness,
+                agent_mode=agent_mode,
+                cwd=cwd or ".",
+                parent=parent,
             )
-            return
 
-        # Clean up old terminated session from registry
-        old = self._registry.get_session(agent_id)
-        if old:
-            self._registry.unregister(agent_id)
-            t = self._tasks.pop(agent_id, None)
-            if t and not t.done():
-                t.cancel()
+            def _update(conn: sqlite3.Connection) -> None:
+                conn.execute(
+                    "UPDATE agents SET status = 'active' WHERE agent_id = ? AND session_id = ?",
+                    (agent_id, session_id),
+                )
+                conn.commit()
 
-        await self.restore(
-            agent_id=agent_id,
-            acp_session_id=acp_session_id,
-            harness=harness,
-            agent_mode=agent_mode,
-            cwd=cwd or ".",
-            parent=parent,
-        )
-        await db.execute(
-            "UPDATE agents SET status = 'active' WHERE agent_id = ? AND session_id = ?",
-            (agent_id, self._session_id),
-        )
-        await db.commit()
+            await self._db_op(_update)
+        # Fire message hook OUTSIDE the lock — it doesn't mutate registry state
+        # and shouldn't block other operations on this agent.
         await self._fire_message_hook(
             self._config.settings.hooks.on_agent_join, agent_id, task or "", parent, "on_agent_join",
         )
@@ -435,13 +518,16 @@ class AgentLifecycle:
     ) -> None:
         """Handle a resurrect command from an agent."""
         agent_id = data["agent_id"]
-        db = await self._ensure_db()
-        cursor = await db.execute(
-            "SELECT parent FROM agents WHERE agent_id = ? AND session_id = ?",
-            (agent_id, self._session_id),
-        )
-        row = await cursor.fetchone()
-        parent = row[0] if row else None
+        session_id = self._session_id
+
+        def _fetch_parent(conn: sqlite3.Connection) -> str | None:
+            row = conn.execute(
+                "SELECT parent FROM agents WHERE agent_id = ? AND session_id = ?",
+                (agent_id, session_id),
+            ).fetchone()
+            return row[0] if row else None
+
+        parent = await self._db_op(_fetch_parent)
         if parent != from_agent:
             await self.update_command_status(
                 cmd_id, "rejected",
@@ -456,11 +542,11 @@ class AgentLifecycle:
         for session in self._registry.all_sessions().values():
             session.force_kill()
 
-        for task in self._tasks.values():
+        for task in list(self._tasks.values()):
             if not task.done():
                 task.cancel()
         if self._tasks:
-            await asyncio.wait(self._tasks.values(), timeout=3.0)
+            await asyncio.wait(list(self._tasks.values()), timeout=3.0)
 
     async def _on_acp_session_created(self, agent_id: str, acp_session_id: str) -> None:
         """Write back the ACP session ID after the agent process creates it.
@@ -508,6 +594,8 @@ class AgentLifecycle:
 
         cmd = entry.run_cmd.split()
         agent_cfg = AgentConfig(agent_id=agent_id, harness=harness, agent_mode=agent_mode, cwd=cwd)
+        if agent_cfg.agent_mode and entry.mode_arg:
+            cmd += [entry.mode_arg, agent_cfg.agent_mode]
         mcp_servers = [
             McpServerStdio(
                 name="synth-mcp",
@@ -525,6 +613,8 @@ class AgentLifecycle:
             event_sink=self._sink,
             mcp_servers=mcp_servers,
             agent_mode=agent_mode,
+            env=self._resolve_harness_env(entry),
+            agent_mode_target=entry.agent_mode_target,
         )
         self._registry.register(agent_id, session)
         if parent:
@@ -554,44 +644,56 @@ class AgentLifecycle:
         task.add_done_callback(_on_done)
         self._tasks[agent_id] = task
 
-    async def _ensure_db(self) -> aiosqlite.Connection:
-        if self._db is None:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self._db = await aiosqlite.connect(self._db_path)
-            await self._db.execute("PRAGMA journal_mode=WAL")
-        return self._db
+    async def _db_op(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        """Run *fn* on a fresh sync sqlite3 connection in a thread-pool thread.
 
-    async def close_db(self) -> None:
-        if self._db is not None:
-            await self._db.close()
-            self._db = None
+        Each call opens, uses, and closes its own connection via
+        contextlib.closing.  WAL mode is set on every connection so
+        concurrent access from MCP subprocesses is safe.
+        """
+        db_path = str(self._db_path)
+
+        def _run() -> Any:
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                return fn(conn)
+
+        return await asyncio.to_thread(_run)
+
+    async def journal_ui_events(
+        self, rows: list[tuple[str, str, int, str, str, int]]
+    ) -> None:
+        """Persist a batch of UI event rows to the journal table.
+
+        Each row is (session_id, agent_id, seq, event_type, payload, created_at).
+        """
+        if not rows:
+            return
+
+        def _sync(conn: sqlite3.Connection) -> None:
+            conn.executemany(
+                "INSERT INTO ui_events "
+                "(session_id, agent_id, seq, event_type, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+
+        await self._db_op(_sync)
 
     async def expire_old_sessions(self) -> None:
         """Remove restorable sessions older than 30 days."""
-        db = await self._ensure_db()
-        await expire_old_sessions_async(db)
-
-    async def register_agents(self) -> None:
-        """Pre-register all config agents in SQLite."""
-        db = await self._ensure_db()
-        await ensure_schema_async(db)
-        now = int(time.time() * 1000)
-        for agent in self._config.agents:
-            await db.execute(
-                "INSERT OR REPLACE INTO agents "
-                "(agent_id, session_id, status, registered, harness, agent_mode, cwd) "
-                "VALUES (?, ?, 'active', ?, ?, ?, ?)",
-                (agent.agent_id, self._session_id, now, agent.harness, agent.agent_mode, agent.cwd),
-            )
-        await db.commit()
+        await self._db_op(expire_old_sessions_sync)
 
     async def update_command_status(self, cmd_id: int, status: str, error: str | None = None) -> None:
-        db = await self._ensure_db()
-        await db.execute(
-            "UPDATE agent_commands SET status = ?, error = ? WHERE id = ?",
-            (status, error, cmd_id),
-        )
-        await db.commit()
+        def _sync(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE agent_commands SET status = ?, error = ? WHERE id = ?",
+                (status, error, cmd_id),
+            )
+            conn.commit()
+
+        await self._db_op(_sync)
 
     def _build_mcp_env(self, agent_id: str, extra_env: dict[str, str] | None = None) -> list[EnvVariable]:
         env = [
@@ -605,6 +707,28 @@ class AgentLifecycle:
         if extra_env:
             env.extend(EnvVariable(name=k, value=v) for k, v in extra_env.items())
         return env
+
+    def _resolve_harness_env(self, entry: HarnessEntry) -> dict[str, str] | None:
+        """Build environment overrides for a harness subprocess."""
+        overrides: dict[str, str] = {}
+
+        if entry.executable_env_var:
+            for name in entry.binary_names:
+                path = shutil.which(name)
+                if path:
+                    overrides[entry.executable_env_var] = path
+                    log.debug("Harness '%s': %s=%s", entry.short_name, entry.executable_env_var, path)
+                    break
+            else:
+                log.warning(
+                    "Harness '%s': executable_env_var '%s' set but none of %s found in PATH",
+                    entry.short_name, entry.executable_env_var, entry.binary_names,
+                )
+
+        for var in entry.clear_env_vars:
+            overrides[var] = ""
+
+        return overrides if overrides else None
 
     async def _get_visible_agents_for(self, agent_id: str) -> list[str]:
         def _query() -> list[str]:
@@ -628,7 +752,7 @@ class AgentLifecycle:
         hook_name: str,
     ) -> None:
         """Send a templated message to the configured recipients."""
-        if hook.recipients == "none" or not hook.template:
+        if not hook.active or not hook.template:
             return
         recipients = await self._resolve_recipients(hook.recipients, agent_id, parent_id)
         if not recipients:
@@ -642,15 +766,19 @@ class AgentLifecycle:
         }
         body = render_template(hook.template, slots)
         log.debug("%s hook fired for %s → %s:\n%s", hook_name, agent_id, recipients, body)
-        db = await self._ensure_db()
         now = int(time.time() * 1000)
-        for recipient in recipients:
-            await db.execute(
-                "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at, kind) "
-                "VALUES (?, 'system', ?, ?, 'pending', ?, ?)",
-                (self._session_id, recipient, body, now, hook.kind),
-            )
-        await db.commit()
+        session_id = self._session_id
+
+        def _sync(conn: sqlite3.Connection) -> None:
+            for recipient in recipients:
+                conn.execute(
+                    "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at, kind) "
+                    "VALUES (?, 'system', ?, ?, 'pending', ?, ?)",
+                    (session_id, recipient, body, now, hook.kind),
+                )
+            conn.commit()
+
+        await self._db_op(_sync)
         for recipient in recipients:
             await self._sink(HookFired(agent_id=recipient, hook_name=hook_name))
 
@@ -673,20 +801,26 @@ class AgentLifecycle:
         """Get sibling agent IDs (agents sharing the same parent, excluding self)."""
         if not parent_id:
             return []
-        db = await self._ensure_db()
-        cursor = await db.execute(
-            "SELECT agent_id FROM agents WHERE session_id = ? AND parent = ? AND agent_id != ? AND status = 'active'",
-            (self._session_id, parent_id, agent_id),
-        )
-        rows = await cursor.fetchall()
-        return [r[0] for r in rows]
+        session_id = self._session_id
+
+        def _sync(conn: sqlite3.Connection) -> list[str]:
+            rows = conn.execute(
+                "SELECT agent_id FROM agents WHERE session_id = ? AND parent = ? AND agent_id != ? AND status = 'active'",
+                (session_id, parent_id, agent_id),
+            ).fetchall()
+            return [r[0] for r in rows]
+
+        return await self._db_op(_sync)
 
     async def _get_agent_task(self, agent_id: str) -> str:
         """Look up the task description for an agent from SQLite."""
-        db = await self._ensure_db()
-        cursor = await db.execute(
-            "SELECT task FROM agents WHERE agent_id = ? AND session_id = ?",
-            (agent_id, self._session_id),
-        )
-        row = await cursor.fetchone()
-        return row[0] or "" if row else ""
+        session_id = self._session_id
+
+        def _sync(conn: sqlite3.Connection) -> str:
+            row = conn.execute(
+                "SELECT task FROM agents WHERE agent_id = ? AND session_id = ?",
+                (agent_id, session_id),
+            ).fetchone()
+            return row[0] or "" if row else ""
+
+        return await self._db_op(_sync)

@@ -5,15 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable
+from contextlib import closing
+from typing import Any
 
-import aiosqlite
 from mcp.server.fastmcp import FastMCP
 
-from synth_acp.db import ensure_schema_async
+from synth_acp.db import ensure_schema_sync
+from synth_acp.models.visibility import get_visible_agents
 
 type NotifyFn = Callable[[], Awaitable[None]]
 
@@ -36,48 +38,28 @@ def create_mcp_server(
     """
     mcp = FastMCP("synth-mcp")
     _schema_ensured = False
-    _persistent_conn: aiosqlite.Connection | None = None
-    _conn_lock = asyncio.Lock()
 
-    async def _get_conn() -> aiosqlite.Connection:
-        """Return a long-lived aiosqlite connection, creating it on first use."""
-        nonlocal _schema_ensured, _persistent_conn
-        if _persistent_conn is None:
-            if not db_path:
-                raise RuntimeError("SYNTH_DB_PATH is not set — synth-mcp must be launched by synth")
-            _persistent_conn = await aiosqlite.connect(db_path)
-            await _persistent_conn.execute("PRAGMA journal_mode=WAL")
-            _schema_ensured = False
-        if not _schema_ensured:
-            await ensure_schema_async(_persistent_conn)
+    async def _db_op(fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        nonlocal _schema_ensured
+        do_init = not _schema_ensured
+        if do_init:
             _schema_ensured = True
-        return _persistent_conn
 
-    @asynccontextmanager
-    async def _db_conn() -> AsyncIterator[aiosqlite.Connection]:
-        async with _conn_lock:
-            yield await _get_conn()
+        def _run() -> Any:
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                if do_init:
+                    ensure_schema_sync(conn)
+                return fn(conn)
 
-    async def _close_db() -> None:
-        """Close the persistent connection. Safe to call multiple times."""
-        nonlocal _persistent_conn
-        if _persistent_conn is not None:
-            await _persistent_conn.close()
-            _persistent_conn = None
+        return await asyncio.to_thread(_run)
 
-    mcp.close_db = _close_db  # type: ignore[attr-defined]
-
-    async def _ensure_registered(conn: aiosqlite.Connection) -> None:
-        await conn.execute(
+    def _ensure_registered(conn: sqlite3.Connection) -> None:
+        conn.execute(
             "INSERT OR IGNORE INTO agents (agent_id, session_id, status, registered) VALUES (?, ?, 'active', ?)",
             (agent_id, session_id, int(time.time() * 1000)),
         )
-        await conn.commit()
-
-    async def _get_visible_agents_async(conn: aiosqlite.Connection) -> list[str]:
-        from synth_acp.models.visibility import get_visible_agents_async
-
-        return await get_visible_agents_async(conn, agent_id, session_id, communication_mode)
+        conn.commit()
 
     @mcp.tool()
     async def send_message(to_agent: str, body: str, kind: str = "chat", reply_to: int | None = None) -> str:
@@ -103,60 +85,45 @@ def create_mcp_server(
         if kind not in valid_kinds:
             return json.dumps({"error": f"Invalid kind: {kind}. Must be one of: {', '.join(sorted(valid_kinds))}"})
 
-        async with _db_conn() as conn:
-            await _ensure_registered(conn)
+        now = int(time.time() * 1000)
+
+        def _sync(conn: sqlite3.Connection) -> str:
+            _ensure_registered(conn)
 
             if reply_to is not None:
-                cursor = await conn.execute(
+                row = conn.execute(
                     "SELECT id FROM messages WHERE id = ? AND session_id = ?",
                     (reply_to, session_id),
-                )
-                row = await cursor.fetchone()
+                ).fetchone()
                 if not row:
                     return json.dumps({"error": f"reply_to message not found: {reply_to}"})
 
-            now = int(time.time() * 1000)
             if to_agent == "*":
-                visible = await _get_visible_agents_async(conn)
+                visible = get_visible_agents(conn, agent_id, session_id, communication_mode)
                 ids = []
                 for aid in visible:
-                    cursor = await conn.execute(
+                    cursor = conn.execute(
                         "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at, kind, reply_to) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
                         (session_id, agent_id, aid, body, now, kind, reply_to),
                     )
                     ids.append(cursor.lastrowid)
-                await conn.commit()
-                await notify()
+                conn.commit()
                 return json.dumps({"message_ids": ids})
 
-            visible = await _get_visible_agents_async(conn)
+            visible = get_visible_agents(conn, agent_id, session_id, communication_mode)
             if to_agent not in visible:
                 return json.dumps({"error": f"Agent not visible: {to_agent}"})
-            cursor = await conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO messages (session_id, from_agent, to_agent, body, status, created_at, kind, reply_to) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
                 (session_id, agent_id, to_agent, body, now, kind, reply_to),
             )
             msg_id = cursor.lastrowid
-            await conn.commit()
+            conn.commit()
+            return json.dumps({"message_id": msg_id})
+
+        result = await _db_op(_sync)
         await notify()
-        return json.dumps({"message_id": msg_id})
-
-    @mcp.tool()
-    async def check_delivery(message_id: int) -> str:
-        """Poll whether a previously sent message has been delivered.
-
-        Args:
-            message_id: ID returned by send_message.
-
-        Returns:
-            {"message_id": int, "status": "pending"|"delivered"|"not_found"}.
-        """
-        async with _db_conn() as conn:
-            cursor = await conn.execute("SELECT status FROM messages WHERE id = ?", (message_id,))
-            row = await cursor.fetchone()
-        if row:
-            return json.dumps({"message_id": message_id, "status": row[0]})
-        return json.dumps({"message_id": message_id, "status": "not_found"})
+        return result
 
     _caller_id = agent_id  # capture closure before parameter shadows it
 
@@ -185,18 +152,17 @@ def create_mcp_server(
         Returns:
             {"ok": true, "agent_id": str}.
         """
-        async with _db_conn() as conn:
-            await _ensure_registered(conn)
+        def _sync(conn: sqlite3.Connection) -> tuple[int, str | None]:
+            _ensure_registered(conn)
 
             max_agents = int(os.environ.get("SYNTH_MAX_AGENTS", "10"))
-            cursor = await conn.execute(
+            row = conn.execute(
                 "SELECT COUNT(*) FROM agents WHERE session_id = ? AND status = 'active'",
                 (session_id,),
-            )
-            row = await cursor.fetchone()
+            ).fetchone()
             active = row[0] if row else 0
             if active >= max_agents:
-                return json.dumps({"error": f"Max agents ({max_agents}) reached"})
+                return -1, json.dumps({"error": f"Max agents ({max_agents}) reached"})
 
             now = int(time.time() * 1000)
             payload = json.dumps(
@@ -209,24 +175,29 @@ def create_mcp_server(
                     "message": message,
                 }
             )
-            cursor = await conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) VALUES (?, ?, 'launch', ?, 'pending', ?)",
                 (session_id, _caller_id, payload, now),
             )
-            cmd_id = cursor.lastrowid
-            await conn.commit()
+            conn.commit()
+            assert cursor.lastrowid is not None
+            return cursor.lastrowid, None
+
+        cmd_id, error = await _db_op(_sync)
+        if error:
+            return error
         await notify()
 
-        # Poll for the broker to process the command so we can return
-        # the actual result (processed/rejected) instead of a blind ok.
         for _ in range(10):
             await asyncio.sleep(0.3)
-            async with _db_conn() as conn:
-                cursor = await conn.execute(
+
+            def _poll(conn: sqlite3.Connection, cid: int = cmd_id) -> tuple | None:
+                return conn.execute(
                     "SELECT status, error FROM agent_commands WHERE id = ?",
-                    (cmd_id,),
-                )
-                row = await cursor.fetchone()
+                    (cid,),
+                ).fetchone()
+
+            row = await _db_op(_poll)
             if row and row[0] != "pending":
                 if row[0] == "rejected":
                     return json.dumps({"error": row[1] or "Launch rejected"})
@@ -244,15 +215,17 @@ def create_mcp_server(
         Returns:
             {"ok": true}.
         """
-        async with _db_conn() as conn:
-            await _ensure_registered(conn)
+        def _sync(conn: sqlite3.Connection) -> None:
+            _ensure_registered(conn)
             now = int(time.time() * 1000)
             payload = json.dumps({"agent_id": target_agent_id})
-            await conn.execute(
+            conn.execute(
                 "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) VALUES (?, ?, 'terminate', ?, 'pending', ?)",
                 (session_id, agent_id, payload, now),
             )
-            await conn.commit()
+            conn.commit()
+
+        await _db_op(_sync)
         await notify()
         return json.dumps({"ok": True})
 
@@ -266,26 +239,31 @@ def create_mcp_server(
         Returns:
             {"ok": true, "agent_id": str} on success, {"error": str} on failure.
         """
-        async with _db_conn() as conn:
-            await _ensure_registered(conn)
+        def _sync(conn: sqlite3.Connection) -> int:
+            _ensure_registered(conn)
             now = int(time.time() * 1000)
             payload = json.dumps({"agent_id": target_agent_id})
-            cursor = await conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) VALUES (?, ?, 'resurrect', ?, 'pending', ?)",
                 (session_id, _caller_id, payload, now),
             )
-            cmd_id = cursor.lastrowid
-            await conn.commit()
+            conn.commit()
+            assert cursor.lastrowid is not None
+            return cursor.lastrowid
+
+        cmd_id = await _db_op(_sync)
         await notify()
 
         for _ in range(10):
             await asyncio.sleep(0.3)
-            async with _db_conn() as conn:
-                cursor = await conn.execute(
+
+            def _poll(conn: sqlite3.Connection, cid: int = cmd_id) -> tuple | None:
+                return conn.execute(
                     "SELECT status, error FROM agent_commands WHERE id = ?",
-                    (cmd_id,),
-                )
-                row = await cursor.fetchone()
+                    (cid,),
+                ).fetchone()
+
+            row = await _db_op(_poll)
             if row and row[0] != "pending":
                 if row[0] == "rejected":
                     return json.dumps({"error": row[1] or "Resurrect rejected"})
@@ -300,28 +278,29 @@ def create_mcp_server(
         Returns:
             JSON array of agent info objects.
         """
-        async with _db_conn() as conn:
-            await _ensure_registered(conn)
-            visible = await _get_visible_agents_async(conn)
+        def _sync(conn: sqlite3.Connection) -> str:
+            _ensure_registered(conn)
+            visible = get_visible_agents(conn, agent_id, session_id, communication_mode)
             all_ids = [*visible, agent_id]
-            cursor = await conn.execute(
+            rows = conn.execute(
                 "SELECT agent_id, status, parent, task FROM agents WHERE session_id = ? AND agent_id IN ({})".format(
                     ",".join("?" * len(all_ids))
                 ),
                 (session_id, *all_ids),
-            )
-            rows = await cursor.fetchall()
-        agents = [
-            {
-                "agent_id": r[0],
-                "status": r[1],
-                "parent": r[2],
-                "task": r[3],
-                "is_self": r[0] == agent_id,
-            }
-            for r in rows
-        ]
-        return json.dumps(agents)
+            ).fetchall()
+            agents = [
+                {
+                    "agent_id": r[0],
+                    "status": r[1],
+                    "parent": r[2],
+                    "task": r[3],
+                    "is_self": r[0] == agent_id,
+                }
+                for r in rows
+            ]
+            return json.dumps(agents)
+
+        return await _db_op(_sync)
 
     @mcp.tool()
     async def get_my_context() -> str:
@@ -336,13 +315,14 @@ def create_mcp_server(
             {"agent_id": str, "parent_agent": str|null, "task": str|null,
              "communication_rules": [str]}
         """
-        async with _db_conn() as conn:
-            await _ensure_registered(conn)
-            cursor = await conn.execute(
+        def _sync(conn: sqlite3.Connection) -> tuple | None:
+            _ensure_registered(conn)
+            return conn.execute(
                 "SELECT parent, task FROM agents WHERE agent_id = ? AND session_id = ?",
                 (agent_id, session_id),
-            )
-            row = await cursor.fetchone()
+            ).fetchone()
+
+        row = await _db_op(_sync)
         parent = row[0] if row else None
         task = row[1] if row else None
         rules = [

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from synth_acp.acp.session import ACPSession
-from synth_acp.models.agent import AgentConfig, AgentMode, AgentModel, AgentState
-from synth_acp.models.config import SessionConfig
+from synth_acp.models.agent import AgentMode, AgentModel, AgentState
 from synth_acp.models.events import UsageUpdated
 
 log = logging.getLogger(__name__)
@@ -18,19 +18,31 @@ class AgentRegistry:
     Pure data object — no I/O, no async, no tasks.
     """
 
-    def __init__(self, config: SessionConfig) -> None:
-        self._config = config
+    def __init__(self) -> None:
         self._sessions: dict[str, ACPSession] = {}
-        self._parents: dict[str, str | None] = {a.agent_id: None for a in config.agents}
-        self._harnesses: dict[str, str] = {a.agent_id: a.harness for a in config.agents}
+        self._parents: dict[str, str | None] = {}
+        self._harnesses: dict[str, str] = {}
         self._initial_messages: dict[str, str] = {}
         self._usage: dict[str, UsageUpdated] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
 
     def register(self, agent_id: str, session: ACPSession) -> None:
         self._sessions[agent_id] = session
 
     def unregister(self, agent_id: str) -> ACPSession | None:
+        self._locks.pop(agent_id, None)
         return self._sessions.pop(agent_id, None)
+
+    def agent_lock(self, agent_id: str) -> asyncio.Lock:
+        """Return the per-agent serialization lock. Creates on first access.
+
+        The lock serializes all operations that transition an agent out of IDLE.
+        Acquired internally by lifecycle.prompt(), lifecycle.set_mode(), lifecycle.set_model().
+        External callers should use lock.locked() as a non-blocking guard only.
+        """
+        if agent_id not in self._locks:
+            self._locks[agent_id] = asyncio.Lock()
+        return self._locks[agent_id]
 
     def get_session(self, agent_id: str) -> ACPSession | None:
         return self._sessions.get(agent_id)
@@ -86,9 +98,6 @@ class AgentRegistry:
 
     def get_states(self) -> dict[str, AgentState]:
         return {aid: s.state for aid, s in self._sessions.items()}
-
-    def get_configs(self) -> list[AgentConfig]:
-        return list(self._config.agents)
 
     def get_modes(self, agent_id: str) -> list[AgentMode]:
         s = self._sessions.get(agent_id)

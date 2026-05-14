@@ -3,3 +3,4 @@ name = "Kiro CLI"
 short_name = "kiro"
 binary_names = ["kiro-cli"]
 run_cmd = "kiro-cli acp"
+mode_arg = "--agent"

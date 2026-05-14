@@ -21,10 +21,6 @@ class HelpScreen(ModalScreen[None]):
         with Vertical(id="help-container"):
             yield Static(self._build_bindings_text(), id="help-bindings")
             yield Static(
-                "[bold]Routing[/bold]\n  @agent-id  — Route a message to a specific agent",
-                id="help-routing",
-            )
-            yield Static(
                 "[bold]Layout[/bold]\n"
                 "  Left sidebar: agent list and MCP button\n"
                 "  Right panel: conversation feed or MCP messages",

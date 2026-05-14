@@ -27,9 +27,11 @@ Layers 1 and 2 have zero Textual imports. The frontend communicates with the bro
 src/synth_acp/
 ├── cli.py              # typer CLI, entry point
 ├── db.py               # Shared SQLite schema and helpers
+├── discovery.py        # Filesystem-based agent discovery for harnesses
+├── embeddings.py       # Standalone embedding module for semantic session search
 ├── harnesses.py        # Harness registry loader (TOML → HarnessEntry)
 ├── data/
-│   └── harnesses/      # Harness TOML definitions (kiro.toml, claude.toml, etc.)
+│   └── harnesses/      # Harness TOML definitions (kiro.toml, claude.toml, opencode.toml, gemini.toml)
 ├── models/
 │   ├── agent.py        # AgentState enum, AgentConfig
 │   ├── config.py       # SessionConfig, HooksConfig (parsed from .synth.json)
@@ -54,6 +56,7 @@ src/synth_acp/
 │   └── shell_read.py   # Buffered async stream reader for PTY output
 └── ui/
     ├── app.py          # SynthApp — bridges broker ↔ Textual messages
+    ├── file_discovery.py # File discovery and fuzzy scoring for @ file references
     ├── messages.py     # Textual Message subclasses wrapping BrokerEvent
     ├── ansi/           # Vendored ANSI terminal state parser (from toad)
     ├── screens/
@@ -64,7 +67,9 @@ src/synth_acp/
     ├── widgets/
     │   ├── agent_list.py
     │   ├── conversation.py
+    │   ├── expandable_section.py
     │   ├── prompt_bubble.py
+    │   ├── prompt_queue.py
     │   ├── agent_message.py
     │   ├── tool_call.py
     │   ├── message_queue.py
@@ -82,16 +87,47 @@ src/synth_acp/
 
 ### Key Dependencies
 
-- `agent-client-protocol` — ACP Python SDK (Pydantic models, `spawn_agent_process`, `SessionAccumulator`)
-- `mcp>=1.0.0` — MCP server via `mcp.server.fastmcp.FastMCP` (agent-to-agent messaging)
-- `textual` — TUI framework
-- `typer` — CLI framework
-- `aiosqlite` — async SQLite for message bus
+- `agent-client-protocol==0.9.0` — ACP Python SDK (Pydantic models, `spawn_agent_process`, `SessionAccumulator`)
+- `mcp>=1.0.0,<2` — MCP server via `mcp.server.fastmcp.FastMCP` (agent-to-agent messaging)
+- `textual[syntax]>=8.2.1` — TUI framework with syntax highlighting
+- `textual-speedups>=0.2.1` — Cython-accelerated Textual internals
+- `typer>=0.9` — CLI framework
+- `InquirerPy==0.3.4` — Interactive fuzzy picker for `--select-agent`
+- `PyYAML>=6.0` — YAML parsing for agent discovery
+
+Optional (`pip install synth-acp[search]`):
+- `onnxruntime>=1.17.0` — ONNX inference for semantic session search
+- `tokenizers>=0.15.0` — Tokenization for embedding model
 
 ### Reference Docs
 
 - `README.md` — configuration reference, lifecycle hooks, MCP tools
 - `examples/synth.example.json` — complete config with all available options
+
+### Harness-Specific Notes
+
+**Claude Code** (`claude.toml`):
+- Uses `npx @agentclientprotocol/claude-agent-acp` binary
+- `agent_mode_target = "meta_agent"` — passes `agent_mode` as `_meta.claudeCode.options.agent`
+- `executable_env_var = "CLAUDE_CODE_EXECUTABLE"` — injects detected binary path
+- `clear_env_vars = ["CLAUDECODE"]` — clears stale env vars in subprocess
+- Returns `config_options` with mode (permission), model, and effort (model-dependent)
+- `set_config_option()` response returns full updated config_options (effort may disappear on model switch)
+- Agent names for plugins: `<plugin-name>:<agent-name>` (e.g., `local-SHScienceAgentKit-all:code-planner`)
+
+**Kiro** (`kiro.toml`):
+- `mode_arg = "--agent"` — passes `agent_mode` as CLI flag
+- Returns `modes` (all agents) + `models`, NO `config_options`
+- Synth synthesizes `config_options` from legacy modes/models
+- `set_session_mode()` / `set_session_model()` used (no `set_config_option` endpoint)
+
+**OpenCode** (`opencode.toml`):
+- `run_cmd = "opencode acp"` — simple ACP mode
+- No agent_mode support
+
+**Gemini CLI** (`gemini.toml`):
+- `run_cmd = "gemini --experimental-acp"` — experimental ACP flag
+- No agent_mode support
 
 ## Build System
 
@@ -121,10 +157,10 @@ uses PyPI Trusted Publishing (OIDC) — no API tokens needed.
 # 1. Bump version in pyproject.toml
 # 2. Commit the bump
 git add pyproject.toml
-git commit -m "release: v0.2.0"
+git commit -m "release: v0.3.1"
 
 # 3. Tag and push (triggers CI → test → publish)
-git tag v0.2.0
+git tag v0.3.1
 git push origin main --tags
 ```
 
@@ -172,39 +208,33 @@ uv run pytest -q --tb=short --no-header -rF     # Quick summary
 uv run pytest --co                                # List collected tests (dry run)
 ```
 
-### aiosqlite / SQLite best practices
+### SQLite best practices
 
-`aiosqlite` creates a dedicated **non-daemon thread** per connection. An unclosed
-connection keeps the process alive after the event loop exits — the user sees a
-hang requiring Ctrl-C. Sync `sqlite3` has no background threads, so a leaked
-connection is just a file descriptor, not a hung process.
+All async DB access uses `asyncio.to_thread` + `contextlib.closing(sqlite3.connect(...))`.
+Each call opens a fresh connection, runs the operation, and closes it — no persistent
+connections, no background threads to manage at shutdown.
 
-**Choose the right tool for the pattern:**
+**Why this is safe:** `asyncio.to_thread` dispatches work to the
+`concurrent.futures.ThreadPoolExecutor` default pool. `concurrent.futures.thread`
+registers `_python_exit` via `threading._register_atexit`, which sends a shutdown
+sentinel to every pool worker at interpreter exit. The pool threads are cleaned up
+automatically — no explicit close is needed.
 
-| Pattern | Use | Why |
-|---------|-----|-----|
-| Long-lived connection (lifecycle DB, message bus delivery loop) | `aiosqlite` | Dedicated thread amortises setup; `async with` or explicit `close_db()` ensures cleanup |
-| Open-close per call (permission writes, one-off queries) | `asyncio.to_thread` + `sqlite3` | Borrows a daemon pool thread briefly; no shutdown hang risk |
-| Sync init before event loop starts (`__init__`, CLI setup) | `sqlite3` directly | No event loop yet; sync is fine and has zero thread overhead |
-| Agent subprocess (MCP server) | `aiosqlite` persistent conn | Subprocess gets killed anyway; `close_db()` hook exists for tests |
+**Pattern:**
 
-**Rules:**
+```python
+async def _db_op(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+    return await asyncio.to_thread(self._run_db, fn)
 
-- Every `aiosqlite.connect()` in the main process **must** be inside `async with`
-  or have a guaranteed `close()` in a `finally` block. A bare
-  `conn = await aiosqlite.connect(...)` without `try/finally` is a shutdown hang
-  waiting to happen.
-- Never open `aiosqlite` connections for short-lived one-off operations. Use
-  `asyncio.to_thread` with sync `sqlite3` instead.
-- Sync `sqlite3` with WAL mode can deadlock against `aiosqlite` connections to the
-  same database when both are in the same process. Keep sync `sqlite3` usage limited
-  to init-time schema creation (before `aiosqlite` connections are opened) or
-  offloaded to `asyncio.to_thread`.
+def _run_db(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+    with contextlib.closing(sqlite3.connect(self._db_path)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        return fn(conn)
+```
 
 **Test cleanup:** Any test that triggers `broker.handle(LaunchAgent(...))` or calls
-`broker._start_message_bus()` **must** stop the bus and close the lifecycle DB
-in a `finally` block — otherwise the aiosqlite background thread and the Unix
-socket server keep the event loop alive and the test hangs indefinitely:
+`broker._start_message_bus()` **must** stop the bus in a `finally` block —
+otherwise the Unix socket server keeps the event loop alive and the test hangs:
 
 ```python
 try:
@@ -213,13 +243,9 @@ try:
 finally:
     if broker._message_bus:
         await broker._message_bus.stop()
-    if broker._lifecycle:
-        await broker._lifecycle.close_db()
 ```
 
-Tests that create MCP servers with `create_mcp_server()` must call
-`await server.close_db()` after the test (or use the `mcp_factory` fixture
-in `tests/mcp/test_server.py` which handles this automatically).
+No DB close is needed because no persistent connection exists.
 
 ## Tooling
 
@@ -236,6 +262,47 @@ in `tests/mcp/test_server.py` which handles this automatically).
 - Pydantic v2 `BaseModel` with `frozen=True` for all cross-layer types.
 - Use the `agent-client-protocol` SDK's Pydantic models directly (e.g. `McpServerStdio`, `EnvVariable`) — don't hand-build dicts for ACP payloads.
 - `SessionAccumulator` from `acp.contrib` is the canonical source of per-agent conversation history. Don't reimplement tool call tracking.
+
+## Async Concurrency Rules
+
+### Broker layer
+
+Any method that mutates registry/session state across `await` points **must** hold
+`self._registry.agent_lock(agent_id)`. This includes: `prompt`, `set_mode`,
+`set_model`, `terminate`, `resurrect`, `handle_launch_command`.
+
+Three patterns that introduce races:
+
+1. **Pop-after-await**: Never `dict.pop()` after an `await` if concurrent code can
+   write to the same key during the await. Snapshot before, consume only the snapshot.
+2. **Unguarded slot in drain loops**: If a loop processes a queue with `await` points
+   inside, hold any shared "active" slot for the full iteration — not just the terminal
+   path.
+3. **Read-await-mutate without lock**: If you read shared state, await, then mutate
+   based on the read — you need a lock. The await is a yield point where any other
+   coroutine can invalidate your read.
+
+### UI layer (Textual workers)
+
+`run_worker` / `@work` create asyncio tasks **concurrent** with the message pump.
+Any worker that modifies shared app state must be guarded:
+
+- **`exclusive=True`** (last-writer-wins): Cancels ALL prior workers with the same
+  `(node, group)` — NOT same name. Always specify `group=` to isolate cancellation
+  pools. Current groups:
+  - `group="modal"` — `action_launch`, `action_restore`, `_do_restore` (mutually
+    exclusive modal flows that should cancel each other)
+  - `group="broker"` — `broker-consumer` (long-lived, must never be cancelled by
+    user actions)
+- **`dict[str, asyncio.Task]`** (first-writer-wins): Use when the operation is
+  idempotent and the second caller wants the same result — `_selecting` for
+  `select_agent` with the same agent_id.
+- **Bare `run_worker()`**: Only safe for fire-and-forget operations that don't touch
+  shared state (e.g. `broker.handle(CancelTurn(...))`, `select_agent` from tile
+  clicks since `_selecting` already guards, `show_messages` since it's idempotent).
+
+When adding `_draining`-style guards, use `dict[str, asyncio.Event]` over `set[str]`
+— matches the repo convention and allows future callers to await completion.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker

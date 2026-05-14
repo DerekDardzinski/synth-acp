@@ -43,3 +43,8 @@ class AgentMessage(Vertical, can_focus=False):
         if self._stream is not None:
             await self._stream.stop()
             self._stream = None
+            # Work around Textual Markdown.append() cursor bug that can
+            # leave fenced code blocks empty after incremental re-parse.
+            full_content = "".join(self._chunks)
+            if full_content:
+                await self._md.update(full_content)

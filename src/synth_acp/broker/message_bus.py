@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import closing
 from pathlib import Path
+from typing import Any
 
-import aiosqlite
-
-from synth_acp.db import ensure_schema_async
+from synth_acp.db import ensure_schema_sync
 
 log = logging.getLogger(__name__)
 
@@ -53,11 +54,17 @@ class MessageBus:
         self._server: asyncio.Server | None = None
         self._socket_path = str(Path(tempfile.gettempdir()) / f"synth-{session_id}.sock")
         self._wake_event = asyncio.Event()
-        self._delivery_db: aiosqlite.Connection | None = None
+        self._delivery_backoff: dict[str, float] = {}
 
     @property
     def socket_path(self) -> str:
         return self._socket_path
+
+    def wake(self, agent_id: str | None = None) -> None:
+        """Wake the delivery loop. If agent_id provided, clear backoff for that agent."""
+        if agent_id:
+            self._delivery_backoff.pop(agent_id, None)
+        self._wake_event.set()
 
     async def start(self) -> None:
         """Start the notification listener and delivery loop."""
@@ -67,7 +74,7 @@ class MessageBus:
         self._server = await asyncio.start_unix_server(self._handle_client, path=self._socket_path)
         self._tasks.append(asyncio.create_task(self._delivery_loop(), name="msg-bus-delivery"))
 
-    async def stop(self, timeout: float = 2.0) -> None:
+    async def stop(self) -> None:
         """Stop all listeners and cancel tasks."""
         if self._stopped:
             return
@@ -80,16 +87,7 @@ class MessageBus:
             if not task.done():
                 task.cancel()
         if self._tasks:
-            await asyncio.wait(self._tasks, timeout=timeout)
-        # Safety net: close the delivery loop DB if the task didn't
-        # finish in time — prevents a non-daemon aiosqlite thread
-        # from keeping the process alive after the event loop exits.
-        if self._delivery_db is not None:
-            try:
-                await self._delivery_db.close()
-            except Exception:
-                pass
-            self._delivery_db = None
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         sock = Path(self._socket_path)
         if sock.exists():
             sock.unlink()
@@ -115,6 +113,17 @@ class MessageBus:
             return None
         return "\n\n".join(_format_message(sender, body, "chat") for sender, body in messages)
 
+    async def _db_op(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        """Run *fn* on a fresh sync sqlite3 connection in a thread-pool thread."""
+        db_path = str(self._db_path)
+
+        def _run() -> Any:
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                return fn(conn)
+
+        return await asyncio.to_thread(_run)
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             while not self._stopped:
@@ -130,74 +139,165 @@ class MessageBus:
     async def _delivery_loop(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            async with aiosqlite.connect(self._db_path) as db:
-                self._delivery_db = db
-                await ensure_schema_async(db)
-                await db.commit()
-                await self._deliver_pending(db)
-                await self._process_pending_commands(db)
-                while not self._stopped:
-                    self._wake_event.clear()
-                    try:
-                        await asyncio.wait_for(self._wake_event.wait(), timeout=self._fallback_interval)
-                    except TimeoutError:
-                        pass
-                    except asyncio.CancelledError:
-                        raise
-                    if self._stopped:
-                        break
-                    try:
-                        await self._deliver_pending(db)
-                        await self._process_pending_commands(db)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        log.exception("MessageBus delivery error")
+            await self._db_op(ensure_schema_sync)
+
+            # Startup recovery: revert stale 'processing' commands to 'pending'
+            session_id = self._session_id
+
+            def _recover_commands(conn: sqlite3.Connection) -> None:
+                conn.execute(
+                    "UPDATE agent_commands SET status = 'pending' "
+                    "WHERE status = 'processing' AND session_id = ?",
+                    (session_id,),
+                )
+                conn.commit()
+
+            await self._db_op(_recover_commands)
+
+            await self._deliver_pending()
+            await self._process_pending_commands()
+            while not self._stopped:
+                self._wake_event.clear()
+                try:
+                    await asyncio.wait_for(self._wake_event.wait(), timeout=self._fallback_interval)
+                except TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    raise
+                if self._stopped:
+                    break
+                try:
+                    await self._deliver_pending()
+                    await self._process_pending_commands()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("MessageBus delivery error")
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("MessageBus connection error")
-        finally:
-            self._delivery_db = None
 
-    async def _deliver_pending(self, db: aiosqlite.Connection) -> None:
-        """Query pending messages, group by recipient, deliver with kind-aware formatting."""
-        rows = await db.execute_fetchall(
-            "SELECT id, from_agent, to_agent, body, kind FROM messages "
-            "WHERE status = 'pending' AND session_id = ? ORDER BY created_at",
-            [self._session_id],
-        )
+    async def _deliver_pending(self) -> None:
+        """Fetch pending messages, deliver, mark on success. At-least-once semantics.
+
+        Combines in-memory pending (enqueue_pending, enqueue_raw) with DB pending.
+        Per-agent lock (via lifecycle.prompt) prevents concurrent delivery to same agent.
+        Messages stay pending on failure — retried on next cycle.
+        """
+        session_id = self._session_id
+
+        def _fetch(conn: sqlite3.Connection) -> list[tuple[int, str, str, str, str]]:
+            return conn.execute(
+                "SELECT id, from_agent, to_agent, body, kind FROM messages "
+                "WHERE status = 'pending' AND session_id = ? ORDER BY created_at",
+                (session_id,),
+            ).fetchall()
+
+        rows = await self._db_op(_fetch)
+
         by_agent: dict[str, list[tuple[int, str, str, str, str]]] = {}
         for row in rows:
-            by_agent.setdefault(row[2], []).append(row)  # type: ignore[arg-type]
+            by_agent.setdefault(row[2], []).append(row)
+
+        # Include agents with in-memory pending but no DB messages
+        for agent_id in set(self._pending.keys()) | set(self._pending_raw.keys()):
+            if agent_id not in by_agent:
+                by_agent[agent_id] = []
+
         for agent_id, messages in by_agent.items():
-            ids = [m[0] for m in messages]
-            placeholders = ",".join("?" * len(ids))
-            now = int(time.time() * 1000)
-            await db.execute(
-                f"UPDATE messages SET status = 'delivered', delivered_at = ? WHERE id IN ({placeholders})",
-                [now, *ids],
-            )
-            await db.commit()
+            if time.time() - self._delivery_backoff.get(agent_id, 0) < 2.0:
+                continue
 
-            combined = "\n\n".join(_format_message(m[1], m[3], m[4]) for m in messages)
-            senders = list({m[1] for m in messages if m[4] != "system"})
-            success = await self._deliver(agent_id, combined, senders)
-            if not success:
-                await db.execute(
-                    f"UPDATE messages SET status = 'pending', delivered_at = NULL WHERE id IN ({placeholders})",
-                    ids,
-                )
-                await db.commit()
+            combined_parts: list[str] = []
+            senders: set[str] = set()
 
-    async def _process_pending_commands(self, db: aiosqlite.Connection) -> None:
-        """Query pending agent commands and pass them to the command callback."""
+            # In-memory raw (initial prompt text) — snapshot before await so a
+            # concurrent enqueue_raw that overwrites the value during deliver
+            # is preserved (we only pop if the value is still the snapshot).
+            raw = self._pending_raw.get(agent_id)
+            if raw:
+                combined_parts.append(raw)
+
+            # In-memory formatted messages — snapshot the count before await so
+            # a concurrent enqueue_pending that appends during deliver is
+            # preserved (we only consume the prefix we actually sent).
+            mem_messages = self._pending.get(agent_id)
+            mem_messages_count = len(mem_messages) if mem_messages else 0
+            if mem_messages:
+                for sender, body in mem_messages:
+                    combined_parts.append(_format_message(sender, body, "chat"))
+                    senders.add(sender)
+
+            # DB messages
+            for m in messages:
+                combined_parts.append(_format_message(m[1], m[3], m[4]))
+                if m[4] != "system":
+                    senders.add(m[1])
+
+            if not combined_parts:
+                continue
+
+            combined = "\n\n".join(combined_parts)
+            success = await self._deliver(agent_id, combined, list(senders))
+            if success:
+                # Clear ONLY the in-memory state we actually delivered. Anything
+                # enqueued during the deliver await must survive into the next
+                # cycle, otherwise we drop messages silently.
+                if raw is not None and self._pending_raw.get(agent_id) == raw:
+                    self._pending_raw.pop(agent_id, None)
+                if mem_messages_count:
+                    current = self._pending.get(agent_id)
+                    if current is not None:
+                        remaining = current[mem_messages_count:]
+                        if remaining:
+                            self._pending[agent_id] = remaining
+                        else:
+                            self._pending.pop(agent_id, None)
+                # Mark DB messages delivered
+                if messages:
+                    ids = [m[0] for m in messages]
+                    placeholders = ",".join("?" * len(ids))
+                    now = int(time.time() * 1000)
+
+                    def _mark(conn: sqlite3.Connection, *, ids: list[int] = ids, now: int = now, ph: str = placeholders) -> None:
+                        conn.execute(
+                            f"UPDATE messages SET status = 'delivered', delivered_at = ? "
+                            f"WHERE id IN ({ph}) AND status = 'pending'",
+                            [now, *ids],
+                        )
+                        conn.commit()
+
+                    await self._db_op(_mark)
+                self._delivery_backoff.pop(agent_id, None)
+            else:
+                self._delivery_backoff[agent_id] = time.time()
+
+    async def _process_pending_commands(self) -> None:
+        """Atomically claim and process pending commands. No double-processing.
+
+        Commands transition pending→processing atomically. Callback sets final status.
+        """
         if self._process_commands is None:
             return
-        rows = await db.execute_fetchall(
-            "SELECT id, from_agent, command, payload FROM agent_commands "
-            "WHERE status = 'pending' AND session_id = ? ORDER BY created_at",
-            [self._session_id],
-        )
+        session_id = self._session_id
+
+        def _claim(conn: sqlite3.Connection) -> list[tuple[int, str, str, str]]:
+            rows = conn.execute(
+                "SELECT id, from_agent, command, payload FROM agent_commands "
+                "WHERE status = 'pending' AND session_id = ? ORDER BY created_at",
+                (session_id,),
+            ).fetchall()
+            if rows:
+                ids = [r[0] for r in rows]
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    f"UPDATE agent_commands SET status = 'processing' WHERE id IN ({placeholders})",
+                    ids,
+                )
+                conn.commit()
+            return rows
+
+        rows = await self._db_op(_claim)
         if rows:
             await self._process_commands([(r[0], r[1], r[2], r[3]) for r in rows])

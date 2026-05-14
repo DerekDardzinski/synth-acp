@@ -6,19 +6,26 @@ A multi-agent orchestration dashboard that manages teams of AI coding agents thr
 
 ## What It Does
 
-- Launches and manages multiple ACP agent subprocesses from a single terminal
+- Launches an ACP agent and manages dynamically spawned child agents from a single terminal
 - Streams agent responses with rendered markdown in a Textual TUI
 - Surfaces permission requests inline with one-click approve/reject
 - Enables agent-to-agent messaging via a bundled MCP server
-- Supports flexible topologies: human-dispatch, orchestrator, peer-to-peer
-- Configurable lifecycle hooks for agent join, exit, and prompt injection
+- Supports flexible topologies: orchestrator spawns children via `launch_agent`
+- Configurable lifecycle hooks for agent startup, join, and exit
+- Session restore with optional semantic search (`synth --restore`)
+- Agent discovery and interactive picker (`synth --list-agents`, `synth --select-agent`)
 
 ## Install
 
 ```bash
 # Install as a global CLI tool (run `synth` from anywhere)
 uv tool install synth-acp
+
+# With semantic session search support (recommended)
+uv tool install synth-acp[search]
 ```
+
+The `[search]` extra enables semantic search when restoring previous sessions (`synth --restore`). Without it, session restore falls back to recency-based listing only.
 
 ## Quick Start
 
@@ -26,168 +33,175 @@ uv tool install synth-acp
 # Navigate to your project
 cd my-project
 
-# Initialize a config file (interactive)
-synth init
-
-# Or create one manually
-cat > .synth.json << 'EOF'
-{
-  "project": "my-project",
-  "agents": [
-    { "agent_id": "kiro", "harness": "kiro" }
-  ]
-}
-EOF
-
-# Launch the TUI
+# Launch — auto-detects your harness if only one is installed
 synth
 
-# Or run headless (CLI mode)
-synth --headless
-
-# Or launch directly with a harness (no config file needed)
+# Or specify a harness explicitly
 synth --harness kiro
+
+# Launch with a specific agent mode
 synth --harness kiro --agent-mode plan
+
+# Launch Claude Code with a specific agent (full qualified name for plugins)
+synth --harness claude --agent-mode local-SHScienceAgentKit-all:code-planner
+
+# Restore a previous session
+synth --restore
+
+# List available agents for a harness
+synth --list-agents --harness kiro
+
+# Interactive fuzzy agent picker
+synth --select-agent
+
+# Set a default so you can just run `synth` anywhere
+synth config set default_harness kiro
 ```
 
-## Configuration
+No config file required. Synth auto-detects installed harnesses and launches immediately.
 
-Create a `.synth.json` in your project root. A minimal config:
+## Global Config (`~/.synth/config.json`)
+
+Created automatically on first run. Stores personal defaults:
 
 ```json
 {
-  "project": "my-project",
-  "agents": [
-    { "agent_id": "lead", "harness": "kiro" },
-    { "agent_id": "worker", "harness": "claude" }
-  ]
-}
-```
-
-### Full Config Reference
-
-See [`examples/synth.example.json`](examples/synth.example.json) for a complete config with all available options.
-
-```json
-{
-  "project": "my-project",
-
-  "agents": [
-    {
-      "agent_id": "lead",
-      "harness": "kiro",
-      "agent_mode": "coder",
-      "cwd": ".",
-      "env": { "CUSTOM_VAR": "value" }
-    }
-  ],
-
-  "settings": {
-    "communication_mode": "MESH",
-    "auto_approve_tools": ["synth-mcp/send_message", "synth-mcp/list_agents"],
-
-    "hooks": {
-      "on_agent_startup": {
-        "prepend": "<orchestration_context>\nagent_id: {agent_id}\nsession: You are in a multi-agent session.\n</orchestration_context>\n\n"
-      },
-      "on_agent_prompt": {
-        "prepend": "<orchestration_context>\nagent_id: {agent_id}\nparent_agent: {parent_id}\nreply_tool: send_message(to_agent='{parent_id}', kind='response')\n</orchestration_context>\n\n"
-      },
-      "on_agent_join": {
-        "recipients": "none",
-        "template": "Agent \"{agent_id}\" is now active. Task: \"{task}\".",
-        "kind": "system"
-      },
-      "on_agent_exit": {
-        "recipients": "none",
-        "template": "Agent \"{agent_id}\" has left the session.",
-        "kind": "system"
-      }
-    }
-  },
-
-  "ui": {
-    "web_port": 8000,
-    "theme": "dark"
+  "default_harness": "kiro",
+  "default_agent_id": null,
+  "default_agent_mode": null,
+  "communication_mode": "LOCAL",
+  "auto_approve_tools": ["synth-mcp"],
+  "hooks": {
+    "on_agent_startup": { "active": true },
+    "on_agent_join": { "active": false, "recipients": "parent", "template": "Agent \"{agent_id}\" is now active. Task: \"{task}\".", "kind": "system" },
+    "on_agent_exit": { "active": false, "recipients": "parent", "template": "Agent \"{agent_id}\" has exited.", "kind": "system" }
   }
 }
 ```
 
-### Agent Fields
+### `synth config` Commands
 
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `agent_id` | yes | — | Unique identifier, shown to other agents |
-| `harness` | yes | — | Short name: `kiro`, `claude`, `opencode`, `gemini` |
-| `agent_mode` | no | — | ACP mode ID applied after session creation |
-| `cwd` | no | `"."` | Working directory (relative to config file) |
-| `env` | no | `{}` | Extra environment variables passed to the harness |
+```bash
+synth config list                    # Show all settings with descriptions
+synth config set default_harness kiro  # Set a default
+synth config set communication_mode MESH
+synth config set auto_approve_tools "synth-mcp/send_message,synth-mcp/list_agents"
+synth config path                    # Print config file path
+```
+
+Settable keys: `default_harness`, `default_agent_id`, `default_agent_mode`, `communication_mode`, `auto_approve_tools`. Hooks are edited directly in the JSON file.
+
+## Startup Context (`~/.synth/context.md`)
+
+Created alongside the global config on first run. This file is prepended to every agent's first prompt, giving it awareness of the Synth session:
+
+- Agent identity and parent
+- Visibility rules (text output vs inter-agent messaging)
+- Available MCP tools
+- Native subagent warning (use `launch_agent`, not `session/fork`)
+- Message delivery semantics
+
+Edit `~/.synth/context.md` to customize what agents know about your workflow. Set `on_agent_startup.active: false` in config to disable injection entirely.
+
+**Template slots in context.md:** `{agent_id}`, `{parent_id}`, `{task}`
+
+## Project Config (`.synth.json`)
+
+Optional. Create one to override global settings for a specific project:
+
+```json
+{
+  "project": "my-project",
+  "settings": {
+    "communication_mode": "MESH",
+    "auto_approve_tools": ["synth-mcp/send_message", "synth-mcp/list_agents"],
+    "hooks": {
+      "on_agent_join": { "active": true, "recipients": "mesh", "template": "Agent \"{agent_id}\" joined. Task: \"{task}\".", "kind": "system" }
+    }
+  }
+}
+```
+
+When `.synth.json` exists, its settings override global config. Fields not set in `.synth.json` fall through to global defaults.
 
 ### Settings
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `communication_mode` | `"MESH"` | `MESH` (all agents visible) or `LOCAL` (family only) |
-| `auto_approve_tools` | `[]` | Tool name patterns to auto-approve without prompting |
+| Field | Global Default | Description |
+|-------|---------------|-------------|
+| `communication_mode` | `"LOCAL"` | `MESH` (all agents visible) or `LOCAL` (family only) |
+| `auto_approve_tools` | `["synth-mcp"]` | Tool name patterns to auto-approve without prompting |
 
 ### Lifecycle Hooks
 
-Hooks fire at specific moments in an agent's lifecycle. They are configurable in `settings.hooks`.
+All hooks have an `active` field that controls whether they fire.
 
 #### `on_agent_startup`
 
-Fires on the first prompt to any config-defined or TUI-launched agent. Prepends context so the agent knows it's in a multi-agent session.
+Fires on the first prompt to every agent (root and dynamically launched children). Prepends the startup context from `~/.synth/context.md`.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `prepend` | *(identity + session awareness block)* | Text prepended to the agent's first prompt |
+| `active` | `true` | Whether to inject startup context |
 
-**Template slots:** `{agent_id}`
-
-#### `on_agent_prompt`
-
-Fires when a dynamically launched child agent receives its initial message from the parent. Prepends routing context so the child knows who it is and how to reply.
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `prepend` | *(routing context with agent_id, parent, reply_tool)* | Text prepended to the initial prompt |
-
-**Template slots:** `{agent_id}`, `{parent_id}`, `{task}`, `{message}`
+**Template slots in context.md:** `{agent_id}`, `{parent_id}`, `{task}`
 
 #### `on_agent_join`
 
-Fires when a dynamically launched agent is registered. Sends a templated message to the configured recipients.
+Fires when a dynamically launched agent is registered. Sends a templated message to other agents.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `recipients` | `"none"` | `none`, `parent`, `family`, or `mesh` |
+| `active` | `false` | Whether to send the notification |
+| `recipients` | `"parent"` | `parent`, `family`, or `mesh` |
 | `template` | `""` | Message body template |
 | `kind` | `"system"` | Message kind: `system` or `chat` |
 
 **Template slots:** `{agent_id}`, `{task}`, `{parent_id}`, `{sibling_ids}`
 
-**Recipient modes:**
-
-| Mode | Recipients |
-|------|-----------|
-| `none` | No message sent (default) |
-| `parent` | Direct parent only |
-| `family` | Parent + siblings (agents sharing the same parent) |
-| `mesh` | All visible agents |
-
 #### `on_agent_exit`
 
-Fires when an agent is terminated. Same fields and recipient modes as `on_agent_join`.
+Fires when an agent is terminated. Same fields as `on_agent_join`.
 
-#### Environment Variable Overrides
+## Config Resolution
 
-For quick experimentation without editing the config file:
+When you run `synth`, configuration is resolved in this order:
 
-| Env var | Overrides |
-|---------|-----------|
-| `SYNTH_JOIN_RECIPIENTS` | `settings.hooks.on_agent_join.recipients` |
-| `SYNTH_JOIN_TEMPLATE` | `settings.hooks.on_agent_join.template` |
-| `SYNTH_ROUTING_TEMPLATE` | `settings.hooks.on_agent_prompt.prepend` |
+| Priority | Source | What it provides |
+|----------|--------|-----------------|
+| 1 | `--harness` / `--agent-mode` / `--agent-id` flags | Agent to launch |
+| 2 | `.synth.json` in CWD | Project settings |
+| 3 | `~/.synth/config.json` `default_harness` | Agent to launch (if no flags) |
+| 4 | Single harness in PATH | Auto-detect agent |
+
+Settings resolution: project `.synth.json` fields override global config. Unset fields fall through to global defaults.
+
+## Harness-Specific Behavior
+
+### Agent Mode
+
+The `--agent-mode` flag has different semantics per harness:
+
+| Harness | `agent_mode` meaning | Example |
+|---------|---------------------|---------|
+| Kiro | Agent config name (passed as `--agent` CLI flag + `set_session_mode`) | `plan`, `code-planner` |
+| Claude Code | Agent name (passed as `_meta.claudeCode.options.agent` on session creation) | `local-SHScienceAgentKit-all:code-planner` |
+| OpenCode | Not supported | — |
+| Gemini CLI | Not supported | — |
+
+For Claude Code, plugin agents require the full qualified name: `<plugin-name>:<agent-name>`. User/project agents (in `~/.claude/agents/` or `.claude/agents/`) use just the agent name.
+
+### Config Options
+
+Synth dynamically renders configuration pickers based on what the harness advertises:
+
+| Harness | Available pickers |
+|---------|------------------|
+| Kiro | Mode (agents), Model |
+| Claude Code | Mode (permission), Model, Effort |
+| OpenCode | None |
+| Gemini CLI | None |
+
+The effort level picker appears only for models that support it (e.g., Opus, Sonnet). Switching to Haiku removes the effort picker automatically.
 
 ## Architecture
 
@@ -203,15 +217,17 @@ synth (single process: broker + TUI)
 │              ▼                           │
 │  SynthApp (Textual TUI)                  │
 └──────────────────────────────────────────┘
-     │ spawns N agent subprocesses via ACP
+     │ spawns agent subprocesses via ACP
      ▼
 ┌──────────┐  ┌──────────┐  ┌──────────┐
-│ kiro-cli │  │ kiro-cli │  │ claude   │
+│ kiro-cli │  │ claude   │  │ opencode │
 │   acp    │  │   acp    │  │   acp    │
 │ MCP:     │  │ MCP:     │  │ MCP:     │
 │ synth-mcp│  │ synth-mcp│  │ synth-mcp│
 └──────────┘  └──────────┘  └──────────┘
 ```
+
+One agent is launched on startup. Additional agents are spawned dynamically via `launch_agent`.
 
 Three layers with strict dependency rules:
 
@@ -230,11 +246,11 @@ Agents communicate via a bundled MCP server (`synth-mcp`) injected into every ag
 
 | Tool | Description |
 |------|-------------|
-| `send_message` | Send a message to another agent (the only inter-agent communication channel) |
-| `check_delivery` | Poll whether a sent message has been delivered |
+| `send_message` | Send a message to another agent |
 | `list_agents` | List all visible agents with their status, parent, and task |
 | `launch_agent` | Launch a new child agent |
 | `terminate_agent` | Terminate a child agent you previously launched |
+| `resurrect_agent` | Resurrect a previously terminated agent |
 | `get_my_context` | Get your identity, parent, task, and communication rules |
 
 Messages are delivered to idle agents between turns. Message kinds (`chat`, `request`, `response`) are formatted distinctly on delivery so agents can distinguish requests from responses.
@@ -268,8 +284,8 @@ Releases are published to PyPI via GitHub Actions when a version tag is pushed.
 # 1. Bump version in pyproject.toml
 # 2. Commit and tag
 git add pyproject.toml
-git commit -m "release: v0.2.0"
-git tag v0.2.0
+git commit -m "release: v0.3.1"
+git tag v0.3.1
 git push origin main --tags
 ```
 
@@ -280,6 +296,9 @@ Install from PyPI:
 
 ```bash
 uv pip install synth-acp
+
+# With semantic session search support
+uv pip install synth-acp[search]
 ```
 
 ## Security & Trust Model

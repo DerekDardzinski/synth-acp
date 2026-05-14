@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-from textual.geometry import Size
-from textual.widgets import RichLog, Static
+from textual.containers import VerticalScroll
+from textual.widgets import Static
 
+from synth_acp.models.agent import AgentConfig
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.app import SynthApp
+from synth_acp.ui.widgets.conversation import ConversationFeed
 from synth_acp.ui.widgets.diff_view import DiffView
-from synth_acp.ui.widgets.tool_call import ToolCallBlock, _extract_raw_output_text, _ReflowRichLog
+from synth_acp.ui.widgets.tool_call import ToolCallBlock, _extract_raw_output_text
 
 
 def _make_config() -> SessionConfig:
     return SessionConfig(
         project="test",
-        agents=[{"agent_id": "a1", "harness": "kiro"}],
     )
 
 
@@ -25,6 +26,7 @@ def _make_broker() -> MagicMock:
     broker = MagicMock()
     broker.handle = AsyncMock()
     broker.shutdown = AsyncMock()
+    broker._initial_agent = AgentConfig(agent_id="a1", harness="kiro")
 
     async def _events():
         return
@@ -34,7 +36,7 @@ def _make_broker() -> MagicMock:
     return broker
 
 
-async def _get_feed(app: SynthApp) -> object:
+async def _get_feed(app: SynthApp) -> ConversationFeed:
     """Select the first agent and return its ConversationFeed."""
     await app.select_agent("a1")
     return app._panels["a1"]
@@ -102,10 +104,10 @@ class TestToolCallBlockContent:
             assert len(loc_widgets) == 1
 
     async def test_tool_call_block_renders_raw_output_for_execute_kind(self) -> None:
-        """execute kind with raw_output produces a RichLog widget."""
+        """execute kind with raw_output produces a VerticalScroll widget."""
         block = ToolCallBlock("tc5", "Run", "execute", "completed", raw_output={"output": "hello"})
         widgets = block._raw_output_widgets({"output": "hello"})
-        assert any(isinstance(w, RichLog) for w in widgets)
+        assert any(isinstance(w, VerticalScroll) for w in widgets)
 
     async def test_tool_call_block_does_not_render_raw_output_for_read_kind(self) -> None:
         """raw_output with read kind is suppressed."""
@@ -127,36 +129,57 @@ class TestToolCallBlockContent:
         assert "hello world" in text
 
 
-class TestReflowRichLogResize:
-    def test_first_resize_records_width_without_clear_write(self) -> None:
-        """First resize (width 0 → 80) should record width, not clear+write."""
-        log = _ReflowRichLog()
-        log._source_content = "hello"
-        log._size_known = True
 
-        event = MagicMock()
-        event.size = Size(80, 24)
 
-        with patch.object(RichLog, "on_resize"), patch.object(log, "clear") as mock_clear, patch.object(log, "write") as mock_write:
-            log.on_resize(event)
+class TestToolCallBlockNested:
+    async def test_mount_nested_child_creates_section_on_first_call(self) -> None:
+        """First nested child triggers ExpandableSection creation."""
+        from synth_acp.ui.widgets.expandable_section import ExpandableSection
 
-        assert log._last_render_width == 80
-        mock_clear.assert_not_called()
-        mock_write.assert_not_called()
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)):
+            feed = await _get_feed(app)
+            await feed.add_tool_call("parent", "Agent task", "agent", "in_progress")
+            parent_block = app.query_one("#tool-parent", ToolCallBlock)
+            child = ToolCallBlock("child", "Read file", "read", "completed")
+            child.add_class("nested-tool-call")
+            await parent_block.mount_nested_child(child)
+            assert parent_block._nested_section is not None
+            assert isinstance(parent_block._nested_section, ExpandableSection)
+            assert child in parent_block._nested_section.content.query(ToolCallBlock)
 
-    def test_subsequent_resize_triggers_clear_write(self) -> None:
-        """Resize after first (width 80 → 120) should clear and re-render."""
-        log = _ReflowRichLog()
-        log._source_content = "hello"
-        log._size_known = True
-        log._last_render_width = 80
+    async def test_mount_nested_child_updates_preview(self) -> None:
+        """Preview updates to latest child's title."""
+        from textual.widgets import Static
 
-        event = MagicMock()
-        event.size = Size(120, 24)
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)):
+            feed = await _get_feed(app)
+            await feed.add_tool_call("parent", "Agent task", "agent", "in_progress")
+            parent_block = app.query_one("#tool-parent", ToolCallBlock)
+            child = ToolCallBlock("child", "Read file", "read", "completed")
+            await parent_block.mount_nested_child(child)
+            assert parent_block._nested_section is not None
+            preview = parent_block._nested_section.query_one("#es-preview", Static)
+            assert preview.content == "Read file"
 
-        with patch.object(RichLog, "on_resize"), patch.object(log, "clear") as mock_clear, patch.object(log, "write") as mock_write:
-            log.on_resize(event)
+    async def test_finalize_nested_sets_summary(self) -> None:
+        """Finalize sets activity=False and preview to summary."""
+        from textual.widgets import Static
 
-        assert log._last_render_width == 120
-        mock_clear.assert_called_once()
-        mock_write.assert_called_once_with("hello")
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)):
+            feed = await _get_feed(app)
+            await feed.add_tool_call("parent", "Agent task", "agent", "in_progress")
+            parent_block = app.query_one("#tool-parent", ToolCallBlock)
+            c1 = ToolCallBlock("c1", "Read", "read", "completed")
+            c2 = ToolCallBlock("c2", "Write", "edit", "completed")
+            await parent_block.mount_nested_child(c1)
+            await parent_block.mount_nested_child(c2)
+            parent_block.finalize_nested()
+            assert parent_block._nested_section is not None
+            preview = parent_block._nested_section.query_one("#es-preview", Static)
+            assert "2 tool calls" in str(preview.content)
+            from synth_acp.ui.widgets.gradient_bar import ActivityBar
+            bar = parent_block._nested_section.query_one(".es-activity", ActivityBar)
+            assert bar.active is False

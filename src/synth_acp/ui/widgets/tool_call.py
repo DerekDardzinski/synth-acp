@@ -2,70 +2,23 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
-from textual.containers import Vertical
+from rich.highlighter import ReprHighlighter
+from rich.text import Text
+from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
+from textual.css.query import NoMatches
 from textual.highlight import highlight
 from textual.lazy import Lazy
-from textual.widgets import Label, Markdown, RichLog, Rule, Static
+from textual.widgets import Label, Markdown, Rule, Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.widgets.copy_button import CopyButton
 from synth_acp.ui.widgets.diff_view import DiffView
+from synth_acp.ui.widgets.expandable_section import ExpandableSection
 
-_ANSI_RE = re.compile(r"\x1b\[[\d;]*[A-Za-z]")
-
-
-class _ReflowRichLog(RichLog):
-    """RichLog that re-renders content when the widget is resized.
-
-    Only reflows on *width* changes to avoid a layout oscillation bug:
-    ``clear()`` sets ``virtual_size`` to ``(0, 0)`` which can be observed
-    by an intermediate layout pass, collapsing the widget to height 0.
-    """
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._source_content: Any = None
-        self._last_render_width: int = 0
-        self._pending_write: Any = None
-
-    def write_reflow(self, content: Any) -> None:
-        """Write content and store it for reflow on resize."""
-        self._source_content = content
-        if self._dom_ready:
-            self.write(content)
-        else:
-            self._pending_write = content
-
-    @property
-    def _dom_ready(self) -> bool:
-        try:
-            return self.app is not None
-        except Exception:
-            return False
-
-    def on_mount(self) -> None:
-        if self._pending_write is not None:
-            self.write(self._pending_write)
-            self._pending_write = None
-
-    def on_resize(self, event: Any) -> None:
-        super().on_resize(event)
-        if (
-            self._source_content is not None
-            and self._size_known
-            and event.size.width != self._last_render_width
-        ):
-            if self._last_render_width == 0:
-                self._last_render_width = event.size.width
-                return
-            self._last_render_width = event.size.width
-            self.clear()
-            self.write(self._source_content)
-
+_HIGHLIGHTER = ReprHighlighter()
 
 TOOL_KIND_STYLE: dict[str, tuple[str, str]] = {
     "read": ("◎", "#3b82f6"),
@@ -184,6 +137,8 @@ class ToolCallBlock(Vertical, can_focus=False):
         self._raw_output_rendered = False
         self._text_rendered = False
         self._copyable_parts: list[str] = []
+        self._nested_section: ExpandableSection | None = None
+        self._nested_count: int = 0
 
     def _build_markup(self) -> Content:
         """Build the header as a Content object."""
@@ -243,7 +198,7 @@ class ToolCallBlock(Vertical, can_focus=False):
         """Build text content widget if applicable."""
         if not text_content or self._text_rendered:
             return []
-        if self._kind in {"execute", "search", "fetch"}:
+        if self._kind not in {"think", "other"}:
             return []
         self._text_rendered = True
         self._copyable_parts.append(text_content)
@@ -258,7 +213,7 @@ class ToolCallBlock(Vertical, can_focus=False):
             for d in diffs
         ]
 
-    def _raw_output_widgets(self, raw_output: Any) -> list[Rule | RichLog]:
+    def _raw_output_widgets(self, raw_output: Any) -> list[Rule | VerticalScroll]:
         """Build raw output widget for execute/search/fetch kinds."""
         if self._kind not in {"execute", "search", "fetch"}:
             return []
@@ -269,16 +224,13 @@ class ToolCallBlock(Vertical, can_focus=False):
             return []
         self._raw_output_rendered = True
         self._copyable_parts.append(text)
-        widgets: list[Rule | RichLog] = []
+        widgets: list[Rule | VerticalScroll] = []
         widgets.append(Rule(line_style="dashed", id="tc-output-sep"))
-        log = _ReflowRichLog(id="tc-raw-output", highlight=True, markup=False, max_lines=2000, wrap=True, min_width=0)
-        if _ANSI_RE.search(text):
-            from rich.text import Text
-
-            log.write_reflow(Text.from_ansi(text))
-        else:
-            log.write_reflow(text)
-        widgets.append(log)
+        rich_text = Text.from_ansi(text)
+        _HIGHLIGHTER.highlight(rich_text)
+        content = Content.from_rich_text(rich_text)
+        label = Label(content, id="tc-raw-output-label")
+        widgets.append(VerticalScroll(label, id="tc-raw-output"))
         exit_status = _extract_exit_status(raw_output)
         if exit_status is not None:
             exit_style = "success" if exit_status == 0 else "error"
@@ -293,7 +245,10 @@ class ToolCallBlock(Vertical, can_focus=False):
             status: New status string.
         """
         self._status = status
-        self.query_one("#tc-header", Static).update(self._build_markup())
+        try:
+            self.query_one("#tc-header", Static).update(self._build_markup())
+        except NoMatches:
+            pass
 
     async def update_content(
         self,
@@ -312,7 +267,7 @@ class ToolCallBlock(Vertical, can_focus=False):
             diffs: File edit diffs extracted from the tool call.
             text_content: Extracted text content from the tool call.
         """
-        widgets: list[Static | Label | Markdown | DiffView | RichLog | Rule] = []
+        widgets: list[Static | Label | Markdown | DiffView | VerticalScroll | Rule] = []
         widgets.extend(self._location_widgets(locations))
         widgets.extend(self._raw_input_widgets(raw_input))
         widgets.extend(self._text_widgets(text_content))
@@ -328,3 +283,28 @@ class ToolCallBlock(Vertical, can_focus=False):
                 self.query_one("#tc-output-sep").add_class(f"shell-exit-{self._exit_style}")
             except Exception:
                 pass
+
+    async def mount_nested_child(self, block: ToolCallBlock) -> None:
+        """Mount a nested tool call into the expandable section.
+
+        Creates the ExpandableSection on first call (lazy init, starts collapsed).
+        Updates preview to the new child's title. Increments nested count.
+        """
+        if self._nested_section is None:
+            section = ExpandableSection()
+            self._nested_section = section
+            await self.mount(section)
+            section.set_activity(True)
+        await self._nested_section.content.mount(block)
+        self._nested_section.set_preview(block._title)
+        self._nested_count += 1
+
+    def finalize_nested(self) -> None:
+        """Called when parent tool call completes.
+
+        Sets activity=False, preview to summary.
+        """
+        if self._nested_section is None:
+            return
+        self._nested_section.set_activity(False)
+        self._nested_section.set_preview(f"✓ {self._nested_count} tool calls")

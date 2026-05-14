@@ -56,8 +56,7 @@ class PermissionEngine:
         """Write a rule to both the in-memory cache and SQLite (async).
 
         Uses ``asyncio.to_thread`` with sync ``sqlite3`` to avoid blocking
-        the event loop without creating long-lived ``aiosqlite`` threads
-        that can hang on shutdown.
+        the event loop.
 
         Args:
             rule: The permission rule to persist.

@@ -60,8 +60,6 @@ async def mcp_factory(db_path: Path):
         return s
 
     yield _make
-    for s in servers:
-        await s.close_db()
 
 
 class TestSendMessage:
@@ -161,22 +159,21 @@ class TestMcpStartupValidation:
 
 class TestMcpConnectionSafety:
     async def test_send_message_closes_conn_on_visibility_error(self, db_path: Path, mcp_factory) -> None:
-        """Connection must survive when _get_visible_agents_async raises."""
+        """Connection must survive when get_visible_agents raises."""
         _register_agents(db_path, [("agent-a", None, None)])
         server = mcp_factory()
         send_message = _get_tool(server, "send_message")
 
         with patch(
-            "synth_acp.models.visibility.get_visible_agents_async",
+            "synth_acp.mcp.server.get_visible_agents",
             side_effect=RuntimeError("db corruption"),
         ), pytest.raises(RuntimeError, match="db corruption"):
             await send_message(to_agent="agent-b", body="hi")
 
         # Verify DB is still accessible — leaked fd would cause issues
-        import aiosqlite
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            await conn.execute("SELECT 1")
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("SELECT 1")
+        conn.close()
 
     async def test_list_agents_closes_conn_on_register_error(self, db_path: Path, mcp_factory) -> None:
         """Connection must survive when _ensure_registered raises."""
@@ -184,16 +181,14 @@ class TestMcpConnectionSafety:
         server = mcp_factory()
         list_agents = _get_tool(server, "list_agents")
 
-        # Force an error by corrupting the persistent connection after it's created
-        # First call succeeds and creates the connection
+        # Force an error by patching get_visible_agents to raise
         with patch(
-            "synth_acp.models.visibility.get_visible_agents_async",
+            "synth_acp.mcp.server.get_visible_agents",
             side_effect=RuntimeError("connect failed"),
         ), pytest.raises(RuntimeError, match="connect failed"):
             await list_agents()
 
         # Original DB still accessible
-        import aiosqlite
-
-        async with aiosqlite.connect(str(db_path)) as conn:
-            await conn.execute("SELECT 1")
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("SELECT 1")
+        conn.close()

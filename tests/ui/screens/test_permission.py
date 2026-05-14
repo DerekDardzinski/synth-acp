@@ -71,12 +71,12 @@ class TestPermissionBarEscape:
 
 def _make_app():
     """Create a SynthApp with mock broker for routing tests."""
+    from synth_acp.models.agent import AgentConfig
     from synth_acp.models.config import SessionConfig
     from synth_acp.ui.app import SynthApp
 
     config = SessionConfig(
         project="test",
-        agents=[{"agent_id": "a", "harness": "kiro"}],
     )
     broker = MagicMock()
     broker.handle = AsyncMock()
@@ -84,6 +84,7 @@ def _make_app():
     broker._pending_permissions = {}
     broker.is_permission_pending = MagicMock(return_value=False)
     broker.get_agent_parent = MagicMock(return_value=None)
+    broker._initial_agent = AgentConfig(agent_id="a", harness="kiro")
 
     async def _events():
         return

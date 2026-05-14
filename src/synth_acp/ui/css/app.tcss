@@ -112,9 +112,7 @@ ConversationFeed {
 .conv-scroll {
     height: 1fr;
     padding: 0 1;
-    scrollbar-size-vertical: 1;
-    scrollbar-color: $scrollbar;
-    scrollbar-background: transparent;
+    scrollbar-size-vertical: 0;
     align-vertical: bottom;
     /* hatch: right $panel 60%; */
 }
@@ -246,6 +244,12 @@ PromptTextArea {
     padding: 0 1;
     margin: 0 3 0 3;
 }
+PromptQueue PromptTextArea {
+    max-height: 8;
+    min-height: 1;
+    margin: 0;
+    scrollbar-size-vertical: 1;
+}
 
 .info-bar {
     height: auto;
@@ -281,18 +285,34 @@ PromptTextArea {
 .info-bar-picker:hover {
     color: $foreground;
 }
-#mode-picker-popup, #model-picker-popup {
-    dock: bottom;
-    width: 40;
+.config-picker-popup {
+    width: auto;
+    max-width: 40;
     max-height: 16;
-    margin: 0 0 6 0;
-    background: $surface;
-    border: round $accent;
+    background: $background;
+    border: heavy $surface-lighten-1;
     padding: 0;
     layer: overlay;
+    scrollbar-size-vertical: 1;
 }
-#mode-picker-popup:focus, #model-picker-popup:focus {
-    border: round $primary;
+.config-picker-popup:focus {
+    border: heavy $surface-lighten-1;
+    background-tint: transparent;
+}
+#file-picker-popup {
+    width: auto;
+    min-width: 40;
+    max-width: 80;
+    max-height: 15;
+    background: $background;
+    border: heavy $surface-lighten-1;
+    padding: 0;
+    layer: overlay;
+    scrollbar-size-vertical: 1;
+}
+#file-picker-popup:focus {
+    border: heavy $surface-lighten-1;
+    background-tint: transparent;
 }
 .info-bar-right {
     width: auto;
@@ -314,6 +334,10 @@ PromptTextArea {
 .cancel-btn:hover {
     color: $error;
     background: transparent;
+}
+#drain-btn {
+    display: none;
+    color: $accent;
 }
 
 /* ── Launch button ── */
@@ -411,9 +435,10 @@ LaunchAgentScreen, HelpScreen {
 
 #launch-container, #help-container {
     width: 60;
+    height: auto;
     max-height: 80%;
-    background: $surface;
-    border: round $primary;
+    background: $background;
+    border: heavy $surface-lighten-1;
     padding: 1 2;
     overflow-y: auto;
 }
@@ -439,9 +464,67 @@ LaunchAgentScreen, HelpScreen {
     width: 1fr;
 }
 
+#agent-option-list {
+    width: 1fr;
+    max-height: 10;
+    height: auto;
+    scrollbar-size-vertical: 1;
+}
+
 #launch-submit {
     width: 1fr;
     margin: 1 0 0 0;
+}
+
+/* ── Session Picker modal ── */
+SessionPickerScreen {
+    background: rgba(0, 0, 0, 0.65);
+    align: center middle;
+}
+
+#picker-container {
+    width: 70%;
+    height: 70%;
+    background: $background;
+    border: heavy $surface-lighten-1;
+    padding: 1 2;
+}
+
+#picker-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+    text-align: center;
+    width: 1fr;
+}
+
+#search-input {
+    width: 1fr;
+    margin: 0 0 1 0;
+    background: $background;
+}
+
+#session-table {
+    height: 1fr;
+    width: 1fr;
+    scrollbar-size-vertical: 1;
+}
+
+#session-table > .datatable--even-row {
+    background: $background;
+}
+
+#session-table > .datatable--odd-row {
+    background: $background-lighten-1;
+}
+
+#indexing-indicator {
+    color: $text-muted;
+    margin: 1 0 0 0;
+}
+
+#indexing-indicator.hidden {
+    display: none;
 }
 
 #help-bindings, #help-routing, #help-layout {
@@ -488,4 +571,10 @@ Terminal.-success {
 }
 Terminal.-error {
     border: panel $error 90%;
+}
+
+/* ── Nested tool calls ── */
+.nested-tool-call {
+    margin-left: 2;
+    margin-top: 1;
 }

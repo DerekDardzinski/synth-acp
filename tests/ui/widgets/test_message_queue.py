@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-from synth_acp.models.agent import AgentState
+from synth_acp.models.agent import AgentConfig, AgentState
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import (
     AgentStateChanged,
@@ -20,15 +20,19 @@ def _make_config(*agent_ids: str) -> SessionConfig:
     """Create a minimal SessionConfig."""
     return SessionConfig(
         project="test",
-        agents=[{"agent_id": aid, "harness": "kiro"} for aid in agent_ids],
     )
 
 
-def _make_broker() -> MagicMock:
+def _make_broker(*agent_ids: str) -> MagicMock:
     """Create a mock broker with async stubs."""
     broker = MagicMock()
     broker.handle = AsyncMock()
     broker.shutdown = AsyncMock()
+    first_id = agent_ids[0] if agent_ids else "agent-1"
+    broker._initial_agent = AgentConfig(agent_id=first_id, harness="kiro")
+    broker.get_agent_parent = MagicMock(return_value=None)
+    broker.get_agent_harness = MagicMock(return_value="kiro")
+    broker.get_agent_cwd = MagicMock(return_value=".")
 
     async def _events():
         return
@@ -41,7 +45,7 @@ def _make_broker() -> MagicMock:
 class TestThreadGrouping:
     async def test_thread_grouping_when_event_received_keys_by_sorted_pair(self) -> None:
         """McpMessageDelivered keyed by sorted agent pair, not arrival order."""
-        broker = _make_broker()
+        broker = _make_broker("a")
         config = _make_config("a", "b")
         app = SynthApp(broker, config)
 
@@ -54,7 +58,7 @@ class TestThreadGrouping:
 
     async def test_thread_grouping_when_same_pair_reversed_appends_to_existing(self) -> None:
         """Bidirectional messages between same pair share one thread."""
-        broker = _make_broker()
+        broker = _make_broker("a")
         config = _make_config("a", "b")
         app = SynthApp(broker, config)
 
@@ -71,12 +75,13 @@ class TestThreadGrouping:
 class TestEventBufferDrain:
     async def test_event_buffer_when_panel_created_drains_and_clears(self) -> None:
         """First panel creation drains buffered events and clears the buffer."""
-        broker = _make_broker()
+        broker = _make_broker("agent-1")
         config = _make_config("agent-1", "agent-2")
         app = SynthApp(broker, config)
 
         async with app.run_test(headless=True, size=(120, 40)):
             # Buffer events before panel exists (agent-2 has no panel yet)
+            app._event_buffers.setdefault("agent-2", [])
             events = [
                 MessageChunkReceived(agent_id="agent-2", chunk="hello "),
                 MessageChunkReceived(agent_id="agent-2", chunk="world"),
@@ -92,11 +97,14 @@ class TestEventBufferDrain:
 
     async def test_event_buffer_when_panel_exists_skips_buffer(self) -> None:
         """Events for agents with existing panels route directly, not buffered."""
-        broker = _make_broker()
+        broker = _make_broker("agent-1")
         config = _make_config("agent-1")
         app = SynthApp(broker, config)
 
         async with app.run_test(headless=True, size=(120, 40)):
+            # Pre-register so dynamic tile creation doesn't fire
+            from synth_acp.ui.app import DynamicAgentInfo
+            app._dynamic_agents["agent-1"] = DynamicAgentInfo(parent=None, task="", harness="kiro")
             # Create panel first
             await app.select_agent("agent-1")
             assert app._event_buffers["agent-1"] == []

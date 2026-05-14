@@ -73,6 +73,14 @@ class GradientBar(Widget):
         self._visual = GradientBarVisual(self._gradient)
         self.app.theme_changed_signal.subscribe(self, self._on_theme_changed)
 
+    def on_show(self) -> None:
+        """Resume animation timer when widget becomes visible."""
+        self.auto_refresh = 1 / 15
+
+    def on_hide(self) -> None:
+        """Pause animation timer when widget is hidden."""
+        self.auto_refresh = None
+
     def on_unmount(self) -> None:
         self.app.theme_changed_signal.unsubscribe(self)
 

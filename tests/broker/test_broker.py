@@ -11,7 +11,7 @@ from acp.schema import PermissionOption
 
 from synth_acp.acp.session import ACPSession
 from synth_acp.broker.broker import ACPBroker
-from synth_acp.models.agent import AgentState
+from synth_acp.models.agent import AgentConfig, AgentState
 from synth_acp.models.commands import (
     LaunchAgent,
     RespondPermission,
@@ -23,19 +23,19 @@ from synth_acp.models.events import BrokerError, BrokerEvent, PermissionRequeste
 from synth_acp.models.permissions import PermissionDecision
 
 
-def _make_config(*agent_ids: str) -> SessionConfig:
-    """Create a minimal SessionConfig with the given agent IDs."""
-    return SessionConfig(
-        project="test-session",
-        agents=[{"agent_id": aid, "harness": "kiro"} for aid in agent_ids],
-    )
+def _make_config() -> SessionConfig:
+    """Create a minimal SessionConfig."""
+    return SessionConfig(project="test-session")
 
 
 def _make_broker(*agent_ids: str, tmp_path: Path) -> ACPBroker:
     """Create a broker with a temp db."""
-    config = _make_config(*agent_ids)
+    config = _make_config()
+    first_id = agent_ids[0] if agent_ids else "agent-1"
+    initial_agent = AgentConfig(agent_id=first_id, harness="kiro")
     return ACPBroker(
         config=config,
+        initial_agent=initial_agent,
         db_path=tmp_path / "synth.db",
     )
 
@@ -156,7 +156,7 @@ class TestBrokerDispatch:
     async def test_set_agent_mode_when_idle_calls_session_set_mode(
         self, tmp_path: Path
     ) -> None:
-        """SetAgentMode must forward to session.set_mode() when agent is IDLE."""
+        """SetAgentMode must route through set_config_option to session."""
         broker = _make_broker("agent-1", tmp_path=tmp_path)
 
         session = ACPSession(
@@ -167,19 +167,17 @@ class TestBrokerDispatch:
             event_sink=broker._sink,
         )
         session._sm._state = AgentState.IDLE
-        session.set_mode = AsyncMock()  # type: ignore[method-assign]
+        session.set_config_option = AsyncMock()  # type: ignore[method-assign]
         broker._registry._sessions["agent-1"] = session
 
         await broker.handle(SetAgentMode(agent_id="agent-1", mode_id="architect"))
 
-        # The broker delegates to session — the call IS the contract.
-        # session.set_mode handles state transitions and event emission.
-        session.set_mode.assert_awaited_once_with("architect")
+        session.set_config_option.assert_awaited_once_with("mode", "architect")
 
     async def test_set_agent_mode_when_not_idle_emits_broker_error(
         self, tmp_path: Path
     ) -> None:
-        """SetAgentMode on a non-idle agent must emit BrokerError and not call set_mode."""
+        """SetAgentMode on a non-idle agent must emit BrokerError and not call set_config_option."""
         broker = _make_broker("agent-1", tmp_path=tmp_path)
         events: list[BrokerEvent] = []
         broker._sink = AsyncMock(side_effect=events.append)  # type: ignore[method-assign]
@@ -188,13 +186,59 @@ class TestBrokerDispatch:
             agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
         )
         session._sm._state = AgentState.TERMINATED
-        session.set_mode = AsyncMock()  # type: ignore[method-assign]
+        session.set_config_option = AsyncMock()  # type: ignore[method-assign]
         broker._registry._sessions["agent-1"] = session
 
         await broker.handle(SetAgentMode(agent_id="agent-1", mode_id="code"))
 
-        session.set_mode.assert_not_awaited()
+        session.set_config_option.assert_not_awaited()
         assert any(isinstance(e, BrokerError) for e in events)
+
+    async def test_set_agent_model_routes_through_set_config_option(
+        self, tmp_path: Path
+    ) -> None:
+        """SetAgentModel must route through set_config_option with config_id='model'."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=broker._sink,
+        )
+        session._sm._state = AgentState.IDLE
+        session.set_config_option = AsyncMock()  # type: ignore[method-assign]
+        broker._registry._sessions["agent-1"] = session
+
+        from synth_acp.models.commands import SetAgentModel
+
+        await broker.handle(SetAgentModel(agent_id="agent-1", model_id="claude-4"))
+
+        session.set_config_option.assert_awaited_once_with("model", "claude-4")
+
+    async def test_set_config_option_command_routes_to_lifecycle(
+        self, tmp_path: Path
+    ) -> None:
+        """SetConfigOption must route to lifecycle.set_config_option with all fields."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=broker._sink,
+        )
+        session._sm._state = AgentState.IDLE
+        session.set_config_option = AsyncMock()  # type: ignore[method-assign]
+        broker._registry._sessions["agent-1"] = session
+
+        from synth_acp.models.commands import SetConfigOption
+
+        await broker.handle(SetConfigOption(agent_id="agent-1", config_id="effort", value="high"))
+
+        session.set_config_option.assert_awaited_once_with("effort", "high")
 
 
 class TestBrokerUsageAccumulation:
@@ -227,8 +271,9 @@ class TestProcessCommands:
 
     async def _init_broker_db(self, broker: ACPBroker) -> None:
         """Initialize the broker DB with schema."""
+        from synth_acp.db import ensure_schema_sync
         lifecycle = await broker._ensure_lifecycle()
-        await lifecycle.register_agents()
+        await lifecycle._db_op(ensure_schema_sync)
 
     def _insert_command(
         self,
@@ -306,8 +351,6 @@ class TestProcessCommands:
         finally:
             if broker._message_bus:
                 await broker._message_bus.stop()
-            if broker._lifecycle:
-                await broker._lifecycle.close_db()
 
     async def test_process_commands_when_launch_with_unknown_harness_rejects(
         self, tmp_path: Path
@@ -338,8 +381,6 @@ class TestProcessCommands:
         finally:
             if broker._message_bus:
                 await broker._message_bus.stop()
-            if broker._lifecycle:
-                await broker._lifecycle.close_db()
 
     async def test_process_commands_when_terminate_by_non_parent_rejects(
         self, tmp_path: Path
@@ -369,8 +410,6 @@ class TestProcessCommands:
         finally:
             if broker._message_bus:
                 await broker._message_bus.stop()
-            if broker._lifecycle:
-                await broker._lifecycle.close_db()
 
     async def test_process_commands_when_at_capacity_rejects_with_error(
         self, tmp_path: Path
@@ -408,62 +447,8 @@ class TestProcessCommands:
         finally:
             if broker._message_bus:
                 await broker._message_bus.stop()
-            if broker._lifecycle:
-                await broker._lifecycle.close_db()
 
-    async def test_process_commands_when_agent_reaches_idle_sends_initial_message(
-        self, tmp_path: Path
-    ) -> None:
-        broker = _make_broker("orchestrator", tmp_path=tmp_path)
-        await self._init_broker_db(broker)
-        try:
-            await broker._start_message_bus()
-            await broker._ensure_lifecycle()
 
-            mock_session = AsyncMock()
-            mock_session.state = AgentState.IDLE
-            mock_session.run = AsyncMock()
-            mock_session.prompt = AsyncMock()
-
-            import json
-
-            payload = json.dumps(
-                {
-                    "agent_id": "worker-1",
-                    "agent_mode": "",
-                    "harness": "kiro",
-                    "cwd": ".",
-                    "task": "Fix auth",
-                    "message": "Start working on auth",
-                }
-            )
-            cmd_id = self._insert_command(broker, "orchestrator", "launch", payload)
-
-            with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_session):
-                await broker._process_commands([(cmd_id, "orchestrator", "launch", payload)])
-
-            assert broker._message_bus is not None
-            assert broker._message_bus._pending_raw.get("worker-1") is not None
-
-            from synth_acp.models.events import AgentStateChanged
-
-            broker._registry._sessions["worker-1"] = mock_session
-            await broker._sink(
-                AgentStateChanged(
-                    agent_id="worker-1",
-                    old_state=AgentState.INITIALIZING,
-                    new_state=AgentState.IDLE,
-                )
-            )
-            await asyncio.sleep(0)
-
-            mock_session.prompt.assert_awaited_once()
-            assert broker._message_bus._pending_raw.get("worker-1") is None
-        finally:
-            if broker._message_bus:
-                await broker._message_bus.stop()
-            if broker._lifecycle:
-                await broker._lifecycle.close_db()
 
     async def test_join_broadcast_when_agent_registered_sends_to_visible_agents(
         self, tmp_path: Path
@@ -475,10 +460,10 @@ class TestProcessCommands:
 
         config = SessionConfig(
             project="test-session",
-            agents=[{"agent_id": "orchestrator", "harness": "kiro"}],
             settings=SettingsConfig(communication_mode=CommunicationMode.LOCAL),
         )
-        broker = ACPBroker(config=config, db_path=tmp_path / "synth.db")
+        initial_agent = AgentConfig(agent_id="orchestrator", harness="kiro")
+        broker = ACPBroker(config=config, initial_agent=initial_agent, db_path=tmp_path / "synth.db")
         await self._init_broker_db(broker)
         try:
 
@@ -521,8 +506,6 @@ class TestProcessCommands:
         finally:
             if broker._message_bus:
                 await broker._message_bus.stop()
-            if broker._lifecycle:
-                await broker._lifecycle.close_db()
 
 
 class TestRelaunchTerminatedAgent:
@@ -550,7 +533,7 @@ class TestRelaunchTerminatedAgent:
 
         try:
             with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_session):
-                await broker.handle(LaunchAgent(agent_id="agent-1"))
+                await broker.handle(LaunchAgent(agent_id="agent-1", config=AgentConfig(agent_id="agent-1", harness="kiro")))
 
             # New session replaced the old one
             assert broker._registry._sessions["agent-1"] is mock_session
@@ -559,17 +542,14 @@ class TestRelaunchTerminatedAgent:
         finally:
             if broker._message_bus:
                 await broker._message_bus.stop()
-            if broker._lifecycle:
-                await broker._lifecycle.close_db()
 
 
 class TestSelfTerminate:
-    async def test_two_pending_messages_before_idle_both_delivered(self, tmp_path: Path) -> None:
-        """Two messages enqueued before IDLE must both appear in the prompt.
-        Catches the old dict-overwrite bug where only the last message survived."""
+    async def test_two_pending_messages_before_idle_wake_event_set(self, tmp_path: Path) -> None:
+        """Two messages enqueued before IDLE — _sink must wake the bus (not deliver directly)."""
         broker = _make_broker("agent-1", tmp_path=tmp_path)
         await broker._start_message_bus()
-        lifecycle = await broker._ensure_lifecycle()
+        await broker._ensure_lifecycle()
 
         session = ACPSession(
             agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
@@ -592,27 +572,25 @@ class TestSelfTerminate:
                     new_state=AgentState.IDLE,
                 )
             )
-            await asyncio.sleep(0)
 
-            session.prompt.assert_awaited_once()
-            prompt_text = session.prompt.call_args[0][0]
-            assert "msg1" in prompt_text
-            assert "msg2" in prompt_text
+            # _sink only wakes the bus — does not deliver directly
+            assert broker._message_bus._wake_event.is_set()
+            # Messages still in pending (bus loop delivers them)
+            assert broker._message_bus._pending.get("agent-1") is not None
         finally:
             await broker._message_bus.stop()
-            await lifecycle.close_db()
 
 
 class TestShutdownOrdering:
     async def test_shutdown_phases_in_order(self, tmp_path: Path) -> None:
-        """Shutdown must call lifecycle.shutdown() → message_bus.stop() → lifecycle.close_db().
+        """Shutdown must call lifecycle.shutdown() → message_bus.stop() → flush.
         Wrong ordering causes zombie DB connections or writes after close."""
         broker = _make_broker("agent-1", tmp_path=tmp_path)
         call_log: list[str] = []
 
         mock_lifecycle = AsyncMock()
         mock_lifecycle.shutdown = AsyncMock(side_effect=lambda: call_log.append("lifecycle.shutdown"))
-        mock_lifecycle.close_db = AsyncMock(side_effect=lambda: call_log.append("lifecycle.close_db"))
+        mock_lifecycle.journal_ui_events = AsyncMock()
         broker._lifecycle = mock_lifecycle
 
         mock_bus = AsyncMock()
@@ -621,7 +599,7 @@ class TestShutdownOrdering:
 
         await broker.shutdown()
 
-        assert call_log == ["lifecycle.shutdown", "bus.stop", "lifecycle.close_db"]
+        assert call_log == ["lifecycle.shutdown", "bus.stop"]
 
 
 class TestEventQueueBackpressure:
@@ -654,3 +632,162 @@ class TestEventQueueBackpressure:
         )
         assert broker._event_queue.qsize() == 2  # filled back up
 
+
+
+class TestSinkLockGuard:
+    async def test_sink_idle_handler_wakes_message_bus(self, tmp_path: Path) -> None:
+        """_sink IDLE handler must only call wake() — no pop_pending, no prompt."""
+        from unittest.mock import MagicMock
+
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+
+        mock_session = AsyncMock()
+        mock_session.state = AgentState.IDLE
+        mock_session.agent_id = "agent-1"
+        broker._registry.register("agent-1", mock_session)
+
+        mock_bus = MagicMock()
+        broker._message_bus = mock_bus
+
+        mock_lifecycle = AsyncMock()
+        broker._lifecycle = mock_lifecycle
+
+        from synth_acp.models.events import AgentStateChanged
+
+        event = AgentStateChanged(agent_id="agent-1", new_state=AgentState.IDLE, old_state=AgentState.BUSY)
+        await broker._sink(event)
+
+        mock_bus.wake.assert_called_once_with("agent-1")
+        mock_bus.pop_pending.assert_not_called()
+        mock_lifecycle.prompt.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Race condition reproducer: permission flush active-slot race
+# ---------------------------------------------------------------------------
+
+
+class TestPermissionFlushActiveSlotRace:
+    """Verify that _flush_permission_queue holds the active slot during auto-resolve awaits."""
+
+    async def test_flush_permission_queue_overwrites_active_slot_set_by_concurrent_sink(
+        self, tmp_path: Path,
+    ) -> None:
+        """During flush's auto-resolve await, a new PermissionRequested via _sink
+        must NOT be able to claim the active slot."""
+        from synth_acp.models.events import PermissionAutoResolved, PermissionRequested
+
+        config = SessionConfig(project="t")
+        initial = AgentConfig(agent_id="a1", harness="kiro")
+        broker = ACPBroker(config=config, initial_agent=initial, db_path=tmp_path / "synth.db")
+
+        session = AsyncMock()
+        session.resolve_permission = lambda _rid, _oid: None
+        broker._registry._sessions["a1"] = session
+
+        object.__setattr__(broker._config.settings, "auto_approve_tools", ("Tool first",))
+
+        first = PermissionRequested(
+            agent_id="a1",
+            request_id="first",
+            title="Tool first",
+            kind="execute",
+            options=[
+                PermissionOption(kind="allow_once", option_id="first-allow", name="Allow"),
+                PermissionOption(kind="reject_once", option_id="first-reject", name="Reject"),
+            ],
+        )
+        second = PermissionRequested(
+            agent_id="a1",
+            request_id="second",
+            title="Tool second",
+            kind="execute",
+            options=[
+                PermissionOption(kind="allow_once", option_id="second-allow", name="Allow"),
+                PermissionOption(kind="reject_once", option_id="second-reject", name="Reject"),
+            ],
+        )
+        broker._pending_permissions[first.request_id] = first
+        broker._pending_permissions[second.request_id] = second
+        broker._permission_queue["a1"] = [first, second]
+        broker._permission_counter["a1"] = (1, 2)
+
+        real_put = broker._event_queue.put
+        auto_resolved_put_started = asyncio.Event()
+        auto_resolved_put_unblock = asyncio.Event()
+
+        async def gated_put(event: BrokerEvent) -> None:
+            if isinstance(event, PermissionAutoResolved):
+                auto_resolved_put_started.set()
+                await auto_resolved_put_unblock.wait()
+            await real_put(event)
+
+        broker._event_queue.put = gated_put  # type: ignore[method-assign]
+
+        flush_task = asyncio.create_task(broker._flush_permission_queue("a1"))
+        await asyncio.wait_for(auto_resolved_put_started.wait(), timeout=1.0)
+
+        concurrent = PermissionRequested(
+            agent_id="a1",
+            request_id="concurrent",
+            title="Tool concurrent",
+            kind="execute",
+            options=[
+                PermissionOption(kind="allow_once", option_id="concurrent-allow", name="Allow"),
+                PermissionOption(kind="reject_once", option_id="concurrent-reject", name="Reject"),
+            ],
+        )
+        await broker._sink(concurrent)
+
+        assert broker._active_permission.get("a1") == "first"
+        assert concurrent in broker._permission_queue.get("a1", [])
+
+        auto_resolved_put_unblock.set()
+        await flush_task
+
+        assert broker._active_permission.get("a1") == "second"
+        assert broker._permission_queue.get("a1") == [concurrent]
+
+
+class TestListRestorableSessions:
+    async def test_list_restorable_sessions_returns_enriched_fields(self, tmp_path: Path) -> None:
+        """list_restorable_sessions must return cwd, tasks, first_messages."""
+        import json
+        import sqlite3
+
+        from synth_acp.db import ensure_schema_sync
+
+        db_path = tmp_path / "synth.db"
+        conn = sqlite3.connect(str(db_path))
+        ensure_schema_sync(conn)
+
+        # Root agent with cwd
+        conn.execute(
+            "INSERT INTO agents (agent_id, session_id, status, registered, cwd, task) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("root", "sess-1", "restorable", 1000, "/home/user/project", "build feature"),
+        )
+        # Child agent (terminated — should still appear in agents list)
+        conn.execute(
+            "INSERT INTO agents (agent_id, session_id, status, registered, task) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("child", "sess-1", "terminated", 2000, "fix tests"),
+        )
+        # UserPromptSubmitted events
+        for i, text in enumerate(["hello world", "do the thing", "third msg", "fourth"]):
+            payload = json.dumps({"agent_id": "root", "text": text})
+            conn.execute(
+                "INSERT INTO ui_events (session_id, agent_id, seq, event_type, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("sess-1", "root", i, "UserPromptSubmitted", payload, 1000 + i),
+            )
+        conn.commit()
+        conn.close()
+
+        results = await ACPBroker.list_restorable_sessions(db_path)
+        assert len(results) == 1
+        sess = results[0]
+        assert set(sess["agents"]) == {"root", "child"}
+        assert sess["cwd"] == "/home/user/project"
+        assert sess["tasks"] == ["build feature", "fix tests"]
+        assert sess["first_messages"] == ["hello world", "do the thing", "third msg"]

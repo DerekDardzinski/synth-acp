@@ -21,6 +21,7 @@ from acp.schema import (
     AllowedOutcome,
     AvailableCommandsUpdate,
     ClientCapabilities,
+    ConfigOptionUpdate,
     CreateTerminalResponse,
     CurrentModeUpdate,
     DeniedOutcome,
@@ -32,6 +33,9 @@ from acp.schema import (
     PermissionOption,
     ReleaseTerminalResponse,
     RequestPermissionResponse,
+    SessionConfigOptionBoolean,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
     SessionNotification,
     TerminalExitStatus,
     TerminalOutputResponse,
@@ -61,6 +65,8 @@ from synth_acp.models.events import (
     AvailableCommandsReceived,
     BrokerError,
     BrokerEvent,
+    ConfigOptionChanged,
+    ConfigOptionsReceived,
     MessageChunkReceived,
     PermissionRequested,
     PlanReceived,
@@ -147,6 +153,8 @@ class ACPSession:
         event_sink: EventSink,
         mcp_servers: list[McpServerStdio] | None = None,
         agent_mode: str | None = None,
+        env: dict[str, str] | None = None,
+        agent_mode_target: str | None = None,
     ) -> None:
         self.agent_id = agent_id
         self._sm = AgentStateMachine(agent_id, self._on_state_transition)
@@ -161,10 +169,14 @@ class ACPSession:
         self._permission_futures: dict[str, asyncio.Future[str]] = {}
         self._capabilities: Any = None
         self._agent_mode = agent_mode
+        self._agent_mode_target = agent_mode_target
+        self._env = env
         self._available_modes: list[AgentMode] = []
         self._current_mode_id: str | None = None
         self._available_models: list[AgentModel] = []
         self._current_model_id: str | None = None
+        self._config_options: list[SessionConfigOptionSelect | SessionConfigOptionBoolean] = []
+        self._has_native_config_options: bool = False
         self._suppress_history_replay: bool = False
         self._accumulator = SessionAccumulator()
         self._unsubscribe: Callable[[], None] = self._accumulator.subscribe(self._on_snapshot)
@@ -172,6 +184,7 @@ class ACPSession:
         self._terminals: dict[str, TerminalProcess] = {}
         self._terminal_count: int = 0
         self._on_session_created: Callable[[str, str], Awaitable[None]] | None = None
+        self._shutting_down: bool = False
 
     @property
     def state(self) -> AgentState:
@@ -214,11 +227,60 @@ class ACPSession:
         """Register a callback invoked after new_session() returns."""
         self._on_session_created = cb
 
+    async def _capture_config_options(self, session: Any) -> None:
+        """Capture native config_options or synthesize from modes/models.
+
+        Called after new_session/load_session. Emits ConfigOptionsReceived.
+        """
+        if session.config_options is not None:
+            self._config_options = list(session.config_options)
+            self._has_native_config_options = True
+        else:
+            options: list[SessionConfigOptionSelect | SessionConfigOptionBoolean] = []
+            if self._available_modes:
+                options.append(
+                    SessionConfigOptionSelect(
+                        id="mode",
+                        name="Mode",
+                        category="mode",
+                        type="select",
+                        current_value=self._current_mode_id or "",
+                        options=[
+                            SessionConfigSelectOption(name=m.name, value=m.id)
+                            for m in self._available_modes
+                        ],
+                    )
+                )
+            if self._available_models:
+                options.append(
+                    SessionConfigOptionSelect(
+                        id="model",
+                        name="Model",
+                        category="model",
+                        type="select",
+                        current_value=self._current_model_id or "",
+                        options=[
+                            SessionConfigSelectOption(name=m.name, value=m.id)
+                            for m in self._available_models
+                        ],
+                    )
+                )
+            self._config_options = options
+            self._has_native_config_options = False
+
+        if self._config_options:
+            await self._event_sink(
+                ConfigOptionsReceived(
+                    agent_id=self.agent_id,
+                    config_options=self._config_options,
+                )
+            )
+
     async def run(self) -> None:
         """Main lifecycle — spawns agent, handshakes, waits for exit."""
         try:
             await self._sm.transition(AgentState.INITIALIZING)
-            async with _spawn_isolated_agent(self, self._binary, *self._args, cwd=self._cwd) as (
+            async with _spawn_isolated_agent(self, self._binary, *self._args, cwd=self._cwd, env=self._env) as (
                 conn,
                 proc,
             ):
@@ -234,7 +296,10 @@ class ACPSession:
                     client_info=Implementation(name="synth", version="0.1.0"),
                 )
                 self._capabilities = getattr(init_response, "agent_capabilities", None)
-                session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers)
+                new_session_kwargs: dict[str, Any] = {}
+                if self._agent_mode_target == "meta_agent" and self._agent_mode:
+                    new_session_kwargs["claudeCode"] = {"options": {"agent": self._agent_mode}}
+                session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers, **new_session_kwargs)
                 self._session_id = session.session_id
 
                 if self._on_session_created:
@@ -279,7 +344,7 @@ class ACPSession:
                     )
 
                 # Apply agent_mode from config if advertised
-                if self._agent_mode is not None:
+                if self._agent_mode is not None and self._agent_mode_target != "meta_agent":
                     mode_ids = {m.id for m in self._available_modes}
                     if self._agent_mode in mode_ids:
                         await conn.set_session_mode(
@@ -318,6 +383,7 @@ class ACPSession:
                             self.agent_id,
                         )
 
+                await self._capture_config_options(session)
                 await self._sm.transition(AgentState.IDLE)
                 await proc.wait()
         except InvalidTransitionError as e:
@@ -333,6 +399,13 @@ class ACPSession:
             await self._event_sink(BrokerError(agent_id=self.agent_id, message=f"Agent error: {e}"))
 
         finally:
+            self._shutting_down = True
+            for task in self._pending_emissions:
+                if not task.done():
+                    task.cancel()
+            if self._pending_emissions:
+                await asyncio.wait(self._pending_emissions, timeout=1.0)
+            self._pending_emissions.clear()
             for t in self._terminals.values():
                 t.kill()
                 if t._task is not None and not t._task.done():
@@ -364,7 +437,7 @@ class ACPSession:
         """
         try:
             await self._sm.transition(AgentState.INITIALIZING)
-            async with _spawn_isolated_agent(self, self._binary, *self._args, cwd=self._cwd) as (
+            async with _spawn_isolated_agent(self, self._binary, *self._args, cwd=self._cwd, env=self._env) as (
                 conn,
                 proc,
             ):
@@ -406,7 +479,10 @@ class ACPSession:
                         )
                     )
                     self._accumulator.reset()
-                    session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers)
+                    new_session_kwargs: dict[str, Any] = {}
+                    if self._agent_mode_target == "meta_agent" and self._agent_mode:
+                        new_session_kwargs["claudeCode"] = {"options": {"agent": self._agent_mode}}
+                    session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers, **new_session_kwargs)
                     self._session_id = session.session_id
                     if self._on_session_created:
                         await self._on_session_created(self.agent_id, session.session_id)
@@ -441,6 +517,7 @@ class ACPSession:
                 # Apply configured agent_mode if it differs from the restored mode
                 if (
                     self._agent_mode is not None
+                    and self._agent_mode_target != "meta_agent"
                     and self._agent_mode != self._current_mode_id
                     and self._agent_mode in {m.id for m in self._available_modes}
                 ):
@@ -471,6 +548,7 @@ class ACPSession:
                         )
                     )
 
+                await self._capture_config_options(session)
                 await self._sm.transition(AgentState.IDLE)
                 await proc.wait()
         except InvalidTransitionError as e:
@@ -485,6 +563,13 @@ class ACPSession:
             log.error("Session %s raised unexpectedly", self.agent_id, exc_info=True)
             await self._event_sink(BrokerError(agent_id=self.agent_id, message=f"Agent error: {e}"))
         finally:
+            self._shutting_down = True
+            for task in self._pending_emissions:
+                if not task.done():
+                    task.cancel()
+            if self._pending_emissions:
+                await asyncio.wait(self._pending_emissions, timeout=1.0)
+            self._pending_emissions.clear()
             for t in self._terminals.values():
                 t.kill()
                 if t._task is not None and not t._task.done():
@@ -522,6 +607,9 @@ class ACPSession:
             )
         finally:
             if self.state == AgentState.BUSY:
+                await self._sm.transition(AgentState.IDLE)
+            elif self.state == AgentState.AWAITING_PERMISSION and not self._permission_futures:
+                await self._sm.transition(AgentState.BUSY)
                 await self._sm.transition(AgentState.IDLE)
 
     async def set_mode(self, mode_id: str) -> None:
@@ -597,6 +685,103 @@ class ACPSession:
                 if self.state == AgentState.CONFIGURING:
                     await self._sm.transition(AgentState.IDLE)
 
+    async def set_config_option(self, config_id: str, value: str | bool) -> None:
+        """Switch a session config option.
+
+        Precondition: state must be IDLE.
+        State transitions: IDLE → CONFIGURING → IDLE (in finally block).
+        """
+        if not self._conn or not self._session_id:
+            return
+        if self.state != AgentState.IDLE:
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=f"Cannot change config while {self.state}",
+                    severity="warning",
+                )
+            )
+            return
+
+        await self._sm.transition(AgentState.CONFIGURING)
+        try:
+            if self._has_native_config_options:
+                try:
+                    resp = await self._conn.set_config_option(
+                        config_id, self._session_id, value
+                    )
+                except Exception as exc:
+                    log.warning("set_config_option failed for %s: %s", self.agent_id, exc)
+                    await self._event_sink(
+                        BrokerError(
+                            agent_id=self.agent_id,
+                            message=f"Failed to set {config_id}={value}: {exc}",
+                            severity="warning",
+                        )
+                    )
+                    return
+                self._config_options = list(resp.config_options)
+                await self._event_sink(
+                    ConfigOptionsReceived(
+                        agent_id=self.agent_id, config_options=self._config_options
+                    )
+                )
+            elif config_id == "mode":
+                await self._conn.set_session_mode(
+                    mode_id=value, session_id=self._session_id
+                )
+                if self._current_model_id:
+                    await self._conn.set_session_model(
+                        model_id=self._current_model_id,
+                        session_id=self._session_id,
+                    )
+                await self._restore_mcp_servers()
+                self._current_mode_id = str(value)
+                for opt in self._config_options:
+                    if opt.id == "mode":
+                        self._config_options[self._config_options.index(opt)] = (
+                            opt.model_copy(update={"current_value": value})
+                        )
+                        break
+                await self._event_sink(
+                    AgentModeChanged(agent_id=self.agent_id, mode_id=str(value))
+                )
+                await self._event_sink(
+                    ConfigOptionChanged(
+                        agent_id=self.agent_id, config_id=config_id, value=value
+                    )
+                )
+            elif config_id == "model":
+                await self._conn.set_session_model(
+                    model_id=value, session_id=self._session_id
+                )
+                self._current_model_id = str(value)
+                for opt in self._config_options:
+                    if opt.id == "model":
+                        self._config_options[self._config_options.index(opt)] = (
+                            opt.model_copy(update={"current_value": value})
+                        )
+                        break
+                await self._event_sink(
+                    AgentModelChanged(agent_id=self.agent_id, model_id=str(value))
+                )
+                await self._event_sink(
+                    ConfigOptionChanged(
+                        agent_id=self.agent_id, config_id=config_id, value=value
+                    )
+                )
+            else:
+                await self._event_sink(
+                    BrokerError(
+                        agent_id=self.agent_id,
+                        message=f"Unknown config option: {config_id}",
+                        severity="warning",
+                    )
+                )
+        finally:
+            if self.state == AgentState.CONFIGURING:
+                await self._sm.transition(AgentState.IDLE)
+
     @property
     def available_modes(self) -> list[AgentMode]:
         """Return a copy of available modes, or [] if none received."""
@@ -661,6 +846,8 @@ class ACPSession:
         accumulator.apply(). UsageUpdate bypasses the accumulator because
         SessionAccumulator silently ignores it.
         """
+        if self._shutting_down:
+            return
         if session_id != self._session_id:
             return
 
@@ -770,6 +957,11 @@ class ACPSession:
                 [item.type for item in (update.content or [])],
                 update.field_meta,
             )
+            parent_tool_call_id: str | None = None
+            if update.field_meta:
+                claude_meta = update.field_meta.get("claudeCode", {})
+                if isinstance(claude_meta, dict):
+                    parent_tool_call_id = claude_meta.get("parentToolUseId")
             default_status = "pending" if isinstance(update, ToolCallStart) else "in_progress"
             diffs: list[ToolCallDiff] = []
             text_parts: list[str] = []
@@ -808,6 +1000,7 @@ class ACPSession:
                     raw_input=update.raw_input,
                     raw_output=update.raw_output,
                     terminal_id=terminal_id,
+                    parent_tool_call_id=parent_tool_call_id,
                 )
             )
         elif isinstance(update, CurrentModeUpdate):
@@ -815,6 +1008,19 @@ class ACPSession:
             if mode_id is not None:
                 self._current_mode_id = mode_id
                 await self._event_sink(AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id))
+        elif isinstance(update, ConfigOptionUpdate):
+            old_values = {opt.id: opt.current_value for opt in self._config_options}
+            self._config_options = list(update.config_options)
+            for opt in self._config_options:
+                old_val = old_values.get(opt.id)
+                if old_val != opt.current_value:
+                    await self._event_sink(
+                        ConfigOptionChanged(
+                            agent_id=self.agent_id,
+                            config_id=opt.id,
+                            value=opt.current_value,
+                        )
+                    )
         elif isinstance(update, AgentPlanUpdate):
             await self._event_sink(
                 PlanReceived(agent_id=self.agent_id, entries=list(update.entries))

@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from acp.schema import PermissionOption
+from acp.schema import (
+    PermissionOption,
+    SessionConfigOptionBoolean,
+    SessionConfigOptionSelect,
+)
 from pydantic import BaseModel, Field
 
 from synth_acp.models.agent import AgentMode, AgentModel, AgentState
@@ -78,6 +82,7 @@ class ToolCallUpdated(BrokerEvent):
     diffs: list[ToolCallDiff] = Field(default_factory=list)
     text_content: str | None = None
     terminal_id: str | None = None
+    parent_tool_call_id: str | None = None
 
 
 class BrokerError(BrokerEvent):
@@ -146,6 +151,13 @@ class HookFired(BrokerEvent):
     hook_name: str
 
 
+class McpMessageHeld(BrokerEvent):
+    """An MCP message was held (not delivered) because delivery is on hold."""
+
+    from_agent: str
+    preview: str
+
+
 class InitialPromptDelivered(BrokerEvent):
     """The initial message from a parent was delivered to a launched agent."""
 
@@ -191,6 +203,19 @@ class AgentModelChanged(BrokerEvent):
     """
 
     model_id: str
+
+
+class ConfigOptionsReceived(BrokerEvent):
+    """Emitted once after session creation with native or synthesized config options."""
+
+    config_options: list[SessionConfigOptionSelect | SessionConfigOptionBoolean]
+
+
+class ConfigOptionChanged(BrokerEvent):
+    """Emitted after a successful config option change or from a ConfigOptionUpdate push notification."""
+
+    config_id: str
+    value: str | bool
 
 
 class PlanReceived(BrokerEvent):
@@ -245,11 +270,12 @@ type AgentEvent = (
 
 type ConfigEvent = (
     AgentModesReceived | AgentModeChanged | AgentModelsReceived | AgentModelChanged
+    | ConfigOptionsReceived | ConfigOptionChanged
 )
 
 type SystemEvent = (
     BrokerError | PermissionRequested | PermissionAutoResolved
-    | UsageUpdated | McpMessageDelivered | HookFired | InitialPromptDelivered
+    | UsageUpdated | McpMessageDelivered | McpMessageHeld | HookFired | InitialPromptDelivered
     | SessionRestoreComplete | UserPromptSubmitted
 )
 

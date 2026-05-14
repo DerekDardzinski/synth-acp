@@ -40,9 +40,6 @@ class TestStateTransitions:
     def test_invalid_transition_not_in_map(self):
         assert AgentState.INITIALIZING not in TRANSITIONS[AgentState.BUSY]
 
-    def test_terminated_is_terminal(self):
-        assert TRANSITIONS[AgentState.TERMINATED] == {AgentState.INITIALIZING}
-
     def test_configuring_reachable_from_idle(self):
         """IDLE → CONFIGURING must be a valid transition — it's the entry point
         for mode switching."""

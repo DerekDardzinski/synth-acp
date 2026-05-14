@@ -2,38 +2,36 @@
 
 from __future__ import annotations
 
-import asyncio
 import atexit
+import json
 import logging
 import os
 import shutil
 import sys
 import threading
 from pathlib import Path
-from typing import Any
 
 import typer
 
-from synth_acp.broker.broker import ACPBroker
+from synth_acp.discovery import discover_agents
 from synth_acp.harnesses import load_harness_registry
-from synth_acp.models.commands import LaunchAgent, RespondPermission, SendPrompt
+from synth_acp.models.agent import AgentConfig
 from synth_acp.models.config import (
+    GLOBAL_CONFIG_PATH,
+    CommunicationMode,
+    GlobalConfig,
     HarnessEntry,
+    HooksConfig,
+    MessageHook,
+    RawSessionConfig,
     SessionConfig,
+    SettingsConfig,
+    StartupHookConfig,
+    ensure_synth_dir,
     find_config,
     load_config,
-    write_json_config,
-)
-from synth_acp.models.events import (
-    AgentStateChanged,
-    BrokerError,
-    BrokerEvent,
-    McpMessageDelivered,
-    MessageChunkReceived,
-    PermissionAutoResolved,
-    PermissionRequested,
-    ToolCallUpdated,
-    TurnComplete,
+    load_global_config,
+    save_global_config,
 )
 
 log = logging.getLogger(__name__)
@@ -53,125 +51,75 @@ atexit.register(_force_exit_if_threads_linger)
 
 app = typer.Typer(invoke_without_command=True)
 
+SETTABLE_KEYS: dict[str, str] = {
+    "default_harness": "Default harness for new sessions",
+    "default_agent_id": "Default agent ID when launching with a harness",
+    "default_agent_mode": "Default agent mode (e.g. code, plan, chat)",
+    "communication_mode": "Agent visibility mode (MESH or LOCAL)",
+    "auto_approve_tools": "Comma-separated tool patterns to auto-approve",
+}
 
-# ------------------------------------------------------------------
-# Input parsing (preserved from original)
-# ------------------------------------------------------------------
-
-
-def parse_input(text: str, default_agent: str | None) -> tuple[str, str] | None:
-    """Parse user input into (agent_id, message) or None for commands.
-
-    Args:
-        text: Raw user input.
-        default_agent: Currently selected default agent, or None.
-
-    Returns:
-        Tuple of (agent_id, message) for prompt commands, None for /select.
-
-    Raises:
-        ValueError: If no agent can be determined for bare text.
-    """
-    text = text.strip()
-    if text.startswith("@"):
-        parts = text[1:].split(None, 1)
-        agent_id = parts[0]
-        message = parts[1] if len(parts) > 1 else ""
-        return (agent_id, message)
-    if text.startswith("/select "):
-        return None
-    if default_agent:
-        return (default_agent, text)
-    raise ValueError("No default agent set. Use @agent-id or /select agent-id")
+config_app = typer.Typer()
+app.add_typer(config_app, name="config")
 
 
-def parse_permission_response(text: str, options: list) -> str | None:
-    """Parse numeric input as permission option selection.
-
-    Args:
-        text: Raw user input.
-        options: List of PermissionOption from the SDK.
-
-    Returns:
-        The option_id if text is a valid 1-based index, else None.
-    """
-    try:
-        idx = int(text) - 1
-        if 0 <= idx < len(options):
-            return options[idx].option_id
-    except ValueError:
-        pass
-    return None
+@config_app.command("path")
+def config_path() -> None:
+    """Print the path to the global config file."""
+    print(GLOBAL_CONFIG_PATH)
 
 
-# ------------------------------------------------------------------
-# Event printing (headless mode)
-# ------------------------------------------------------------------
-
-
-def _print_event(
-    event: BrokerEvent,
-    pending_permissions: list[dict[str, Any]],
-) -> None:
-    """Print a broker event to stdout.
-
-    Args:
-        event: The broker event to print.
-        pending_permissions: FIFO queue of pending permission requests.
-    """
-    match event:
-        case AgentStateChanged(agent_id=aid, old_state=old, new_state=new):
-            print(f"[state] {aid}: {old} → {new}")
-        case MessageChunkReceived(chunk=chunk):
-            print(chunk, end="", flush=True)
-        case ToolCallUpdated(agent_id=aid, title=title, kind=kind, status=status):
-            print(f"\n[tool] {aid}: {kind} — {title} [{status}]")
-        case BrokerError(agent_id=aid, message=msg, severity=sev):
-            print(f"[{sev}] {aid}: {msg}", file=sys.stderr)
-        case PermissionRequested(agent_id=aid, request_id=rid, title=title, kind=kind, options=opts):
-            pending_permissions.append({"agent_id": aid, "request_id": rid, "options": opts})
-            print(f"\n[permission] {aid} requests permission:")
-            print(f"  Title: {title}")
-            print(f"  Kind: {kind}")
-            print("  Options:")
-            for i, opt in enumerate(opts, 1):
-                print(f"    {i}) {opt.name}")
-            if len(pending_permissions) == 1:
-                print(f"Enter option number for {aid}: ", end="", flush=True)
-            else:
-                print(f"  (queued — respond to {pending_permissions[0]['agent_id']} first)")
-        case PermissionAutoResolved(agent_id=aid, request_id=rid, decision=dec):
-            print(f"[auto-resolved] {aid}: {rid} → {dec}")
-        case TurnComplete(agent_id=aid, stop_reason=reason):
-            print(f"\n[turn complete] {aid}: {reason}")
-        case McpMessageDelivered(from_agent=src, to_agent=dst):
-            print(f"[message] {src} → {dst}")
-
-
-# ------------------------------------------------------------------
-# Async stdin reader
-# ------------------------------------------------------------------
-
-
-async def _read_input() -> str:
-    """Read a line from stdin via event loop reader."""
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[str] = loop.create_future()
-
-    def _on_stdin_ready() -> None:
-        loop.remove_reader(sys.stdin)
-        line = sys.stdin.readline()
-        if not line:
-            future.set_exception(EOFError())
+@config_app.command("list")
+def config_list() -> None:
+    """Show all config keys with current values."""
+    cfg = load_global_config()
+    print("Global config:")
+    for key, desc in SETTABLE_KEYS.items():
+        val = getattr(cfg, key)
+        if val is None:
+            display = "(not set)"
+        elif isinstance(val, list):
+            display = ", ".join(val) if val else "(empty)"
         else:
-            future.set_result(line.rstrip("\n"))
+            display = str(val)
+        print(f"  {key}: {display}  — {desc}")
+    print("\nHooks:")
+    print(f"  on_agent_startup: active={cfg.hooks.on_agent_startup.active}")
+    print(f"  on_agent_join: active={cfg.hooks.on_agent_join.active}")
+    print(f"  on_agent_exit: active={cfg.hooks.on_agent_exit.active}")
 
-    loop.add_reader(sys.stdin, _on_stdin_ready)
-    try:
-        return await future
-    except asyncio.CancelledError:
-        loop.remove_reader(sys.stdin)
-        raise
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(..., help="Config key to set"),
+    value: str = typer.Argument(..., help="Value to set"),
+) -> None:
+    """Set a global config value."""
+    if key not in SETTABLE_KEYS:
+        valid = ", ".join(SETTABLE_KEYS)
+        print(f"Unknown key '{key}'. Valid keys: {valid}", file=sys.stderr)
+        raise typer.Exit(1)
+
+    ensure_synth_dir()
+    cfg = load_global_config()
+
+    new_value: str | list[str] | CommunicationMode | None
+    if key in ("default_harness", "default_agent_id", "default_agent_mode"):
+        new_value = None if value in ("none", "null", "") else value
+    elif key == "communication_mode":
+        try:
+            new_value = CommunicationMode(value)
+        except ValueError:
+            valid_modes = ", ".join(m.value for m in CommunicationMode)
+            print(f"Invalid communication_mode '{value}'. Valid: {valid_modes}", file=sys.stderr)
+            raise typer.Exit(1) from None
+    else:  # auto_approve_tools
+        new_value = [item.strip() for item in value.split(",")]
+
+    updated = cfg.model_copy(update={key: new_value})
+    save_global_config(updated)
+    display = new_value if new_value is not None else "(cleared)"
+    print(f"Set {key} = {display}")
 
 
 # ------------------------------------------------------------------
@@ -181,16 +129,18 @@ async def _read_input() -> str:
 
 def _build_transient_config(
     harness_name: str, agent_id: str | None, agent_mode: str | None,
-) -> SessionConfig:
-    """Build a transient SessionConfig from a harness name.
+    global_cfg: GlobalConfig,
+) -> tuple[SessionConfig, AgentConfig]:
+    """Build a transient SessionConfig and AgentConfig from a harness name.
 
     Args:
         harness_name: The ``--harness`` value (short_name).
         agent_id: Optional ``--agent-id`` value.
         agent_mode: Optional ``--agent-mode`` value.
+        global_cfg: Global config providing settings values.
 
     Returns:
-        A SessionConfig with a single agent.
+        Tuple of (SessionConfig, AgentConfig).
 
     Raises:
         typer.Exit: If the harness is not found.
@@ -202,19 +152,185 @@ def _build_transient_config(
         print(f"Unknown harness '{harness_name}'. Known: {known}", file=sys.stderr)
         raise typer.Exit(1)
 
-    aid = agent_id or agent_mode or harness.short_name
-    agent_dict: dict[str, Any] = {
-        "agent_id": aid,
-        "harness": harness_name,
-        "cwd": str(Path.cwd().resolve()),
-    }
-    if agent_mode:
-        agent_dict["agent_mode"] = agent_mode
-
-    return SessionConfig(
-        project=Path.cwd().name,
-        agents=[agent_dict],
+    # agent_mode may contain colons (e.g. plugin:agent-name) which are invalid in agent_id
+    if agent_id:
+        aid = agent_id
+    elif agent_mode:
+        aid = agent_mode.split(":")[-1] if ":" in agent_mode else agent_mode
+    else:
+        aid = harness.short_name
+    agent = AgentConfig(
+        agent_id=aid,
+        harness=harness_name,
+        cwd=str(Path.cwd().resolve()),
+        agent_mode=agent_mode,
     )
+
+    settings = SettingsConfig(
+        communication_mode=global_cfg.communication_mode,
+        auto_approve_tools=global_cfg.auto_approve_tools,
+        hooks=HooksConfig(
+            on_agent_startup=global_cfg.hooks.on_agent_startup,
+            on_agent_join=global_cfg.hooks.on_agent_join,
+            on_agent_exit=global_cfg.hooks.on_agent_exit,
+        ),
+    )
+    config = SessionConfig(
+        project=Path.cwd().name,
+        settings=settings.model_dump(),
+    )
+    return config, agent
+
+
+def _apply_global_settings(raw: RawSessionConfig, global_cfg: GlobalConfig) -> SessionConfig:
+    """Resolve RawSessionConfig into SessionConfig by filling None fields from global config.
+
+    Args:
+        raw: Parsed project config with potentially unset fields.
+        global_cfg: Global config providing fallback values.
+
+    Returns:
+        Fully-resolved SessionConfig with no None values in settings.
+    """
+    comm_mode = (
+        raw.settings.communication_mode
+        if raw.settings.communication_mode is not None
+        else global_cfg.communication_mode
+    )
+    auto_approve = (
+        raw.settings.auto_approve_tools
+        if raw.settings.auto_approve_tools is not None
+        else global_cfg.auto_approve_tools
+    )
+
+    # Hooks merge: project default → use global, otherwise project wins
+    on_startup = (
+        global_cfg.hooks.on_agent_startup
+        if raw.settings.hooks.on_agent_startup == StartupHookConfig()
+        else raw.settings.hooks.on_agent_startup
+    )
+    on_join = (
+        global_cfg.hooks.on_agent_join
+        if raw.settings.hooks.on_agent_join == MessageHook()
+        else raw.settings.hooks.on_agent_join
+    )
+    on_exit = (
+        global_cfg.hooks.on_agent_exit
+        if raw.settings.hooks.on_agent_exit == MessageHook()
+        else raw.settings.hooks.on_agent_exit
+    )
+
+    settings = SettingsConfig(
+        communication_mode=comm_mode,
+        auto_approve_tools=auto_approve,
+        hooks=HooksConfig(
+            on_agent_startup=on_startup,
+            on_agent_join=on_join,
+            on_agent_exit=on_exit,
+        ),
+    )
+    return SessionConfig(
+        project=raw.project,
+        settings=settings.model_dump(),
+    )
+
+
+def _load_config_with_agent(
+    path: Path, global_cfg: GlobalConfig,
+) -> tuple[SessionConfig, AgentConfig | None]:
+    """Load .synth.json and extract the initial agent from the legacy agents array.
+
+    Args:
+        path: Path to .synth.json.
+        global_cfg: Global config for settings resolution.
+
+    Returns:
+        Tuple of (SessionConfig, AgentConfig or None if no agents in config).
+    """
+    raw_data = json.loads(path.read_text())
+
+    # Extract agent from raw JSON before model parsing strips it
+    agents_raw = raw_data.get("agents")
+    if not agents_raw or not isinstance(agents_raw, list) or len(agents_raw) == 0:
+        # No agents in .synth.json — load settings only, resolve agent from global/auto-detect
+        raw = load_config(path)
+        session_config = _apply_global_settings(raw, global_cfg)
+        return session_config, None
+
+    if len(agents_raw) > 1:
+        log.warning(
+            "Multiple agents in .synth.json is deprecated. Using first agent '%s'.",
+            agents_raw[0].get("agent_id", "unknown"),
+        )
+
+    first = agents_raw[0]
+    config_dir = path.parent.resolve()
+    cwd = str((config_dir / first.get("cwd", ".")).resolve())
+    agent = AgentConfig(
+        agent_id=first["agent_id"],
+        harness=first["harness"],
+        agent_mode=first.get("agent_mode"),
+        cwd=cwd,
+        env=first.get("env", {}),
+    )
+
+    raw = load_config(path)
+    session_config = _apply_global_settings(raw, global_cfg)
+    return session_config, agent
+
+
+def _resolve_agent(
+    agent_id: str | None,
+    agent_mode: str | None,
+    global_cfg: GlobalConfig,
+) -> AgentConfig:
+    """Resolve the initial agent from global config or auto-detect.
+
+    Used when .synth.json provides settings but no agents.
+    """
+    # Try global config default_harness
+    if global_cfg.default_harness:
+        aid = agent_id or global_cfg.default_agent_id or agent_mode or global_cfg.default_harness
+        return AgentConfig(
+            agent_id=aid,
+            harness=global_cfg.default_harness,
+            agent_mode=agent_mode or global_cfg.default_agent_mode,
+            cwd=str(Path.cwd().resolve()),
+        )
+
+    # Try auto-detect
+    installed = _detect_installed_harnesses()
+    if len(installed) == 1:
+        entry, _ = installed[0]
+        print(
+            f"[synth] Using {entry.name} (only harness in PATH). "
+            f"Make permanent: synth config set default_harness {entry.short_name}",
+            file=sys.stderr,
+        )
+        aid = agent_id or agent_mode or entry.short_name
+        return AgentConfig(
+            agent_id=aid,
+            harness=entry.short_name,
+            agent_mode=agent_mode,
+            cwd=str(Path.cwd().resolve()),
+        )
+
+    if len(installed) > 1:
+        print("Multiple harnesses found in PATH:", file=sys.stderr)
+        for entry, path in installed:
+            print(f"  - {entry.short_name} ({path})", file=sys.stderr)
+        print(
+            "\nSet a default: synth config set default_harness <name>",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+
+    registry = load_harness_registry()
+    print("No ACP harnesses found in PATH.", file=sys.stderr)
+    print("Install one of:", file=sys.stderr)
+    for h in registry:
+        print(f"  - {h.name} ({', '.join(h.binary_names)})", file=sys.stderr)
+    raise typer.Exit(1)
 
 
 def _resolve_config(
@@ -222,68 +338,127 @@ def _resolve_config(
     agent_id: str | None,
     agent_mode: str | None,
     config_path: Path | None,
-    headless: bool,
-) -> SessionConfig:
-    """Resolve configuration using the priority order.
+) -> tuple[SessionConfig, AgentConfig]:
+    """4-level resolution: CLI flags > .synth.json > global config > auto-detect.
+
+    Always returns fully-resolved (SessionConfig, AgentConfig).
 
     Args:
         harness: ``--harness`` flag value.
         agent_id: ``--agent-id`` flag value.
         agent_mode: ``--agent-mode`` flag value.
         config_path: ``--config`` flag value.
-        headless: Whether running in headless mode.
 
     Returns:
-        Resolved SessionConfig.
+        Tuple of (SessionConfig, AgentConfig).
 
     Raises:
         typer.Exit: If no config can be resolved.
     """
+    global_cfg = load_global_config()
+
     # 1. --harness → transient config
     if harness:
-        return _build_transient_config(harness, agent_id, agent_mode)
+        return _build_transient_config(harness, agent_id, agent_mode, global_cfg)
 
     # 2. --config → load file
     if config_path:
         if not config_path.exists():
             print(f"Config not found: {config_path}", file=sys.stderr)
             raise typer.Exit(1)
-        return load_config(config_path)
+        session_config, agent = _load_config_with_agent(config_path, global_cfg)
+        if agent:
+            return session_config, agent
+        # No agents in config — resolve agent from global/auto-detect below
+        return session_config, _resolve_agent(agent_id, agent_mode, global_cfg)
 
-    # 3. Auto-discover
+    # 3. Auto-discover .synth.json
     found = find_config(Path.cwd())
     if found:
-        return load_config(found)
+        session_config, agent = _load_config_with_agent(found, global_cfg)
+        if agent:
+            return session_config, agent
+        # No agents in config — resolve agent from global/auto-detect below
+        return session_config, _resolve_agent(agent_id, agent_mode, global_cfg)
 
-    # 4. First-run picker (TUI only)
-    if headless:
-        print("No config found. Run without --headless for interactive setup.", file=sys.stderr)
+    # 4. Global config default_harness
+    if global_cfg.default_harness:
+        return _build_transient_config(
+            global_cfg.default_harness,
+            agent_id or global_cfg.default_agent_id,
+            agent_mode or global_cfg.default_agent_mode,
+            global_cfg,
+        )
+
+    # 5. Auto-detect installed harnesses
+    installed = _detect_installed_harnesses()
+    if len(installed) == 1:
+        entry, _ = installed[0]
+        print(
+            f"[synth] Using {entry.name} (only harness in PATH). "
+            f"Make permanent: synth config set default_harness {entry.short_name}",
+            file=sys.stderr,
+        )
+        return _build_transient_config(entry.short_name, agent_id, agent_mode, global_cfg)
+
+    if len(installed) > 1:
+        print("Multiple harnesses found in PATH:", file=sys.stderr)
+        for entry, path in installed:
+            print(f"  - {entry.short_name} ({path})", file=sys.stderr)
+        print(
+            "\nSet a default: synth config set default_harness <name>",
+            file=sys.stderr,
+        )
         raise typer.Exit(1)
 
-    return SessionConfig(project=Path.cwd().name, agents=[])
+    # No harnesses found
+    registry = load_harness_registry()
+    print("No ACP harnesses found in PATH.", file=sys.stderr)
+    print("Install one of:", file=sys.stderr)
+    for h in registry:
+        print(f"  - {h.name} ({', '.join(h.binary_names)})", file=sys.stderr)
+    raise typer.Exit(1)
 
 
-# ------------------------------------------------------------------
-# First-run picker
-# ------------------------------------------------------------------
-
-
-def _first_run_picker() -> SessionConfig:
-    """Interactive first-run setup that probes PATH for harnesses.
-
-    Detects installed harnesses, shows a numbered list, prompts for
-    agent name and project name, writes ``.synth.toml``, and returns
-    the config.
-
-    Returns:
-        The newly created SessionConfig.
-
-    Raises:
-        typer.Exit: If no harnesses are found.
-    """
+def _resolve_harness_for_discovery(harness: str | None) -> HarnessEntry:
+    """Resolve a HarnessEntry for discovery flags (--list-agents, --select-agent)."""
     registry = load_harness_registry()
 
-    # Probe PATH for installed harnesses
+    if harness:
+        entry = next((h for h in registry if h.short_name == harness), None)
+        if not entry:
+            known = ", ".join(sorted(h.short_name for h in registry))
+            print(f"Unknown harness '{harness}'. Known: {known}", file=sys.stderr)
+            raise typer.Exit(1)
+        return entry
+
+    global_cfg = load_global_config()
+    if global_cfg.default_harness:
+        entry = next((h for h in registry if h.short_name == global_cfg.default_harness), None)
+        if entry:
+            return entry
+
+    installed = _detect_installed_harnesses()
+    if len(installed) == 1:
+        return installed[0][0]
+
+    if len(installed) > 1:
+        print("Multiple harnesses found. Use --harness to specify:", file=sys.stderr)
+        for entry, path in installed:
+            print(f"  - {entry.short_name} ({path})", file=sys.stderr)
+    else:
+        print("No ACP harnesses found in PATH.", file=sys.stderr)
+        print("Install one or set: synth config set default_harness <name>", file=sys.stderr)
+    raise typer.Exit(1)
+
+
+def _detect_installed_harnesses() -> list[tuple[HarnessEntry, str]]:
+    """Probe PATH for installed ACP harness binaries.
+
+    Returns:
+        List of (HarnessEntry, binary_path) pairs for each harness found.
+    """
+    registry = load_harness_registry()
     installed: list[tuple[HarnessEntry, str]] = []
     for harness in registry:
         for binary in harness.binary_names:
@@ -291,174 +466,7 @@ def _first_run_picker() -> SessionConfig:
             if path:
                 installed.append((harness, path))
                 break
-
-    if not installed:
-        print("\nNo supported harnesses found in PATH.\n", file=sys.stderr)
-        print("Install one of:", file=sys.stderr)
-        for h in registry:
-            print(f"  - {h.name} ({', '.join(h.binary_names)})", file=sys.stderr)
-        raise typer.Exit(1)
-
-    print("\nNo .synth.toml found. Let's set one up.\n")
-    print("Which harness?")
-    for i, (harness, path) in enumerate(installed, 1):
-        print(f"  {i}) {harness.short_name}    ({path})")
-
-    # Get harness selection
-    while True:
-        choice = input("\n  > ").strip()
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(installed):
-                selected_harness, _ = installed[idx]
-                break
-        except ValueError:
-            pass
-        print(f"  Enter a number 1-{len(installed)}")
-
-    # Get agent name
-    default_agent = selected_harness.short_name
-    agent_input = input(f"\nAgent name [{default_agent}]: ").strip()
-    agent_name = agent_input or default_agent
-
-    # Get project name
-    default_project = Path.cwd().name
-    project_input = input(f"Project name [{default_project}]: ").strip()
-    project_name = project_input or default_project
-
-    # Build config
-    config = SessionConfig(
-        project=project_name,
-        agents=[{"agent_id": agent_name, "harness": selected_harness.short_name}],
-    )
-
-    config_path = Path.cwd() / ".synth.json"
-    write_json_config(config_path, config)
-    print(f"\nWrote {config_path}\n")
-
-    return load_config(config_path)
-
-
-# ------------------------------------------------------------------
-# Headless run
-# ------------------------------------------------------------------
-
-
-async def _run(config: SessionConfig) -> None:
-    """Run in headless mode with the given config.
-
-    Args:
-        config: Resolved session configuration.
-    """
-    broker = ACPBroker(config)
-
-    if not config.agents:
-        print("No agents configured", file=sys.stderr)
-        return
-
-    # Launch all agents
-    for agent in config.agents:
-        print(f"[synth] Launching {agent.agent_id}...")
-        await broker.handle(LaunchAgent(agent_id=agent.agent_id))
-
-    # Wait for all agents to reach IDLE
-    idle_agents: set[str] = set()
-    expected = {a.agent_id for a in config.agents}
-    async for event in broker.events():
-        _print_event(event, [])
-        if isinstance(event, AgentStateChanged) and event.new_state == "idle":
-            idle_agents.add(event.agent_id)
-            if idle_agents >= expected:
-                break
-        if isinstance(event, BrokerError):
-            await broker.shutdown()
-            return
-
-    # Auto-select default agent if only one
-    default_agent: str | None = config.agents[0].agent_id if len(config.agents) == 1 else None
-    pending_permissions: list[dict[str, Any]] = []
-
-    # Start event consumer task
-    async def _consume_events() -> None:
-        async for event in broker.events():
-            _print_event(event, pending_permissions)
-
-    event_task = asyncio.create_task(_consume_events())
-
-    # Interactive stdin read loop
-    try:
-        while True:
-            try:
-                raw = await _read_input()
-            except (EOFError, asyncio.CancelledError):
-                break
-
-            text = raw.strip()
-            if not text:
-                continue
-
-            # Check for permission response
-            if pending_permissions:
-                option_id = parse_permission_response(text, pending_permissions[0]["options"])
-                if option_id is not None:
-                    perm = pending_permissions.pop(0)
-                    await broker.handle(
-                        RespondPermission(
-                            agent_id=perm["agent_id"],
-                            request_id=perm["request_id"],
-                            option_id=option_id,
-                        )
-                    )
-                    # Prompt for next queued permission if any
-                    if pending_permissions:
-                        nxt = pending_permissions[0]
-                        print(
-                            f"Enter option number for {nxt['agent_id']}: ",
-                            end="",
-                            flush=True,
-                        )
-                    continue
-
-            # Handle /select command
-            if text.startswith("/select "):
-                default_agent = text.split(None, 1)[1]
-                print(f"[synth] Default agent set to: {default_agent}")
-                continue
-
-            # Parse and route input
-            try:
-                result = parse_input(text, default_agent)
-            except ValueError as e:
-                print(f"[synth] {e}", file=sys.stderr)
-                continue
-
-            if result is not None:
-                agent_id, message = result
-                await broker.handle(SendPrompt(agent_id=agent_id, text=message))
-
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
-    finally:
-        print("\n[synth] Shutting down...")
-        watchdog = threading.Timer(5.0, os._exit, args=(0,))
-        watchdog.daemon = True
-        watchdog.start()
-        event_task.cancel()
-        try:
-            await event_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await broker.shutdown()
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            pass
-        try:
-            loop = asyncio.get_running_loop()
-            await loop.shutdown_default_executor(1)
-            loop._default_executor = None  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        watchdog.cancel()
+    return installed
 
 
 # ------------------------------------------------------------------
@@ -471,25 +479,86 @@ _STYLE_CSS = {
 }
 
 
-def _run_tui(config: SessionConfig, style: str = "default", restore: bool = False) -> None:
+def _run_tui(
+    config: SessionConfig, initial_agent: AgentConfig, style: str = "default", restore: bool = False,
+) -> None:
     """Launch the Textual TUI.
 
     Args:
         config: Resolved session configuration.
+        initial_agent: The agent to launch on startup.
         style: CSS style variant name.
         restore: Whether to show the session picker on startup.
     """
     from textual.geometry import Region
 
+    from synth_acp.broker.broker import ACPBroker
     from synth_acp.ui.app import SynthApp
     if type(Region).__module__ != "builtins":
         logging.getLogger("synth_acp").warning(
             "textual-speedups not active — install textual-speedups for better performance"
         )
 
-    broker = ACPBroker(config)
+    broker = ACPBroker(config, initial_agent)
     css_path = _STYLE_CSS.get(style, _STYLE_CSS["default"])
-    SynthApp(broker, config, css_path=css_path, restore=restore).run()
+    SynthApp(broker, config, initial_agent=initial_agent, css_path=css_path, restore=restore).run()
+
+
+# ------------------------------------------------------------------
+# Discovery flag handlers
+# ------------------------------------------------------------------
+
+
+def _handle_list_agents(harness: str | None) -> None:
+    """Handle --list-agents: print table of discovered agents and exit."""
+    from rich.console import Console
+    from rich.table import Table
+
+    entry = _resolve_harness_for_discovery(harness)
+    agents = discover_agents(entry, Path.cwd())
+
+    if not agents:
+        print(f"No agents found for {entry.name}.")
+        raise typer.Exit(0)
+
+    table = Table(title=f"Agents for {entry.name}")
+    table.add_column("Name")
+    table.add_column("Qualified Name")
+    table.add_column("Source")
+    table.add_column("Description")
+
+    for a in agents:
+        table.add_row(a.name, a.qualified_name, a.source, a.description)
+
+    Console().print(table)
+    raise typer.Exit(0)
+
+
+def _handle_select_agent(harness: str | None) -> str:
+    """Handle --select-agent: present fuzzy picker and return selected qualified_name."""
+    from InquirerPy import inquirer
+
+    entry = _resolve_harness_for_discovery(harness)
+    agents = discover_agents(entry, Path.cwd())
+
+    if not agents:
+        print(f"No agents found for {entry.name}.")
+        raise typer.Exit(0)
+
+    choices = [
+        {"name": f"{a.qualified_name} — {a.description}", "value": a.qualified_name}
+        for a in agents
+    ]
+
+    try:
+        result = inquirer.fuzzy(message="Select agent:", choices=choices).execute()
+    except (KeyboardInterrupt, EOFError):
+        raise typer.Exit(0) from None
+
+    if result is None:
+        raise typer.Exit(0)
+
+    return result
 
 
 # ------------------------------------------------------------------
@@ -497,13 +566,13 @@ def _run_tui(config: SessionConfig, style: str = "default", restore: bool = Fals
 # ------------------------------------------------------------------
 
 
-@app.command()
+@app.callback(invoke_without_command=True)
 def cli(
+    ctx: typer.Context,
     harness: str | None = typer.Option(None, help="Harness to launch (e.g. kiro, claude)"),
     agent_id: str | None = typer.Option(None, "--agent-id", help="Agent identifier"),
     agent_mode: str | None = typer.Option(None, "--agent-mode", help="Agent mode (e.g. code, plan, chat)"),
     config: Path | None = typer.Option(None, "-c", "--config", help="Path to config file"),
-    headless: bool = typer.Option(False, help="Run without TUI (stdin/stdout mode)"),
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Enable debug logging"),
     restore: bool = typer.Option(False, "-r", "--restore", help="Restore a previous session"),
     style: str = typer.Option(
@@ -512,8 +581,15 @@ def cli(
         "--style",
         help="TUI style variant",
     ),
+    list_agents: bool = typer.Option(False, "--list-agents", help="List available agents and exit"),
+    select_agent: bool = typer.Option(False, "--select-agent", help="Interactive agent picker"),
 ) -> None:
     """SYNTH — multi-agent ACP orchestrator."""
+    if ctx.invoked_subcommand is not None:
+        return
+
+    ensure_synth_dir()
+
     if verbose:
         log_file = Path.home() / ".synth" / "synth.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -522,18 +598,17 @@ def cli(
             filename=str(log_file),
             format="%(asctime)s %(name)s %(levelname)s %(message)s",
         )
-        logging.getLogger("aiosqlite").setLevel(logging.WARNING)
         logging.getLogger("markdown_it").setLevel(logging.WARNING)
 
-    resolved = _resolve_config(harness, agent_id, agent_mode, config, headless)
+    if list_agents:
+        _handle_list_agents(harness)
+        return
 
-    if headless:
-        if restore:
-            print("Session restore requires TUI mode.", file=sys.stderr)
-            raise typer.Exit(1)
-        asyncio.run(_run(resolved))
-    else:
-        _run_tui(resolved, style=style, restore=restore)
+    if select_agent:
+        agent_mode = _handle_select_agent(harness)
+
+    resolved_config, initial_agent = _resolve_config(harness, agent_id, agent_mode, config)
+    _run_tui(resolved_config, initial_agent, style=style, restore=restore)
 
 
 main = app
