@@ -22,7 +22,7 @@ A multi-agent orchestration dashboard that manages teams of AI coding agents thr
 uv tool install synth-acp
 
 # With semantic session search support (recommended)
-uv tool install synth-acp[search]
+uv tool install "synth-acp[search]"
 ```
 
 The `[search]` extra enables semantic search when restoring previous sessions (`synth --restore`). Without it, session restore falls back to recency-based listing only.
@@ -298,7 +298,7 @@ Install from PyPI:
 uv pip install synth-acp
 
 # With semantic session search support
-uv pip install synth-acp[search]
+uv pip install "synth-acp[search]"
 ```
 
 ## Security & Trust Model
