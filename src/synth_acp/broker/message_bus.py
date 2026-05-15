@@ -87,7 +87,7 @@ class MessageBus:
             if not task.done():
                 task.cancel()
         if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            await asyncio.wait(self._tasks, timeout=2.0)
         sock = Path(self._socket_path)
         if sock.exists():
             sock.unlink()

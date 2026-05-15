@@ -546,7 +546,7 @@ class AgentLifecycle:
             if not task.done():
                 task.cancel()
         if self._tasks:
-            await asyncio.wait(list(self._tasks.values()), timeout=3.0)
+            await asyncio.wait(list(self._tasks.values()), timeout=1.0)
 
     async def _on_acp_session_created(self, agent_id: str, acp_session_id: str) -> None:
         """Write back the ACP session ID after the agent process creates it.

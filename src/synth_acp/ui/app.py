@@ -222,8 +222,14 @@ class SynthApp(App):
     def _do_index_sessions(self) -> None:
         """Index session logic, separated for testability."""
         try:
+            from textual.worker import NoActiveWorker, get_current_worker
+
             if not embedding_available():
                 return
+            try:
+                worker = get_current_worker()
+            except NoActiveWorker:
+                worker = None
             engine = EmbeddingEngine()
             self._embedding_engine = engine
             engine.ensure_model()
@@ -233,6 +239,8 @@ class SynthApp(App):
                 conn.row_factory = sqlite3.Row
                 pairs = get_unembedded_agents_sync(conn)
                 for sid, agent_id in pairs:
+                    if worker is not None and worker.is_cancelled:
+                        return
                     text = self._query_agent_text(conn, sid, agent_id)
                     if text is None:
                         store_embedding_sync(conn, sid, agent_id, "", b"")
