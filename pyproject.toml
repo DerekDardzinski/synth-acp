@@ -29,6 +29,8 @@ dependencies = [
 search = [
     "onnxruntime>=1.17.0",
     "tokenizers>=0.15.0",
+    "bm25s>=0.2.0",
+    "PyStemmer>=2.0.0",
 ]
 
 [dependency-groups]
