@@ -791,3 +791,68 @@ class TestListRestorableSessions:
         assert sess["cwd"] == "/home/user/project"
         assert sess["tasks"] == ["build feature", "fix tests"]
         assert sess["first_messages"] == ["hello world", "do the thing", "third msg"]
+
+    async def test_list_restorable_sessions_includes_initial_prompts(self, tmp_path: Path) -> None:
+        """initial_prompts populated from InitialPromptDelivered events."""
+        import json
+        import sqlite3
+
+        from synth_acp.db import ensure_schema_sync
+
+        db_path = tmp_path / "synth.db"
+        conn = sqlite3.connect(str(db_path))
+        ensure_schema_sync(conn)
+
+        conn.execute(
+            "INSERT INTO agents (agent_id, session_id, status, registered, cwd) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("root", "sess-1", "restorable", 1000, "/home/user/project"),
+        )
+        conn.execute(
+            "INSERT INTO agents (agent_id, session_id, status, registered) "
+            "VALUES (?, ?, ?, ?)",
+            ("child", "sess-1", "restorable", 2000),
+        )
+        # InitialPromptDelivered for child (seq=0, fires before user prompt)
+        conn.execute(
+            "INSERT INTO ui_events (session_id, agent_id, seq, event_type, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("sess-1", "child", 0, "InitialPromptDelivered",
+             json.dumps({"agent_id": "child", "text": "You are a code reviewer"}), 1000),
+        )
+        # UserPromptSubmitted for root (no InitialPromptDelivered)
+        conn.execute(
+            "INSERT INTO ui_events (session_id, agent_id, seq, event_type, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("sess-1", "root", 1, "UserPromptSubmitted",
+             json.dumps({"agent_id": "root", "text": "Fix the auth bug"}), 1001),
+        )
+        conn.commit()
+        conn.close()
+
+        results = await ACPBroker.list_restorable_sessions(db_path)
+        assert results[0]["initial_prompts"] == {
+            "child": "You are a code reviewer",
+            "root": "Fix the auth bug",
+        }
+
+    async def test_list_restorable_sessions_initial_prompts_empty_when_no_events(self, tmp_path: Path) -> None:
+        """initial_prompts is always present as empty dict when no qualifying events."""
+        import sqlite3
+
+        from synth_acp.db import ensure_schema_sync
+
+        db_path = tmp_path / "synth.db"
+        conn = sqlite3.connect(str(db_path))
+        ensure_schema_sync(conn)
+
+        conn.execute(
+            "INSERT INTO agents (agent_id, session_id, status, registered, cwd) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("root", "sess-1", "restorable", 1000, "/tmp"),
+        )
+        conn.commit()
+        conn.close()
+
+        results = await ACPBroker.list_restorable_sessions(db_path)
+        assert results[0]["initial_prompts"] == {}

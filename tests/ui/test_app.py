@@ -687,7 +687,7 @@ class TestIndexSessions:
         assert app._embedding_engine is None
 
     def test_index_sessions_embeds_unembedded_sessions(self, tmp_path: Path) -> None:
-        """Worker processes unembedded sessions and stores embeddings."""
+        """Worker processes unembedded agents and stores embeddings."""
         app = _make_app("agent-1")
         app.broker._db_path = tmp_path / "test.db"
 
@@ -700,10 +700,8 @@ class TestIndexSessions:
         with (
             patch("synth_acp.ui.app.embedding_available", return_value=True),
             patch("synth_acp.ui.app.EmbeddingEngine", return_value=mock_engine),
-            patch("synth_acp.ui.app.get_unembedded_sessions_sync", return_value=["sess-1", "sess-2"]),
-            patch.object(SynthApp, "_query_session_metadata", return_value={"agents": ["a"], "cwd": "/tmp", "tasks": ["t"], "first_messages": ["hello"]}),
-            patch("synth_acp.ui.app._build_embedding_text", return_value="hello a tmp t"),
-            patch("synth_acp.ui.app._text_hash", return_value="abc123"),
+            patch("synth_acp.ui.app.get_unembedded_agents_sync", return_value=[("sess-1", "a1"), ("sess-2", "a2")]),
+            patch.object(SynthApp, "_query_agent_text", return_value="hello world this is a test prompt"),
             patch("synth_acp.ui.app.store_embedding_sync") as mock_store,
         ):
             app._do_index_sessions()
@@ -712,10 +710,35 @@ class TestIndexSessions:
         assert app._embedding_engine is mock_engine
         mock_engine.ensure_model.assert_called_once()
         assert mock_store.call_count == 2
-        # Verify correct args for first call
         call_args = mock_store.call_args_list[0]
         assert call_args[0][1] == "sess-1"
-        assert call_args[0][2] == "abc123"
+        assert call_args[0][2] == "a1"
+        assert call_args[0][4] == b"\x00" * 1536
+
+    def test_index_sessions_stores_sentinel_for_short_text(self, tmp_path: Path) -> None:
+        """Worker stores empty sentinel when _query_agent_text returns None."""
+        app = _make_app("agent-1")
+        app.broker._db_path = tmp_path / "test.db"
+
+        mock_engine = MagicMock()
+
+        with (
+            patch("synth_acp.ui.app.embedding_available", return_value=True),
+            patch("synth_acp.ui.app.EmbeddingEngine", return_value=mock_engine),
+            patch("synth_acp.ui.app.get_unembedded_agents_sync", return_value=[("sess-1", "a1")]),
+            patch.object(SynthApp, "_query_agent_text", return_value=None),
+            patch("synth_acp.ui.app.store_embedding_sync") as mock_store,
+        ):
+            app._do_index_sessions()
+
+        assert app._indexing_complete is True
+        mock_engine.embed.assert_not_called()
+        mock_store.assert_called_once()
+        call_args = mock_store.call_args[0]
+        assert call_args[1] == "sess-1"
+        assert call_args[2] == "a1"
+        assert call_args[3] == ""
+        assert call_args[4] == b""
 
     def test_index_sessions_handles_embed_error(self, tmp_path: Path) -> None:
         """Exception during engine.embed() does not propagate."""
@@ -728,10 +751,8 @@ class TestIndexSessions:
         with (
             patch("synth_acp.ui.app.embedding_available", return_value=True),
             patch("synth_acp.ui.app.EmbeddingEngine", return_value=mock_engine),
-            patch("synth_acp.ui.app.get_unembedded_sessions_sync", return_value=["sess-1"]),
-            patch.object(SynthApp, "_query_session_metadata", return_value={"agents": [], "cwd": None, "tasks": [], "first_messages": []}),
-            patch("synth_acp.ui.app._build_embedding_text", return_value="text"),
-            patch("synth_acp.ui.app._text_hash", return_value="hash"),
+            patch("synth_acp.ui.app.get_unembedded_agents_sync", return_value=[("sess-1", "a1")]),
+            patch.object(SynthApp, "_query_agent_text", return_value="hello world this is a test prompt"),
         ):
             # Should not raise
             app._do_index_sessions()

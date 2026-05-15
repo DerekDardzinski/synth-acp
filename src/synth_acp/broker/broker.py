@@ -328,6 +328,26 @@ class ACPBroker:
                     except (json.JSONDecodeError, TypeError):
                         pass
 
+                # Bulk: per-agent initial prompts (first inbound message per agent)
+                all_initial_prompts: dict[str, dict[str, str]] = {sid: {} for sid in sids}
+                prompt_rows = conn.execute(
+                    f"SELECT session_id, agent_id, payload FROM ("
+                    f"  SELECT session_id, agent_id, payload,"
+                    f"  ROW_NUMBER() OVER (PARTITION BY session_id, agent_id ORDER BY seq) as rn"
+                    f"  FROM ui_events WHERE session_id IN ({placeholders})"
+                    f"  AND event_type IN ('InitialPromptDelivered', 'UserPromptSubmitted')"
+                    f") WHERE rn = 1",
+                    sids,
+                ).fetchall()
+                for r in prompt_rows:
+                    try:
+                        data = json.loads(r["payload"])
+                        text = data.get("text", "")
+                        if text:
+                            all_initial_prompts[r["session_id"]][r["agent_id"]] = text
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
                 return [
                     {
                         "session_id": s["session_id"],
@@ -337,6 +357,7 @@ class ACPBroker:
                         "cwd": all_cwds[s["session_id"]],
                         "tasks": all_tasks[s["session_id"]],
                         "first_messages": all_messages[s["session_id"]],
+                        "initial_prompts": all_initial_prompts[s["session_id"]],
                     }
                     for s in sessions
                 ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -20,9 +21,7 @@ from textual.worker import Worker, WorkerState
 
 from synth_acp.broker.broker import ACPBroker
 from synth_acp.db import (
-    _build_embedding_text,
-    _text_hash,
-    get_unembedded_sessions_sync,
+    get_unembedded_agents_sync,
     store_embedding_sync,
 )
 from synth_acp.embeddings import EmbeddingEngine, embedding_available
@@ -232,58 +231,49 @@ class SynthApp(App):
             with contextlib.closing(sqlite3.connect(db_path)) as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.row_factory = sqlite3.Row
-                session_ids = get_unembedded_sessions_sync(conn)
-                for sid in session_ids:
-                    session = self._query_session_metadata(conn, sid)
-                    text = _build_embedding_text(session)
-                    text_h = _text_hash(text)
-                    embedding = engine.embed(text)
-                    store_embedding_sync(conn, sid, text_h, embedding.tobytes())
+                pairs = get_unembedded_agents_sync(conn)
+                for sid, agent_id in pairs:
+                    text = self._query_agent_text(conn, sid, agent_id)
+                    if text is None:
+                        store_embedding_sync(conn, sid, agent_id, "", b"")
+                    else:
+                        text_h = hashlib.sha256(text.encode()).hexdigest()
+                        embedding = engine.embed(text)
+                        store_embedding_sync(conn, sid, agent_id, text_h, embedding.tobytes())
             self._indexing_complete = True
         except Exception:
             log.debug("Background indexing failed", exc_info=True)
 
     @staticmethod
-    def _query_session_metadata(conn: sqlite3.Connection, session_id: str) -> dict:
-        """Query session metadata for embedding text composition."""
-        agents = [
-            r[0] for r in conn.execute(
-                "SELECT agent_id FROM agents WHERE session_id = ?", (session_id,)
-            ).fetchall()
-        ]
-        cwd_row = conn.execute(
-            "SELECT cwd FROM agents WHERE session_id = ? ORDER BY registered ASC LIMIT 1",
-            (session_id,),
-        ).fetchone()
-        cwd = cwd_row["cwd"] if cwd_row else None
-        tasks = [
-            r[0] for r in conn.execute(
-                "SELECT task FROM agents WHERE session_id = ? AND task IS NOT NULL",
-                (session_id,),
-            ).fetchall()
-        ]
-        first_messages: list[str] = []
-        msg_rows = conn.execute(
+    def _query_agent_text(conn: sqlite3.Connection, session_id: str, agent_id: str) -> str | None:
+        """Get the first inbound message text for an agent.
+
+        Tries InitialPromptDelivered first, falls back to first UserPromptSubmitted.
+        Returns None if no text found or text < 20 chars.
+        """
+        row = conn.execute(
             "SELECT payload FROM ui_events "
-            "WHERE session_id = ? AND event_type = 'UserPromptSubmitted' "
-            "ORDER BY seq LIMIT 3",
-            (session_id,),
-        ).fetchall()
-        for row in msg_rows:
-            try:
-                data = json.loads(row["payload"])
-                text = data.get("text", "")
-                if text:
-                    first_messages.append(text)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        return {
-            "session_id": session_id,
-            "agents": agents,
-            "cwd": cwd,
-            "tasks": tasks,
-            "first_messages": first_messages,
-        }
+            "WHERE session_id = ? AND agent_id = ? AND event_type = 'InitialPromptDelivered' "
+            "ORDER BY seq LIMIT 1",
+            (session_id, agent_id),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT payload FROM ui_events "
+                "WHERE session_id = ? AND agent_id = ? AND event_type = 'UserPromptSubmitted' "
+                "ORDER BY seq LIMIT 1",
+                (session_id, agent_id),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            data = json.loads(row["payload"])
+            text = data.get("text")
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not text or len(text) < 20:
+            return None
+        return text
 
     async def on_broker_event_message(self, message: BrokerEventMessage) -> None:
         """Route broker events to the appropriate widgets.

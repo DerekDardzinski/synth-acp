@@ -106,6 +106,8 @@ def _build_bm25_text(session: dict) -> str:
         parts.append(task)
     for msg in session.get("first_messages", []):
         parts.append(msg)
+    for text in session.get("initial_prompts", {}).values():
+        parts.append(text)
     return "\n".join(parts)
 
 
@@ -162,7 +164,7 @@ class SessionPickerScreen(ModalScreen[str | None]):
         self._engine = engine
         self._indexing_complete = indexing_complete
         self._search_timer: Timer | None = None
-        self._embeddings: tuple[list[str], object] | None = None
+        self._embeddings: tuple[list[str], object, object] | None = None
         self._bm25: object | None = None  # bm25s.BM25 instance
         self._bm25_session_ids: list[str] = []
         self._row_keys: list[str] = []
@@ -311,24 +313,28 @@ class SessionPickerScreen(ModalScreen[str | None]):
         """Get semantic similarity ranks for all sessions."""
         if self._embeddings is None:
             self._embeddings = self._load_embeddings()
-        session_ids, matrix = self._embeddings
+        session_ids, session_starts, matrix = self._embeddings
         if matrix is None or len(session_ids) == 0:
             return {}
 
-        query_emb = self._engine.embed(query)  # type: ignore[union-attr]
-        scores = self._engine.similarity(query_emb, matrix)  # type: ignore[union-attr]
+        import numpy as np
 
-        scored = sorted(zip(session_ids, scores, strict=True), key=lambda x: x[1], reverse=True)
+        query_emb = self._engine.embed(query)  # type: ignore[union-attr]
+        scores = matrix @ query_emb  # shape (N_total,)
+        session_maxes = np.maximum.reduceat(scores, session_starts)  # shape (N_sessions,)
 
         threshold = 0.1
+        ranked = sorted(
+            enumerate(session_maxes), key=lambda x: x[1], reverse=True
+        )
         ranks: dict[str, int] = {}
-        for rank, (sid, score) in enumerate(scored):
+        for rank, (idx, score) in enumerate(ranked):
             if score >= threshold:
-                ranks[sid] = rank
+                ranks[session_ids[idx]] = rank
         return ranks
 
-    def _load_embeddings(self) -> tuple[list[str], object | None]:
-        """Load embeddings from DB, deserialize, build matrix."""
+    def _load_embeddings(self) -> tuple[list[str], object | None, object | None]:
+        """Load embeddings from DB, deserialize, build grouped matrix."""
         import numpy as np
 
         from synth_acp.db import load_all_embeddings_sync
@@ -337,13 +343,27 @@ class SessionPickerScreen(ModalScreen[str | None]):
             conn.execute("PRAGMA journal_mode=WAL")
             rows = load_all_embeddings_sync(conn)
 
-        if not rows:
-            return ([], None)
+        # Filter out empty blobs (sentinel for agents with no text)
+        rows = [r for r in rows if r[2]]
 
-        session_ids = [r[0] for r in rows]
-        vectors = [np.frombuffer(r[1], dtype=np.float32) for r in rows]
+        if not rows:
+            return ([], None, None)
+
+        # Build unique session_ids and session_starts (rows ordered by session_id)
+        unique_session_ids: list[str] = []
+        starts: list[int] = []
+        prev_sid = None
+        vectors: list = []
+        for i, (sid, _aid, blob) in enumerate(rows):
+            if sid != prev_sid:
+                unique_session_ids.append(sid)
+                starts.append(i)
+                prev_sid = sid
+            vectors.append(np.frombuffer(blob, dtype=np.float32))
+
         matrix = np.stack(vectors)
-        return (session_ids, matrix)
+        session_starts = np.array(starts, dtype=np.intp)
+        return (unique_session_ids, session_starts, matrix)
 
     def _substring_filter(self, query: str, sessions: list[dict]) -> list[dict]:
         """Case-insensitive substring match against metadata text."""

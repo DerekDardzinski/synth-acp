@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 import time
-from pathlib import Path
 
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS agents (
@@ -61,10 +59,12 @@ CREATE INDEX IF NOT EXISTS idx_ui_events_user_prompts
 
 SESSION_EMBEDDINGS_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS session_embeddings (
-    session_id  TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,
     text_hash   TEXT NOT NULL,
     embedding   BLOB NOT NULL,
-    created_at  INTEGER NOT NULL
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (session_id, agent_id)
 );
 """
 
@@ -106,6 +106,14 @@ def _migrate_schema_sync(conn) -> None:
         """)
         conn.commit()
 
+    # Migrate session_embeddings: detect old single-PK schema (no agent_id column)
+    cur = conn.execute("PRAGMA table_info(session_embeddings)")
+    emb_cols = {row[1] for row in cur.fetchall()}
+    if emb_cols and "agent_id" not in emb_cols:
+        conn.execute("DROP TABLE session_embeddings")
+        conn.executescript(SESSION_EMBEDDINGS_SCHEMA)
+        conn.commit()
+
 
 _EXPIRE_SQL = (
     "DELETE FROM agents WHERE status IN ('restorable', 'active')"
@@ -142,57 +150,35 @@ def expire_old_sessions_sync(conn, max_age_days: int = 30) -> None:
 
 
 def store_embedding_sync(
-    conn: sqlite3.Connection, session_id: str, text_hash: str, embedding_blob: bytes
+    conn: sqlite3.Connection, session_id: str, agent_id: str, text_hash: str, embedding_blob: bytes
 ) -> None:
-    """Upsert a session embedding. embedding_blob is 1536 bytes (384 x float32)."""
+    """Upsert a per-agent embedding. embedding_blob is 1536 bytes (384 x float32)."""
     conn.execute(
-        "INSERT OR REPLACE INTO session_embeddings (session_id, text_hash, embedding, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (session_id, text_hash, embedding_blob, int(time.time() * 1000)),
+        "INSERT OR REPLACE INTO session_embeddings (session_id, agent_id, text_hash, embedding, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (session_id, agent_id, text_hash, embedding_blob, int(time.time() * 1000)),
     )
     conn.commit()
 
 
-def load_all_embeddings_sync(conn: sqlite3.Connection) -> list[tuple[str, bytes]]:
-    """Return all (session_id, embedding_blob) pairs."""
-    return conn.execute("SELECT session_id, embedding FROM session_embeddings").fetchall()
-
-
-def get_unembedded_sessions_sync(conn: sqlite3.Connection) -> list[str]:
-    """Return session_ids that exist in agents (restorable) but not in session_embeddings."""
-    rows = conn.execute(
-        "SELECT session_id FROM agents WHERE status IN ('restorable', 'active') "
-        "GROUP BY session_id "
-        "EXCEPT SELECT session_id FROM session_embeddings"
+def load_all_embeddings_sync(conn: sqlite3.Connection) -> list[tuple[str, str, bytes]]:
+    """Return all (session_id, agent_id, embedding_blob) tuples ordered by session_id."""
+    return conn.execute(
+        "SELECT session_id, agent_id, embedding FROM session_embeddings ORDER BY session_id"
     ).fetchall()
-    return [r[0] for r in rows]
 
 
-def _build_embedding_text(session: dict) -> str:
-    """Compose text for embedding from session metadata.
-
-    Concatenates: first_messages + agent names + cwd basename + tasks.
-    Truncated to ~200 words to stay under 256 tokens.
-    """
-    parts: list[str] = []
-    for msg in session.get("first_messages", []):
-        parts.append(msg)
-    agents = session.get("agents", [])
-    if agents:
-        parts.append(", ".join(agents))
-    cwd = session.get("cwd")
-    if cwd:
-        parts.append(Path(cwd).name)
-    for task in session.get("tasks", []):
-        parts.append(task)
-    text = "\n".join(parts)
-    words = text.split()
-    if len(words) > 200:
-        words = words[:200]
-    return " ".join(words)
+def get_unembedded_agents_sync(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Return (session_id, agent_id) pairs that exist in agents but not in session_embeddings."""
+    return conn.execute(
+        "SELECT a.session_id, a.agent_id FROM agents a "
+        "WHERE a.status IN ('restorable', 'active') "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM session_embeddings e "
+        "  WHERE e.session_id = a.session_id AND e.agent_id = a.agent_id"
+        ")"
+    ).fetchall()
 
 
-def _text_hash(text: str) -> str:
-    """SHA256 hex digest of text for staleness detection."""
-    return hashlib.sha256(text.encode()).hexdigest()
+
 
