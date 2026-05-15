@@ -298,7 +298,6 @@ class SynthApp(App):
                 feed = self._panels[recipient]
                 if feed.input_bar:
                     feed.input_bar.enqueue(event.preview, "mcp", event.from_agent)
-                    self._attempt_drain(recipient)
             return
 
         # Handle MCP messages — update threads and show in conversation
