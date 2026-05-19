@@ -91,13 +91,3 @@ class RestoreSession(BrokerCommand):
     broker_session_id: str
 
 
-class HoldDelivery(BrokerCommand):
-    """Hold MCP message delivery for an agent. Messages go to UI queue instead."""
-
-    agent_id: str
-
-
-class ReleaseDelivery(BrokerCommand):
-    """Release MCP delivery hold. Future messages deliver directly to agent."""
-
-    agent_id: str
