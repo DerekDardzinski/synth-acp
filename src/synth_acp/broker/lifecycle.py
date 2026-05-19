@@ -340,6 +340,39 @@ class AgentLifecycle:
                 return
             await session.set_config_option(config_id, value)
 
+    async def set_agent(self, agent_id: str, agent_name: str) -> None:
+        """Switch active agent via fork_session."""
+        async with self._registry.agent_lock(agent_id):
+            session = self._registry.get_session(agent_id)
+            if not session:
+                await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
+                return
+            if session.state != AgentState.IDLE:
+                await self._sink(
+                    BrokerError(
+                        agent_id=agent_id,
+                        message=f"Agent '{agent_id}' is {session.state}, cannot switch agent",
+                        severity="warning",
+                    )
+                )
+                return
+            new_session_id = await session.fork_with_agent(agent_name)
+            if new_session_id:
+                await self._update_acp_session_id(agent_id, new_session_id)
+
+    async def _update_acp_session_id(self, agent_id: str, new_session_id: str) -> None:
+        """Update acp_session_id in DB."""
+        session_id = self._session_id
+
+        def _sync(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE agents SET acp_session_id = ? WHERE agent_id = ? AND session_id = ?",
+                (new_session_id, agent_id, session_id),
+            )
+            conn.commit()
+
+        await self._db_op(_sync)
+
     async def handle_launch_command(
         self, cmd_id: int, from_agent: str, data: dict[str, str]
     ) -> None:

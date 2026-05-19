@@ -616,7 +616,7 @@ class InputBar(Vertical):
 
     # --- Config option pickers ---
 
-    _CATEGORY_ORDER: ClassVar[dict[str, int]] = {"mode": 0, "model": 1, "thought_level": 2}
+    _CATEGORY_ORDER: ClassVar[dict[str, int]] = {"agent": -1, "mode": 0, "model": 1, "thought_level": 2}
 
     def update_config_options(self, options: list[SessionConfigOptionSelect | SessionConfigOptionBoolean]) -> None:
         """Rebuild pickers from config options. Only select-type options get pickers.

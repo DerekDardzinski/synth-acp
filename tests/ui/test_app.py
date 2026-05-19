@@ -47,6 +47,7 @@ def _make_broker(events: list[BrokerEvent] | None = None, agent_ids: list[str] |
     broker.get_agent_parent = MagicMock(return_value=None)
     broker.get_agent_harness = MagicMock(return_value="kiro")
     broker.get_agent_cwd = MagicMock(return_value=".")
+    broker.get_agent_display_name = MagicMock(return_value=None)
 
     async def _events():
         for e in events or []:
@@ -817,3 +818,59 @@ class TestRecordEvent:
             event = McpMessageDelivered(agent_id="agent-1", from_agent="other", to_agent="agent-1", preview="hello")
             await app.on_broker_event_message(BrokerEventMessage(event))
             assert event in feed._current_turn_events
+
+
+class TestSynthesizeAgentOption:
+    def test_returns_select_for_meta_agent(self) -> None:
+        """Picker appears for Claude Code agents with discovered agents.
+        Silent failure: picker never appears."""
+        from unittest.mock import MagicMock
+
+        from acp.schema import SessionConfigOptionSelect
+
+        from synth_acp.discovery import DiscoveredAgent
+
+        broker = _make_broker(agent_ids=["agent-1"])
+        # Set up registry mock
+        registry = MagicMock()
+        registry.get_agent_mode_target = MagicMock(return_value="meta_agent")
+        registry.get_agent_mode = MagicMock(return_value="plugin-x:code-planner")
+        broker._registry = registry
+
+        fake_agents = [
+            DiscoveredAgent(qualified_name="plugin-x:code-planner", name="code-planner", description="Plans code", source="plugin:plugin-x"),
+            DiscoveredAgent(qualified_name="reviewer", name="reviewer", description="Reviews", source="user"),
+        ]
+        broker.get_discovered_agents = MagicMock(return_value=fake_agents)
+
+        app = SynthApp(broker, _make_config("agent-1"))
+        result = app._synthesize_agent_option("agent-1")
+
+        assert result is not None
+        assert isinstance(result, SessionConfigOptionSelect)
+        assert result.id == "agent"
+        assert result.name == "Agent"
+        assert result.category == "agent"
+        assert result.current_value == "plugin-x:code-planner"
+        assert len(result.options) == 3
+        assert result.options[0].name == "Default"
+        assert result.options[0].value == ""
+        assert result.options[1].name == "code-planner"
+        assert result.options[1].value == "plugin-x:code-planner"
+        assert result.options[2].name == "reviewer"
+        assert result.options[2].value == "reviewer"
+
+    def test_returns_none_for_non_meta_agent(self) -> None:
+        """Non-meta_agent harnesses are unaffected.
+        Silent failure: Kiro/OpenCode get a spurious Agent picker."""
+        from unittest.mock import MagicMock
+
+        broker = _make_broker(agent_ids=["agent-1"])
+        registry = MagicMock()
+        registry.get_agent_mode_target = MagicMock(return_value="acp_mode")
+        broker._registry = registry
+
+        app = SynthApp(broker, _make_config("agent-1"))
+        result = app._synthesize_agent_option("agent-1")
+
+        assert result is None

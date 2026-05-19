@@ -14,6 +14,7 @@ from typing import Any
 
 from acp.client.connection import ClientSideConnection
 from acp.contrib.session_state import SessionAccumulator
+from acp.exceptions import RequestError
 from acp.schema import (
     AgentMessageChunk,
     AgentPlanUpdate,
@@ -194,6 +195,16 @@ class ACPSession:
     def session_id(self) -> str | None:
         """The ACP session ID, or None if not yet initialized."""
         return self._session_id
+
+    @property
+    def agent_mode(self) -> str | None:
+        """The configured agent_mode value, or None."""
+        return self._agent_mode
+
+    @property
+    def agent_mode_target(self) -> str | None:
+        """How agent_mode is applied: 'meta_agent' or 'acp_mode', or None."""
+        return self._agent_mode_target
 
     async def force_terminate(self) -> None:
         """Force transition to TERMINATED. Safe for cleanup paths and voluntary exit.
@@ -778,6 +789,70 @@ class ACPSession:
                         severity="warning",
                     )
                 )
+        finally:
+            if self.state == AgentState.CONFIGURING:
+                await self._sm.transition(AgentState.IDLE)
+
+    async def fork_with_agent(self, agent_name: str) -> str | None:
+        """Fork current session with a different agent.
+
+        Calls conn.fork_session with _meta.claudeCode.options.agent set to agent_name.
+        On success: swaps _session_id, updates _agent_mode, re-captures config_options
+        from fork response, emits ConfigOptionsReceived. Returns new session_id.
+        On failure: emits BrokerError, returns None.
+
+        Precondition: state must be IDLE.
+        State transitions: IDLE -> CONFIGURING -> IDLE (in finally).
+        """
+        if not self._conn or not self._session_id:
+            return None
+        if self.state != AgentState.IDLE:
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=f"Cannot switch agent while {self.state}",
+                    severity="warning",
+                )
+            )
+            return None
+
+        await self._sm.transition(AgentState.CONFIGURING)
+        try:
+            meta_kwargs: dict[str, Any] = {}
+            if agent_name:
+                meta_kwargs["claudeCode"] = {"options": {"agent": agent_name}}
+            try:
+                response = await self._conn.fork_session(
+                    cwd=self._cwd,
+                    session_id=self._session_id,
+                    mcp_servers=self._mcp_servers or None,
+                    **meta_kwargs,
+                )
+            except RequestError as exc:
+                if exc.code == -32002:
+                    # Empty session — no history to fork. Fall back to new_session.
+                    log.debug("Fork failed (no history), falling back to new_session for %s", self.agent_id)
+                    response = await self._conn.new_session(
+                        cwd=self._cwd,
+                        mcp_servers=self._mcp_servers,
+                        **meta_kwargs,
+                    )
+                else:
+                    raise
+            self._session_id = response.session_id
+            self._agent_mode = agent_name or None
+            await self._capture_config_options(response)
+            return response.session_id
+        except Exception as exc:
+            log.warning("fork_with_agent failed for %s: %s", self.agent_id, exc)
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=f"Failed to switch agent to {agent_name}: {exc}",
+                    severity="error",
+                )
+            )
+            return None
         finally:
             if self.state == AgentState.CONFIGURING:
                 await self._sm.transition(AgentState.IDLE)

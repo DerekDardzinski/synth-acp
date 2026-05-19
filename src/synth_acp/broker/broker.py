@@ -18,6 +18,7 @@ from synth_acp.broker.message_bus import MessageBus
 from synth_acp.broker.permissions import PermissionEngine
 from synth_acp.broker.registry import AgentRegistry
 from synth_acp.db import ensure_schema_sync
+from synth_acp.discovery import DiscoveredAgent, discover_agents
 from synth_acp.models.agent import AgentConfig, AgentMode, AgentModel, AgentState
 from synth_acp.models.commands import (
     BrokerCommand,
@@ -90,6 +91,7 @@ class ACPBroker:
         self._turn_buffer_tool_index: dict[str, dict[str, int]] = {}
         self._pending_flushes: set[asyncio.Task] = set()
         self._delivery_held: set[str] = set()
+        self._discovery_cache: dict[str, list[DiscoveredAgent]] = {}
 
     @property
     def session_id(self) -> str:
@@ -127,7 +129,10 @@ class ACPBroker:
             case SetAgentModel(agent_id=aid, model_id=mid):
                 await lifecycle.set_config_option(aid, "model", mid)
             case SetConfigOption(agent_id=aid, config_id=cid, value=val):
-                await lifecycle.set_config_option(aid, cid, val)
+                if cid == "agent" and self._registry.get_agent_mode_target(aid) == "meta_agent":
+                    await lifecycle.set_agent(aid, str(val))
+                else:
+                    await lifecycle.set_config_option(aid, cid, val)
             case RestoreSession(broker_session_id=sid):
                 await self.restore_session(sid)
             case HoldDelivery(agent_id=aid):
@@ -165,6 +170,37 @@ class ACPBroker:
 
     def get_current_model(self, agent_id: str) -> str | None:
         return self._registry.get_current_model(agent_id)
+
+    def get_agent_display_name(self, agent_id: str) -> str | None:
+        """Return a short display name for the agent's configured mode, or None.
+
+        For harnesses where agent_mode_target is 'meta_agent' (e.g. Claude Code),
+        the config_options 'mode' category represents the permission mode, not the
+        agent. This method returns the actual agent name (short form) in that case.
+        """
+        if self._registry.get_agent_mode_target(agent_id) == "meta_agent":
+            mode = self._registry.get_agent_mode(agent_id)
+            if mode:
+                return mode.split(":")[-1]
+        return None
+
+    def get_discovered_agents(self, agent_id: str) -> list[DiscoveredAgent]:
+        """Return cached discovery results for the agent's harness."""
+        if self._lifecycle is None:
+            return []
+        harness_name = self._registry.get_harness(agent_id)
+        if not harness_name:
+            return []
+        entry = next(
+            (e for e in self._lifecycle._harness_registry if e.short_name == harness_name),
+            None,
+        )
+        if entry is None:
+            return []
+        if entry.identity not in self._discovery_cache:
+            cwd = self._registry.get_cwd(agent_id)
+            self._discovery_cache[entry.identity] = discover_agents(entry, Path(cwd))
+        return self._discovery_cache[entry.identity]
 
     def is_permission_pending(self, agent_id: str) -> bool:
         return any(p.agent_id == agent_id for p in self._pending_permissions.values())

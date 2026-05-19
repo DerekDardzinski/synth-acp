@@ -821,3 +821,73 @@ class TestSetConfigOption:
         errors = [e for e in events if isinstance(e, BrokerError)]
         assert len(errors) == 1
         assert "cannot change config option" in errors[0].message
+
+
+class TestSetAgent:
+    async def test_set_agent_calls_fork_with_agent_and_updates_db(self, tmp_path: Path) -> None:
+        """set_agent must call fork_with_agent and persist new session_id to DB.
+        Silent failure: DB not updated means session restore uses stale session_id."""
+        import sqlite3
+
+        from synth_acp.db import ensure_schema_sync
+
+        db_path = tmp_path / "synth.db"
+        config = _config("a")
+        reg = AgentRegistry()
+        events: list = []
+
+        async def sink(e: object) -> None:
+            events.append(e)
+
+        lc = AgentLifecycle(config, reg, sink, db_path=db_path, session_id="s1")
+
+        # Seed DB with agent row
+        with sqlite3.connect(str(db_path)) as conn:
+            ensure_schema_sync(conn)
+            conn.execute(
+                "INSERT INTO agents (agent_id, session_id, status, registered, harness, acp_session_id) "
+                "VALUES (?, ?, 'active', 1000, 'claude', 'old-acp-sess')",
+                ("a", "s1"),
+            )
+            conn.commit()
+
+        mock_session = AsyncMock()
+        mock_session.state = AgentState.IDLE
+        mock_session.fork_with_agent = AsyncMock(return_value="new-acp-sess")
+        reg.register("a", mock_session)
+
+        await lc.set_agent("a", "code-planner")
+
+        mock_session.fork_with_agent.assert_awaited_once_with("code-planner")
+
+        # Verify DB updated
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute(
+                "SELECT acp_session_id FROM agents WHERE agent_id = ? AND session_id = ?",
+                ("a", "s1"),
+            ).fetchone()
+        assert row[0] == "new-acp-sess"
+
+    async def test_set_agent_emits_error_when_not_idle(self) -> None:
+        """set_agent on a non-idle agent must emit BrokerError and not call fork.
+        Silent failure: fork attempted on busy agent causes undefined behavior."""
+        config = _config("a")
+        reg = AgentRegistry()
+        events: list = []
+
+        async def sink(e: object) -> None:
+            events.append(e)
+
+        lc = AgentLifecycle(config, reg, sink, db_path=Path("/tmp/unused.db"), session_id="s1")
+
+        mock_session = AsyncMock()
+        mock_session.state = AgentState.BUSY
+        mock_session.fork_with_agent = AsyncMock()
+        reg.register("a", mock_session)
+
+        await lc.set_agent("a", "code-planner")
+
+        mock_session.fork_with_agent.assert_not_awaited()
+        errors = [e for e in events if isinstance(e, BrokerError)]
+        assert len(errors) == 1
+        assert "cannot switch agent" in errors[0].message

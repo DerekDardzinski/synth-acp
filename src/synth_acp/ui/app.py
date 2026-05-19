@@ -11,6 +11,7 @@ import os
 import sqlite3
 from typing import ClassVar, NamedTuple
 
+from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -400,6 +401,9 @@ class SynthApp(App):
 
         if isinstance(event, ConfigOptionsReceived):
             self._agent_config_options[event.agent_id] = list(event.config_options)
+            agent_opt = self._synthesize_agent_option(event.agent_id)
+            if agent_opt is not None:
+                self._agent_config_options[event.agent_id].insert(0, agent_opt)
             self._update_tile_mode_from_config(event.agent_id)
             self._update_input_bar_config_options(event.agent_id)
 
@@ -652,8 +656,40 @@ class SynthApp(App):
         if queued:
             self.run_worker(self.broker.handle(SendPrompt(agent_id=agent_id, text=queued.text)))
 
+    def _synthesize_agent_option(self, agent_id: str) -> SessionConfigOptionSelect | None:
+        """Build a synthesized agent picker option from discovery results."""
+        if self.broker._registry.get_agent_mode_target(agent_id) != "meta_agent":
+            return None
+        agents = self.broker.get_discovered_agents(agent_id)
+        if not agents:
+            return None
+        current_value = self.broker._registry.get_agent_mode(agent_id) or ""
+        return SessionConfigOptionSelect(
+            id="agent",
+            name="Agent",
+            category="agent",
+            type="select",
+            current_value=current_value,
+            options=[
+                SessionConfigSelectOption(name="Default", value=""),
+                *[
+                    SessionConfigSelectOption(name=a.name, value=a.qualified_name)
+                    for a in agents
+                ],
+            ],
+        )
+
     def _update_tile_mode_from_config(self, agent_id: str) -> None:
         """Resolve the current mode name from config options and push to tile."""
+        # For harnesses where mode config option != agent name (e.g. Claude Code),
+        # use the broker's display name derived from the configured agent_mode.
+        display_name = self.broker.get_agent_display_name(agent_id)
+        if display_name:
+            tile = self._tiles.get(agent_id)
+            if tile is not None:
+                tile.update_mode(display_name)
+            return
+
         options = self._agent_config_options.get(agent_id, [])
         mode_opt = next((o for o in options if getattr(o, "category", None) == "mode" and hasattr(o, "current_value")), None)
         mode_name: str | None = None

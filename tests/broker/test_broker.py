@@ -856,3 +856,126 @@ class TestListRestorableSessions:
 
         results = await ACPBroker.list_restorable_sessions(db_path)
         assert results[0]["initial_prompts"] == {}
+
+
+class TestBrokerAgentRouting:
+    """Tests for SetConfigOption(config_id='agent') routing to set_agent."""
+
+    async def test_broker_routes_agent_config_to_set_agent_for_meta_agent(self, tmp_path: Path) -> None:
+        """config_id='agent' with meta_agent target must route to lifecycle.set_agent.
+        Silent failure: goes through set_config_option which doesn't know how to fork."""
+        from synth_acp.models.commands import SetConfigOption
+
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        lifecycle = await broker._ensure_lifecycle()
+
+        # Register a session with agent_mode_target="meta_agent"
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=broker._sink,
+            agent_mode_target="meta_agent",
+        )
+        session._sm._state = AgentState.IDLE
+        broker._registry._sessions["agent-1"] = session
+
+        lifecycle.set_agent = AsyncMock()  # type: ignore[method-assign]
+        lifecycle.set_config_option = AsyncMock()  # type: ignore[method-assign]
+
+        await broker.handle(SetConfigOption(agent_id="agent-1", config_id="agent", value="code-planner"))
+
+        lifecycle.set_agent.assert_awaited_once_with("agent-1", "code-planner")
+        lifecycle.set_config_option.assert_not_awaited()
+
+    async def test_broker_routes_non_agent_config_to_set_config_option(self, tmp_path: Path) -> None:
+        """config_id='mode' must still route to set_config_option unchanged.
+        Silent failure: all config options accidentally routed to set_agent."""
+        from synth_acp.models.commands import SetConfigOption
+
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        lifecycle = await broker._ensure_lifecycle()
+
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=broker._sink,
+            agent_mode_target="meta_agent",
+        )
+        session._sm._state = AgentState.IDLE
+        broker._registry._sessions["agent-1"] = session
+
+        lifecycle.set_agent = AsyncMock()  # type: ignore[method-assign]
+        lifecycle.set_config_option = AsyncMock()  # type: ignore[method-assign]
+
+        await broker.handle(SetConfigOption(agent_id="agent-1", config_id="mode", value="trust"))
+
+        lifecycle.set_config_option.assert_awaited_once_with("agent-1", "mode", "trust")
+        lifecycle.set_agent.assert_not_awaited()
+
+
+class TestDiscoveryCache:
+    async def test_get_discovered_agents_caches_by_identity(self, tmp_path: Path) -> None:
+        """Discovery is only called once per harness identity.
+        Silent failure: filesystem scan runs on every config option emission."""
+        from unittest.mock import patch as _patch
+
+        from synth_acp.discovery import DiscoveredAgent
+        from synth_acp.models.config import HarnessEntry
+
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        lifecycle = await broker._ensure_lifecycle()
+
+        entry = HarnessEntry(
+            identity="claude",
+            name="Claude Code",
+            short_name="claude",
+            binary_names=["claude"],
+            run_cmd="claude acp",
+            agent_mode_target="meta_agent",
+        )
+        lifecycle._harness_registry = [entry]
+
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="echo",
+            args=[],
+            cwd="/tmp/project",
+            event_sink=broker._sink,
+        )
+        broker._registry._sessions["agent-1"] = session
+        broker._registry.set_harness("agent-1", "claude")
+
+        fake_agents = [
+            DiscoveredAgent(qualified_name="planner", name="planner", description="", source="user")
+        ]
+
+        with _patch("synth_acp.broker.broker.discover_agents", return_value=fake_agents) as mock_discover:
+            result1 = broker.get_discovered_agents("agent-1")
+            result2 = broker.get_discovered_agents("agent-1")
+
+        assert result1 == fake_agents
+        assert result2 == fake_agents
+        assert mock_discover.call_count == 1
+
+    async def test_get_discovered_agents_returns_empty_for_unknown_harness(self, tmp_path: Path) -> None:
+        """Unknown harness returns empty list gracefully.
+        Silent failure: KeyError crash."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        await broker._ensure_lifecycle()
+
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=broker._sink,
+        )
+        broker._registry._sessions["agent-1"] = session
+        broker._registry.set_harness("agent-1", "nonexistent")
+
+        result = broker.get_discovered_agents("agent-1")
+        assert result == []

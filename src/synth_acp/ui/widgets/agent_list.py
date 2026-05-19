@@ -106,11 +106,14 @@ class AgentTile(Vertical):
             else ""
         )
         name = f"[$primary bold]{escape(self._agent_id)}[/]"
-        if self._parent_agent:
-            name += f" [$text-muted](via {escape(self._parent_agent)})[/]"
-        mode_badge = (
-            f"  [$accent dim]{escape(self._current_mode)}[/]"
+        mode_line = (
+            f"\n  [$accent dim]{escape(self._current_mode)}[/]"
             if self._current_mode
+            else ""
+        )
+        parent_line = (
+            f"\n  [$text-muted]via {escape(self._parent_agent)}[/]"
+            if self._parent_agent
             else ""
         )
         preview = (
@@ -118,7 +121,7 @@ class AgentTile(Vertical):
             if self._agent_task
             else PREVIEW_TEXT.get(self._state, DEFAULT_PREVIEW)
         )
-        return f"{dot} {name}{warn}{mode_badge}\n  {preview}"
+        return f"{dot} {name}{warn}{mode_line}{parent_line}\n  {preview}"
 
     def update_state(self, new_state: AgentState) -> None:
         """Update the tile to reflect a new agent state.

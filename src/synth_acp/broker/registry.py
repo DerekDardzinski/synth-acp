@@ -115,5 +115,13 @@ class AgentRegistry:
         s = self._sessions.get(agent_id)
         return s.current_model_id if s else None
 
+    def get_agent_mode(self, agent_id: str) -> str | None:
+        s = self._sessions.get(agent_id)
+        return s.agent_mode if s else None
+
+    def get_agent_mode_target(self, agent_id: str) -> str | None:
+        s = self._sessions.get(agent_id)
+        return s.agent_mode_target if s else None
+
     def active_count(self) -> int:
         return sum(1 for s in self._sessions.values() if s.state != AgentState.TERMINATED)

@@ -1309,3 +1309,161 @@ class TestSetConfigOption:
         assert len(error_events) == 1
         assert error_events[0].severity == "warning"
         assert session.state == AgentState.BUSY
+
+
+class TestForkWithAgent:
+    """Tests for ACPSession.fork_with_agent."""
+
+    @pytest.fixture()
+    def events(self) -> list[BrokerEvent]:
+        return []
+
+    @pytest.fixture()
+    def session(self, events: list[BrokerEvent]) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        s = ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd="/project",
+            event_sink=sink,
+            agent_mode="old-agent",
+            agent_mode_target="meta_agent",
+        )
+        s._session_id = "sess-1"
+        return s
+
+    async def test_fork_with_agent_calls_fork_session_with_correct_meta(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """fork_session must receive claudeCode options with the agent name.
+        Silent failure: wrong agent loaded if _meta is malformed."""
+        from unittest.mock import AsyncMock
+
+
+        conn = AsyncMock()
+        conn.fork_session.return_value = AsyncMock(
+            session_id="sess-2", config_options=None, modes=None, models=None
+        )
+        session._conn = conn
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+        events.clear()
+
+        await session.fork_with_agent("new-agent")
+
+        conn.fork_session.assert_called_once_with(
+            cwd="/project",
+            session_id="sess-1",
+            mcp_servers=None,
+            claudeCode={"options": {"agent": "new-agent"}},
+        )
+
+    async def test_fork_with_agent_swaps_session_id_and_agent_mode(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Session ID and agent_mode must update on success.
+        Silent failure: stale session_id means prompts go to old session."""
+        from unittest.mock import AsyncMock
+
+        conn = AsyncMock()
+        conn.fork_session.return_value = AsyncMock(
+            session_id="sess-new", config_options=None, modes=None, models=None
+        )
+        session._conn = conn
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+        events.clear()
+
+        result = await session.fork_with_agent("new-agent")
+
+        assert result == "sess-new"
+        assert session._session_id == "sess-new"
+        assert session._agent_mode == "new-agent"
+
+    async def test_fork_with_agent_returns_none_on_failure(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Must return None and emit BrokerError on exception.
+        Silent failure: exception propagates and crashes caller."""
+        from unittest.mock import AsyncMock
+
+        from synth_acp.models.events import BrokerError as BErr
+
+        conn = AsyncMock()
+        conn.fork_session.side_effect = RuntimeError("connection lost")
+        session._conn = conn
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+        events.clear()
+
+        result = await session.fork_with_agent("new-agent")
+
+        assert result is None
+        assert session._session_id == "sess-1"  # unchanged
+        error_events = [e for e in events if isinstance(e, BErr)]
+        assert len(error_events) == 1
+        assert "new-agent" in error_events[0].message
+
+    async def test_fork_with_agent_transitions_through_configuring(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Must enter CONFIGURING before fork and return to IDLE after.
+        Silent failure: concurrent prompts race the fork."""
+        from unittest.mock import AsyncMock
+
+        observed_states: list[AgentState] = []
+        original_sink = session._event_sink
+
+        async def tracking_sink(event: BrokerEvent) -> None:
+            if isinstance(event, AgentStateChanged):
+                observed_states.append(event.new_state)
+            await original_sink(event)
+
+        session._event_sink = tracking_sink
+
+        conn = AsyncMock()
+        conn.fork_session.return_value = AsyncMock(
+            session_id="sess-2", config_options=None, modes=None, models=None
+        )
+        session._conn = conn
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+        observed_states.clear()
+
+        await session.fork_with_agent("new-agent")
+
+        assert AgentState.CONFIGURING in observed_states
+        assert session.state == AgentState.IDLE
+
+    async def test_fork_with_agent_falls_back_to_new_session_on_resource_not_found(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """When fork fails with resource-not-found (empty session), must fall back to new_session.
+        Silent failure: agent switch fails on empty sessions."""
+        from unittest.mock import AsyncMock
+
+        from acp.exceptions import RequestError
+
+        conn = AsyncMock()
+        conn.fork_session.side_effect = RequestError(-32002, "Resource not found")
+        conn.new_session.return_value = AsyncMock(
+            session_id="sess-new", config_options=None, modes=None, models=None
+        )
+        session._conn = conn
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+        events.clear()
+
+        result = await session.fork_with_agent("new-agent")
+
+        assert result == "sess-new"
+        assert session._session_id == "sess-new"
+        assert session._agent_mode == "new-agent"
+        conn.new_session.assert_called_once_with(
+            cwd="/project",
+            mcp_servers=[],
+            claudeCode={"options": {"agent": "new-agent"}},
+        )
