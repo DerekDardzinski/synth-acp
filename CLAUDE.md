@@ -1,5 +1,9 @@
 # AGENTS.md
 
+## Multi-Agent Orchestration
+
+When working on this project within a Synth session, **always use `synth-mcp` tools (`launch_agent`, `send_message`, `terminate_agent`) to spawn and coordinate child agents** — never use native Claude Code subagents (the `Agent` tool). Native subagents bypass the Synth broker, so they won't appear in the TUI, won't be managed by the session lifecycle, and their messages won't route through the message bus. Using synth-mcp ensures agents are visible, manageable, and testable through the same system you're developing.
+
 ## Project Overview
 
 SYNTH (Synchronized Network of Teamed Harnesses over ACP) is a multi-agent orchestration dashboard that manages teams of AI coding agents through the Agent Client Protocol (ACP). A single process runs the broker (session lifecycle, message routing, permissions) and a Textual TUI.
