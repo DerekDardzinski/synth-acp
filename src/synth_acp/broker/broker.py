@@ -23,9 +23,7 @@ from synth_acp.models.agent import AgentConfig, AgentMode, AgentModel, AgentStat
 from synth_acp.models.commands import (
     BrokerCommand,
     CancelTurn,
-    HoldDelivery,
     LaunchAgent,
-    ReleaseDelivery,
     RespondPermission,
     RestoreSession,
     ResurrectAgent,
@@ -135,10 +133,18 @@ class ACPBroker:
                     await lifecycle.set_config_option(aid, cid, val)
             case RestoreSession(broker_session_id=sid):
                 await self.restore_session(sid)
-            case HoldDelivery(agent_id=aid):
-                self._delivery_held.add(aid)
-            case ReleaseDelivery(agent_id=aid):
-                self._delivery_held.discard(aid)
+
+    # ------------------------------------------------------------------
+    # Synchronous delivery hold/release
+    # ------------------------------------------------------------------
+
+    def hold_delivery(self, agent_id: str) -> None:
+        """Synchronously hold MCP delivery for agent. Messages will be queued in UI."""
+        self._delivery_held.add(agent_id)
+
+    def release_delivery(self, agent_id: str) -> None:
+        """Synchronously release MCP delivery hold. Messages deliver directly."""
+        self._delivery_held.discard(agent_id)
 
     # ------------------------------------------------------------------
     # State queries (thin delegations to registry)
@@ -852,7 +858,11 @@ class ACPBroker:
             return True
         session = self._registry.get_session(agent_id)
         if not session or session.state != AgentState.IDLE:
-            return False
+            for sender in from_agents:
+                await self._sink(
+                    McpMessageHeld(agent_id=agent_id, from_agent=sender, preview=text)
+                )
+            return True
         try:
             if self._lifecycle:
                 success = await self._lifecycle.prompt(agent_id, text)

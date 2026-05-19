@@ -28,9 +28,7 @@ from synth_acp.db import (
 from synth_acp.embeddings import EmbeddingEngine, embedding_available
 from synth_acp.models.agent import AgentConfig, AgentState, css_id
 from synth_acp.models.commands import (
-    HoldDelivery,
     LaunchAgent,
-    ReleaseDelivery,
     RespondPermission,
     SendPrompt,
     TerminateAgent,
@@ -299,6 +297,7 @@ class SynthApp(App):
                 feed = self._panels[recipient]
                 if feed.input_bar:
                     feed.input_bar.enqueue(event.preview, "mcp", event.from_agent)
+                    self._attempt_drain(recipient)
             return
 
         # Handle MCP messages — update threads and show in conversation
@@ -551,10 +550,10 @@ class SynthApp(App):
         if event.text_area.text.strip():
             if agent_id not in self._delivery_holding:
                 self._delivery_holding.add(agent_id)
-                self.run_worker(self.broker.handle(HoldDelivery(agent_id=agent_id)))
+                self.broker.hold_delivery(agent_id)
         elif agent_id in self._delivery_holding:
             self._delivery_holding.discard(agent_id)
-            self.run_worker(self.broker.handle(ReleaseDelivery(agent_id=agent_id)))
+            self.broker.release_delivery(agent_id)
 
     async def on_agent_tile_terminate_clicked(self, message: AgentTile.TerminateClicked) -> None:
         """Handle the close button on an agent tile."""
@@ -647,6 +646,9 @@ class SynthApp(App):
             return
         if not feed.input_bar.has_queue_items:
             feed.input_bar.set_drain_pending(False)
+            return
+        # Don't show drain or auto-drain if agent isn't idle — wait for IDLE transition
+        if self._agent_states.get(agent_id) != AgentState.IDLE:
             return
         if feed.input_bar.is_composing or agent_id in self._drain_suppressed:
             feed.input_bar.set_drain_pending(True)
@@ -835,7 +837,7 @@ class SynthApp(App):
             old_feed = self._panels.get(old_agent)
             if not old_feed or not old_feed.input_bar or not old_feed.input_bar.is_composing:
                 self._delivery_holding.discard(old_agent)
-                self.run_worker(self.broker.handle(ReleaseDelivery(agent_id=old_agent)))
+                self.broker.release_delivery(old_agent)
         if not agent_id:
             return
         feed_id = f"feed-{css_id(agent_id)}"

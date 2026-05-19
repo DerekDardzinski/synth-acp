@@ -480,10 +480,12 @@ class TestAttemptDrain:
 
     async def test_attempt_drain_dispatches_send_prompt_when_queue_has_item(self) -> None:
         """_attempt_drain calls broker.handle(SendPrompt) when drain_next returns an item."""
+        from synth_acp.models.agent import AgentState
         from synth_acp.models.commands import SendPrompt
         from synth_acp.ui.widgets.prompt_queue import QueuedPrompt
 
         app = _make_app("agent-1")
+        app._agent_states["agent-1"] = AgentState.IDLE
         feed = MagicMock()
         feed.input_bar = MagicMock()
         feed.input_bar.drain_next = MagicMock(return_value=QueuedPrompt(text="queued msg"))
