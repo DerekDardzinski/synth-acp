@@ -102,14 +102,9 @@ class TestBrokerDispatch:
         assert "hello" in prompt_text
         assert "orchestration_context" in prompt_text
 
+        # Sending to busy agent enqueues instead of erroring (unified prompt queue)
         await broker.handle(SendPrompt(agent_id="agent-2", text="hello"))
-        # Drain any HookFired events to find the BrokerError
-        events = []
-        while not broker._event_queue.empty():
-            events.append(broker._event_queue.get_nowait())
-        errors = [e for e in events if isinstance(e, BrokerError)]
-        assert len(errors) == 1
-        assert "agent-2" in errors[0].message
+        assert not broker._prompt_queue.is_empty("agent-2")
 
     async def test_resolve_permission_when_always_option_persists_rule(
         self, tmp_path: Path
@@ -544,9 +539,9 @@ class TestRelaunchTerminatedAgent:
                 await broker._message_bus.stop()
 
 
-class TestSelfTerminate:
-    async def test_two_pending_messages_before_idle_wake_event_set(self, tmp_path: Path) -> None:
-        """Two messages enqueued before IDLE — _sink must wake the bus (not deliver directly)."""
+class TestPromptQueueDrainOnIdle:
+    async def test_queued_message_drains_on_idle(self, tmp_path: Path) -> None:
+        """Messages queued via submit_prompt drain on IDLE transition."""
         broker = _make_broker("agent-1", tmp_path=tmp_path)
         await broker._start_message_bus()
         await broker._ensure_lifecycle()
@@ -554,29 +549,32 @@ class TestSelfTerminate:
         session = ACPSession(
             agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
         )
-        session._sm._state = AgentState.IDLE
+        session._sm._state = AgentState.BUSY
         session.prompt = AsyncMock()  # type: ignore[method-assign]
         broker._registry._sessions["agent-1"] = session
-
-        assert broker._message_bus is not None
-        broker._message_bus.enqueue_pending("agent-1", "sender-a", "msg1")
-        broker._message_bus.enqueue_pending("agent-1", "sender-b", "msg2")
 
         from synth_acp.models.events import AgentStateChanged
 
         try:
+            # Submit while busy — goes to queue
+            await broker.submit_prompt("agent-1", "msg1", source="mcp", from_agent="sender-a")
+            assert not broker._prompt_queue.is_empty("agent-1")
+            session.prompt.assert_not_awaited()
+
+            # Transition to IDLE — triggers drain
+            session._sm._state = AgentState.IDLE
             await broker._sink(
                 AgentStateChanged(
                     agent_id="agent-1",
-                    old_state=AgentState.INITIALIZING,
+                    old_state=AgentState.BUSY,
                     new_state=AgentState.IDLE,
                 )
             )
 
-            # _sink only wakes the bus — does not deliver directly
-            assert broker._message_bus._wake_event.is_set()
-            # Messages still in pending (bus loop delivers them)
-            assert broker._message_bus._pending.get("agent-1") is not None
+            # Queue drained, prompt dispatched (as a task)
+            assert broker._prompt_queue.is_empty("agent-1")
+            await asyncio.sleep(0)  # let the prompt task run
+            session.prompt.assert_awaited_once()
         finally:
             await broker._message_bus.stop()
 
@@ -793,7 +791,7 @@ class TestListRestorableSessions:
         assert sess["first_messages"] == ["hello world", "do the thing", "third msg"]
 
     async def test_list_restorable_sessions_includes_initial_prompts(self, tmp_path: Path) -> None:
-        """initial_prompts populated from InitialPromptDelivered events."""
+        """initial_prompts populated from InitialPromptDelivered/UserPromptSubmitted events (legacy compat)."""
         import json
         import sqlite3
 

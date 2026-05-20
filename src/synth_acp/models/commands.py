@@ -91,3 +91,43 @@ class RestoreSession(BrokerCommand):
     broker_session_id: str
 
 
+class HoldQueue(BrokerCommand):
+    """Suppress auto-drain for an agent (user is composing)."""
+
+    agent_id: str
+
+
+class ReleaseQueue(BrokerCommand):
+    """Resume auto-drain for an agent."""
+
+    agent_id: str
+
+
+class DrainQueue(BrokerCommand):
+    """User explicitly requested draining the front queue item."""
+
+    agent_id: str
+
+
+class EditQueueItem(BrokerCommand):
+    """User started editing a queued item (blocks drain at that item)."""
+
+    agent_id: str
+    item_id: str
+
+
+class CommitQueueEdit(BrokerCommand):
+    """User saved an edit to a queued item."""
+
+    agent_id: str
+    item_id: str
+    text: str
+
+
+class DeleteQueueItem(BrokerCommand):
+    """User deleted a queued item."""
+
+    agent_id: str
+    item_id: str
+
+

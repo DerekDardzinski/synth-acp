@@ -7,7 +7,7 @@ import logging
 import re
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import ClassVar
 
 from acp.schema import (
     SessionConfigOptionBoolean,
@@ -28,9 +28,6 @@ from textual.widgets.option_list import Option
 from synth_acp.models.commands import CancelTurn, SendPrompt, SetConfigOption
 from synth_acp.ui.file_discovery import FileEntry, discover_files, estimate_tokens, filter_files
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
-
-if TYPE_CHECKING:
-    from synth_acp.ui.widgets.prompt_queue import PromptQueue, QueuedPrompt
 
 log = logging.getLogger(__name__)
 
@@ -378,13 +375,6 @@ class InputBar(Vertical):
         harness: Harness name for display.
     """
 
-    class DrainReady(Message):
-        """Posted when queue edit completes and drain should be re-attempted."""
-
-        def __init__(self, agent_id: str) -> None:
-            self.agent_id = agent_id
-            super().__init__()
-
     class CancelClicked(Message):
         """Posted when the user cancels the current turn."""
 
@@ -411,6 +401,7 @@ class InputBar(Vertical):
 
     def on_mount(self) -> None:
         """Start polling git branch if cwd is set."""
+        self.query_one("#drain-btn").display = False
         cwd = self.query_one("#cwd-label", Static)
         if self._cwd_display:
             cwd.update(self._build_cwd_label())
@@ -717,17 +708,18 @@ class InputBar(Vertical):
 
     @on(Button.Pressed, "#drain-btn")
     def _on_drain_click(self, event: Button.Pressed) -> None:
+        """User clicked Drain Queue — force-drain the front item."""
         event.stop()
-        from synth_acp.ui.widgets.prompt_queue import PromptQueue
+        from synth_acp.models.commands import DrainQueue
+        from synth_acp.ui.app import SynthApp
 
-        self.set_drain_pending(False)
-        queued = self.query_one(PromptQueue).drain_next()
-        if queued:
-            from synth_acp.ui.app import SynthApp
+        app = self.app
+        if isinstance(app, SynthApp):
+            app.run_worker(app.broker.handle(DrainQueue(agent_id=self._agent_id)))
 
-            app = self.app
-            if isinstance(app, SynthApp):
-                app.run_worker(app.broker.handle(SendPrompt(agent_id=self._agent_id, text=queued.text)))
+    def set_drain_visible(self, visible: bool) -> None:
+        """Show/hide the Drain Queue button based on queue state."""
+        self.query_one("#drain-btn").display = visible
 
     def set_busy(self, busy: bool) -> None:
         """Toggle between submit/cancel button and activity bar."""
@@ -737,10 +729,6 @@ class InputBar(Vertical):
         self.query_one("#drain-btn").display = False
         self.query_one(ActivityBar).active = busy
 
-    def set_drain_pending(self, pending: bool) -> None:
-        """Show/hide the Drain Queue button."""
-        self.query_one("#drain-btn").display = pending
-
     def on_prompt_text_area_submitted(self, message: PromptTextArea.Submitted) -> None:
         """Send prompt to the focused agent."""
         text = message.text_area.text.strip()
@@ -749,12 +737,6 @@ class InputBar(Vertical):
         message.text_area.clear()
 
         # If busy, enqueue instead of dispatching
-        if self._busy:
-            from synth_acp.ui.widgets.prompt_queue import PromptQueue
-
-            self.query_one(PromptQueue).enqueue(text, "user", None)
-            return
-
         from synth_acp.ui.app import SynthApp
 
         app = self.app
@@ -786,31 +768,7 @@ class InputBar(Vertical):
 
     # --- Queue API ---
 
-    def enqueue(self, text: str, source: Literal["user", "mcp"], from_agent: str | None) -> None:
-        """Public API for app.py to enqueue MCP messages into this agent's queue."""
-        from synth_acp.ui.widgets.prompt_queue import PromptQueue
-
-        self.query_one(PromptQueue).enqueue(text, source, from_agent)
-
-    def drain_next(self) -> QueuedPrompt | None:
-        """Public API for app.py drain trigger. Delegates to PromptQueue."""
-        from synth_acp.ui.widgets.prompt_queue import PromptQueue
-
-        return self.query_one(PromptQueue).drain_next()
-
     @property
     def is_composing(self) -> bool:
         """True if the prompt textarea has non-empty stripped text."""
         return bool(self.query_one("#prompt-input", PromptTextArea).text.strip())
-
-    @property
-    def has_queue_items(self) -> bool:
-        """True if the prompt queue has pending items."""
-        from synth_acp.ui.widgets.prompt_queue import PromptQueue
-
-        return self.query_one(PromptQueue).has_items
-
-    def on_prompt_queue_drain_ready(self, message: PromptQueue.DrainReady) -> None:
-        """Handle DrainReady from PromptQueue — bubble as InputBar.DrainReady."""
-        message.stop()
-        self.post_message(self.DrainReady(agent_id=self._agent_id))

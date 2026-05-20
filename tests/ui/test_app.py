@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,7 +17,6 @@ from synth_acp.models.events import (
     AgentStateChanged,
     AgentThoughtReceived,
     BrokerEvent,
-    McpMessageDelivered,
     MessageChunkReceived,
     ToolCallUpdated,
     UsageUpdated,
@@ -26,7 +24,6 @@ from synth_acp.models.events import (
 from synth_acp.ui.app import DynamicAgentInfo, SynthApp, _coalesce_events
 from synth_acp.ui.messages import BrokerEventMessage
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
-from synth_acp.ui.widgets.message_queue import MessageQueue
 
 
 def _make_config(*agent_ids: str) -> SessionConfig:
@@ -170,26 +167,6 @@ class TestWatchSelectedAgent:
             app.watch_selected_agent("", "")
 
         mock_query_one.assert_not_called()
-
-
-class TestShowMessagesContentSwitcher:
-    async def test_show_messages_when_first_call_mounts_mcp_panel(self) -> None:
-        """First call creates MessageQueue with id='messages' and mounts it."""
-        app = _make_app("agent-1")
-
-        mock_switcher = SimpleNamespace(current=None, add_content=AsyncMock())
-        with (
-            patch.object(app, "query_one", return_value=mock_switcher),
-            patch.object(app, "_tiles", {}),
-        ):
-            await app.show_messages()
-
-        assert app._mcp_panel is not None
-        assert isinstance(app._mcp_panel, MessageQueue)
-        mock_switcher.add_content.assert_called_once()
-        mounted = mock_switcher.add_content.call_args[0][0]
-        assert mounted.id == "messages"
-        assert mock_switcher.current == "messages"
 
 
 # ── Modal screens ──
@@ -405,178 +382,6 @@ class TestDrainSerialization:
 
             assert event in app._event_buffers["agent-1"]
             app._draining.pop("agent-1", None)
-
-
-class TestMcpMessageDeliveredBuffering:
-    """Verify that McpMessageDelivered for unknown recipients is buffered."""
-
-    async def test_mcp_message_for_unknown_recipient_buffered(self) -> None:
-        """McpMessageDelivered for unknown recipient is buffered, not dropped."""
-        app = _make_app()
-        assert "unknown-agent" not in app._panels
-        assert "unknown-agent" not in app._event_buffers
-
-        async with app.run_test(headless=True, size=(120, 40)):
-            event = McpMessageDelivered(
-                agent_id="sender",
-                from_agent="sender",
-                to_agent="unknown-agent",
-                preview="hello",
-            )
-            await app.on_broker_event_message(BrokerEventMessage(event))
-
-            assert "unknown-agent" in app._event_buffers
-            assert event in app._event_buffers["unknown-agent"]
-
-
-class TestMcpInterceptionRouting:
-    """Verify MCP messages route to queue when composing, to feed otherwise."""
-
-    async def test_mcp_message_held_routes_to_queue(self) -> None:
-        """McpMessageHeld calls enqueue on the input bar."""
-        from synth_acp.models.events import McpMessageHeld
-
-        app = _make_app("agent-1")
-        feed = MagicMock()
-        feed.input_bar = MagicMock()
-        feed.input_bar.enqueue = MagicMock()
-        app._panels["agent-1"] = feed
-
-        event = McpMessageHeld(
-            agent_id="agent-1",
-            from_agent="other",
-            preview="hello from other",
-        )
-        await app.on_broker_event_message(BrokerEventMessage(event))
-
-        feed.input_bar.enqueue.assert_called_once_with("hello from other", "mcp", "other")
-
-    async def test_mcp_message_routes_to_feed_when_not_composing(self) -> None:
-        """McpMessageDelivered calls add_mcp_message when is_composing is False."""
-        app = _make_app("agent-1")
-        app._event_buffers["agent-1"] = []
-        app._dynamic_agents["agent-1"] = DynamicAgentInfo(parent=None, task="", harness="kiro")
-
-        feed = MagicMock()
-        feed.input_bar = MagicMock()
-        feed.input_bar.is_composing = False
-        feed.add_mcp_message = AsyncMock()
-        app._panels["agent-1"] = feed
-
-        event = McpMessageDelivered(
-            agent_id="other",
-            from_agent="other",
-            to_agent="agent-1",
-            preview="hello from other",
-        )
-        await app.on_broker_event_message(BrokerEventMessage(event))
-
-        feed.add_mcp_message.assert_called_once_with("other", "agent-1", "hello from other")
-        feed.input_bar.enqueue.assert_not_called()
-
-
-class TestAttemptDrain:
-    """Verify _attempt_drain dispatches SendPrompt or is a no-op."""
-
-    async def test_attempt_drain_dispatches_send_prompt_when_queue_has_item(self) -> None:
-        """_attempt_drain calls broker.handle(SendPrompt) when drain_next returns an item."""
-        from synth_acp.models.agent import AgentState
-        from synth_acp.models.commands import SendPrompt
-        from synth_acp.ui.widgets.prompt_queue import QueuedPrompt
-
-        app = _make_app("agent-1")
-        app._agent_states["agent-1"] = AgentState.IDLE
-        feed = MagicMock()
-        feed.input_bar = MagicMock()
-        feed.input_bar.drain_next = MagicMock(return_value=QueuedPrompt(text="queued msg"))
-        feed.input_bar.is_composing = False
-        feed.input_bar.has_queue_items = True
-        app._panels["agent-1"] = feed
-
-        with patch.object(app, "run_worker") as mock_run:
-            app._attempt_drain("agent-1")
-
-        mock_run.assert_called_once()
-        # The argument to run_worker is a coroutine from broker.handle(SendPrompt(...))
-        app.broker.handle.assert_called_once_with(SendPrompt(agent_id="agent-1", text="queued msg"))
-
-    async def test_attempt_drain_noop_when_queue_empty(self) -> None:
-        """_attempt_drain does nothing when drain_next returns None."""
-        app = _make_app("agent-1")
-        feed = MagicMock()
-        feed.input_bar = MagicMock()
-        feed.input_bar.drain_next = MagicMock(return_value=None)
-        app._panels["agent-1"] = feed
-
-        with patch.object(app, "run_worker") as mock_run:
-            app._attempt_drain("agent-1")
-
-        mock_run.assert_not_called()
-
-    async def test_turn_complete_does_not_drain(self) -> None:
-        """TurnComplete does NOT trigger _attempt_drain (drain is on IDLE only)."""
-        from synth_acp.models.events import TurnComplete
-
-        app = _make_app("agent-1")
-        feed = MagicMock()
-        feed.input_bar = MagicMock()
-        feed.finalize_current_message = AsyncMock()
-        app._panels["agent-1"] = feed
-
-        event = TurnComplete(agent_id="agent-1", stop_reason="end_turn")
-
-        with patch.object(app, "_attempt_drain") as mock_drain:
-            await app._route_event_to_feed(feed, event)
-
-        mock_drain.assert_not_called()
-
-    async def test_agent_state_idle_triggers_drain(self) -> None:
-        """AgentStateChanged(IDLE) triggers _attempt_drain."""
-        app = _make_app("agent-1")
-        feed = MagicMock()
-        feed.input_bar = MagicMock()
-        app._panels["agent-1"] = feed
-
-        event = AgentStateChanged(
-            agent_id="agent-1",
-            old_state=AgentState.BUSY,
-            new_state=AgentState.IDLE,
-        )
-
-        with patch.object(app, "_attempt_drain") as mock_drain:
-            await app._route_event_to_feed(feed, event)
-
-        mock_drain.assert_called_once_with("agent-1")
-
-
-class TestDrainReady:
-    """Verify on_input_bar_drain_ready triggers drain only when idle."""
-
-    async def test_drain_ready_triggers_drain_when_idle(self) -> None:
-        """DrainReady calls _attempt_drain when agent state is IDLE."""
-        app = _make_app("agent-1")
-        app._agent_states["agent-1"] = AgentState.IDLE
-
-        event = MagicMock()
-        event.agent_id = "agent-1"
-
-        with patch.object(app, "_attempt_drain") as mock_drain:
-            app.on_input_bar_drain_ready(event)
-
-        mock_drain.assert_called_once_with("agent-1")
-
-    async def test_drain_ready_skipped_when_busy(self) -> None:
-        """DrainReady does NOT call _attempt_drain when agent is BUSY."""
-        app = _make_app("agent-1")
-        app._agent_states["agent-1"] = AgentState.BUSY
-
-        event = MagicMock()
-        event.agent_id = "agent-1"
-
-        with patch.object(app, "_attempt_drain") as mock_drain:
-            app.on_input_bar_drain_ready(event)
-
-        mock_drain.assert_not_called()
 
 
 class TestDisabledStates:
@@ -811,15 +616,6 @@ class TestRecordEvent:
             await app._route_event_to_feed(feed, event)
             assert feed._current_turn_events == []
 
-    async def test_mcp_delivered_early_return_records_event(self) -> None:
-        """McpMessageDelivered in the early-return block is recorded."""
-        app = _make_app("agent-1")
-        async with app.run_test(headless=True, size=(120, 40)):
-            await app.select_agent("agent-1")
-            feed = app._panels["agent-1"]
-            event = McpMessageDelivered(agent_id="agent-1", from_agent="other", to_agent="agent-1", preview="hello")
-            await app.on_broker_event_message(BrokerEventMessage(event))
-            assert event in feed._current_turn_events
 
 
 class TestSynthesizeAgentOption:

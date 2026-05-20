@@ -28,9 +28,11 @@ from synth_acp.db import (
 from synth_acp.embeddings import EmbeddingEngine, embedding_available
 from synth_acp.models.agent import AgentConfig, AgentState, css_id
 from synth_acp.models.commands import (
+    CommitQueueEdit,
+    DeleteQueueItem,
+    EditQueueItem,
     LaunchAgent,
     RespondPermission,
-    SendPrompt,
     TerminateAgent,
 )
 from synth_acp.models.config import SessionConfig
@@ -43,12 +45,10 @@ from synth_acp.models.events import (
     ConfigOptionChanged,
     ConfigOptionsReceived,
     HookFired,
-    InitialPromptDelivered,
-    McpMessageDelivered,
-    McpMessageHeld,
     MessageChunkReceived,
     PermissionRequested,
     PlanReceived,
+    QueueUpdated,
     SessionRestoreComplete,
     TerminalCreated,
     ToolCallUpdated,
@@ -61,10 +61,9 @@ from synth_acp.ui.screens.help import HelpScreen
 from synth_acp.ui.screens.launch import LaunchAgentScreen
 from synth_acp.ui.screens.permission import PermissionBar
 from synth_acp.ui.screens.session_picker import SessionPickerScreen
-from synth_acp.ui.widgets.agent_list import AgentList, AgentTile, MCPButton
+from synth_acp.ui.widgets.agent_list import AgentList, AgentTile
 from synth_acp.ui.widgets.conversation import ConversationFeed
 from synth_acp.ui.widgets.input_bar import InputBar
-from synth_acp.ui.widgets.message_queue import MessageQueue
 
 _DISABLED_STATES = {AgentState.AWAITING_PERMISSION}
 
@@ -74,9 +73,7 @@ _RENDERABLE_EVENTS = (
     ToolCallUpdated,
     TurnComplete,
     PlanReceived,
-    McpMessageDelivered,
     HookFired,
-    InitialPromptDelivered,
     UserPromptSubmitted,
 )
 
@@ -140,7 +137,6 @@ class SynthApp(App):
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("q", "quit", "Quit"),
         Binding("tab", "next_agent", "Next agent", show=False),
-        Binding("m", "messages", "MCP messages"),
         Binding("l", "launch", "Launch agent"),
         Binding("ctrl+r", "restore", "Restore session"),
         Binding("f1", "help", "Help"),
@@ -160,11 +156,6 @@ class SynthApp(App):
         self._event_buffers: dict[str, list[BrokerEvent]] = {}
         self._panels: dict[str, ConversationFeed] = {}
         self._agent_states: dict[str, AgentState] = {}
-        self._mcp_threads: dict[tuple[str, str], list[McpMessageDelivered]] = {}
-        self._mcp_count: int = 0
-        self._mcp_panel: MessageQueue | None = None
-        self._delivery_holding: set[str] = set()
-        self._drain_suppressed: set[str] = set()
         self._dynamic_agents: dict[str, DynamicAgentInfo] = {}
         self._agent_config_options: dict[str, list] = {}
         self._tiles: dict[str, AgentTile] = {}
@@ -190,9 +181,20 @@ class SynthApp(App):
             yield ContentSwitcher(id="right")
         yield Footer()
 
+    def _is_composing(self, agent_id: str) -> bool:
+        """Check if user is composing in the text area for an agent.
+
+        Called by the broker at delivery decision time — reads actual UI state.
+        """
+        feed = self._panels.get(agent_id)
+        if not feed or not feed.input_bar:
+            return False
+        return feed.input_bar.is_composing
+
     async def on_mount(self) -> None:
         """Launch all agents, select the first, and start the broker event consumer."""
         self.theme = "catppuccin-mocha"
+        self.broker.set_composing_check(self._is_composing)
         initial = self._initial_agent
         self._event_buffers[initial.agent_id] = []
         if self._restore_mode:
@@ -255,22 +257,15 @@ class SynthApp(App):
     def _query_agent_text(conn: sqlite3.Connection, session_id: str, agent_id: str) -> str | None:
         """Get the first inbound message text for an agent.
 
-        Tries InitialPromptDelivered first, falls back to first UserPromptSubmitted.
         Returns None if no text found or text < 20 chars.
         """
         row = conn.execute(
             "SELECT payload FROM ui_events "
-            "WHERE session_id = ? AND agent_id = ? AND event_type = 'InitialPromptDelivered' "
+            "WHERE session_id = ? AND agent_id = ? "
+            "AND event_type IN ('UserPromptSubmitted', 'InitialPromptDelivered') "
             "ORDER BY seq LIMIT 1",
             (session_id, agent_id),
         ).fetchone()
-        if row is None:
-            row = conn.execute(
-                "SELECT payload FROM ui_events "
-                "WHERE session_id = ? AND agent_id = ? AND event_type = 'UserPromptSubmitted' "
-                "ORDER BY seq LIMIT 1",
-                (session_id, agent_id),
-            ).fetchone()
         if row is None:
             return None
         try:
@@ -290,39 +285,21 @@ class SynthApp(App):
         """
         event = message.event
 
-        # Handle held MCP messages — show in prompt queue
-        if isinstance(event, McpMessageHeld):
-            recipient = event.agent_id
-            if recipient in self._panels and recipient not in self._draining:
-                feed = self._panels[recipient]
+        # Handle queue state updates — forward to prompt queue widget and drain button
+        if isinstance(event, QueueUpdated):
+            if event.agent_id in self._panels:
+                feed = self._panels[event.agent_id]
                 if feed.input_bar:
-                    feed.input_bar.enqueue(event.preview, "mcp", event.from_agent)
-                    self._attempt_drain(recipient)
-            return
-
-        # Handle MCP messages — update threads and show in conversation
-        if isinstance(event, McpMessageDelivered):
-            key = tuple(sorted([event.from_agent, event.to_agent]))
-            self._mcp_threads.setdefault(key, []).append(event)  # type: ignore[arg-type]
-            self._mcp_count += 1
-            try:
-                self.query_one("#mcp-btn", MCPButton).update_count(self._mcp_count)
-            except Exception:
-                log.debug("MCP button not found", exc_info=True)
-            # Update MCP panel if visible
-            if (
-                self._mcp_panel is not None
-                and self.query_one(ContentSwitcher).current == "messages"
-            ):
-                await self._mcp_panel.update_threads(self._mcp_threads)
-            # Show in recipient's conversation feed
-            recipient = event.to_agent
-            if recipient in self._panels and recipient not in self._draining:
-                feed = self._panels[recipient]
-                feed.record_event(event)
-                await feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
-            else:
-                self._event_buffers.setdefault(recipient, []).append(event)
+                    from synth_acp.ui.widgets.prompt_queue import PromptQueue as PQWidget
+                    try:
+                        pq = feed.input_bar.query_one(PQWidget)
+                        pq.reconcile(event.items)
+                    except Exception:
+                        log.debug("PromptQueue widget not found for %s", event.agent_id, exc_info=True)
+                    # Show drain button when queue has items and agent is idle
+                    has_items = bool(event.items)
+                    is_idle = self._agent_states.get(event.agent_id) == AgentState.IDLE
+                    feed.input_bar.set_drain_visible(has_items and is_idle and not feed.input_bar._busy)
             return
 
         # Handle session history restore — render static snapshot into the feed.
@@ -477,10 +454,7 @@ class SynthApp(App):
             self._update_usage_display(event)
         elif isinstance(event, HookFired):
             await feed.add_hook_notification(event.hook_name)
-        elif isinstance(event, InitialPromptDelivered):
-            await feed.add_prompt(event.text)
         elif isinstance(event, UserPromptSubmitted):
-            self._drain_suppressed.discard(event.agent_id)
             await feed.add_prompt(event.text)
         elif isinstance(event, BrokerError):
             self.notify(event.message, severity=event.severity)
@@ -491,8 +465,6 @@ class SynthApp(App):
                 feed.input_bar.set_busy(False)
                 if event.new_state == AgentState.IDLE and event.agent_id == self.selected_agent:
                     feed.input_bar.query_one("#prompt-input").focus()
-                if event.new_state == AgentState.IDLE:
-                    self._attempt_drain(event.agent_id)
             elif event.new_state in {AgentState.INITIALIZING, AgentState.BUSY, AgentState.CONFIGURING}:
                 feed.input_bar.set_busy(True)
 
@@ -521,39 +493,46 @@ class SynthApp(App):
                 RespondPermission(agent_id=message.agent_id, request_id=message.request_id, option_id=message.option_id)
             )
 
-    def on_input_bar_drain_ready(self, event: InputBar.DrainReady) -> None:
-        """Handle DrainReady — attempt drain if agent is idle.
+    def on_prompt_queue_edit_requested(self, message: object) -> None:
+        """Forward edit request from PromptQueue widget to broker."""
+        from synth_acp.ui.widgets.prompt_queue import PromptQueue
+        if not isinstance(message, PromptQueue.EditRequested):
+            return
+        if self.selected_agent:
+            self.run_worker(self.broker.handle(EditQueueItem(agent_id=self.selected_agent, item_id=message.item_id)))
 
-        Args:
-            event: The DrainReady message from InputBar.
-        """
-        self._drain_suppressed.discard(event.agent_id)
-        if self._agent_states.get(event.agent_id) == AgentState.IDLE:
-            self._attempt_drain(event.agent_id)
+    def on_prompt_queue_edit_committed(self, message: object) -> None:
+        """Forward edit commit from PromptQueue widget to broker."""
+        from synth_acp.ui.widgets.prompt_queue import PromptQueue
+        if not isinstance(message, PromptQueue.EditCommitted):
+            return
+        if self.selected_agent:
+            self.run_worker(self.broker.handle(CommitQueueEdit(agent_id=self.selected_agent, item_id=message.item_id, text=message.text)))
 
-    def on_input_bar_cancel_clicked(self, event: InputBar.CancelClicked) -> None:
-        """Suppress auto-drain after cancel — user wants to correct course."""
-        self._drain_suppressed.add(event.agent_id)
+    def on_prompt_queue_delete_requested(self, message: object) -> None:
+        """Forward delete request from PromptQueue widget to broker."""
+        from synth_acp.ui.widgets.prompt_queue import PromptQueue
+        if not isinstance(message, PromptQueue.DeleteRequested):
+            return
+        if self.selected_agent:
+            self.run_worker(self.broker.handle(DeleteQueueItem(agent_id=self.selected_agent, item_id=message.item_id)))
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        """Hold/release MCP delivery based on whether user is composing."""
+        """Trigger queue drain when text area becomes empty (user stopped composing)."""
         if event.text_area.id != "prompt-input":
             return
-        # Derive agent_id from the InputBar ancestor, not selected_agent
+        if event.text_area.text.strip():
+            return  # Still composing — nothing to do
+        # Text is empty — user may have deleted content or submitted.
+        # Try draining any queued MCP messages for this agent.
         agent_id: str | None = None
         for ancestor in event.text_area.ancestors_with_self:
             if isinstance(ancestor, InputBar):
                 agent_id = ancestor._agent_id
                 break
-        if not agent_id:
-            return
-        if event.text_area.text.strip():
-            if agent_id not in self._delivery_holding:
-                self._delivery_holding.add(agent_id)
-                self.broker.hold_delivery(agent_id)
-        elif agent_id in self._delivery_holding:
-            self._delivery_holding.discard(agent_id)
-            self.broker.release_delivery(agent_id)
+        if agent_id:
+            from synth_acp.models.commands import ReleaseQueue
+            self.run_worker(self.broker.handle(ReleaseQueue(agent_id=agent_id)))
 
     async def on_agent_tile_terminate_clicked(self, message: AgentTile.TerminateClicked) -> None:
         """Handle the close button on an agent tile."""
@@ -601,12 +580,8 @@ class SynthApp(App):
         elif isinstance(event, AvailableCommandsReceived):
             if feed.input_bar is not None:
                 feed.input_bar.update_slash_commands(event.commands)
-        elif isinstance(event, McpMessageDelivered):
-            await feed.add_mcp_message(event.from_agent, event.to_agent, event.preview)
         elif isinstance(event, HookFired):
             await feed.add_hook_notification(event.hook_name)
-        elif isinstance(event, InitialPromptDelivered):
-            await feed.add_prompt(event.text)
         elif isinstance(event, UserPromptSubmitted):
             await feed.add_prompt(event.text)
         elif isinstance(event, SessionRestoreComplete):
@@ -632,31 +607,6 @@ class SynthApp(App):
         else:
             bar.set_disabled(disabled=False, hint=f"Message {agent_id}…")
 
-    def _attempt_drain(self, agent_id: str) -> None:
-        """Drain the next queued prompt and dispatch it to the broker.
-
-        Single drain owner — only app.py calls this.
-        If the user is actively composing, shows the drain button instead.
-
-        Args:
-            agent_id: The agent whose queue to drain.
-        """
-        feed = self._panels.get(agent_id)
-        if not feed or not feed.input_bar:
-            return
-        if not feed.input_bar.has_queue_items:
-            feed.input_bar.set_drain_pending(False)
-            return
-        # Don't show drain or auto-drain if agent isn't idle — wait for IDLE transition
-        if self._agent_states.get(agent_id) != AgentState.IDLE:
-            return
-        if feed.input_bar.is_composing or agent_id in self._drain_suppressed:
-            feed.input_bar.set_drain_pending(True)
-            return
-        feed.input_bar.set_drain_pending(False)
-        queued = feed.input_bar.drain_next()
-        if queued:
-            self.run_worker(self.broker.handle(SendPrompt(agent_id=agent_id, text=queued.text)))
 
     def _synthesize_agent_option(self, agent_id: str) -> SessionConfigOptionSelect | None:
         """Build a synthesized agent picker option from discovery results."""
@@ -812,12 +762,6 @@ class SynthApp(App):
                     feed.input_bar.set_busy(False)
             # Push any config option data that arrived before the panel existed
             self._update_input_bar_config_options(agent_id)
-            # Refresh MCP badge in case replayed events updated the count
-            if self._mcp_count:
-                try:
-                    self.query_one("#mcp-btn", MCPButton).update_count(self._mcp_count)
-                except Exception:
-                    pass
 
         switcher = self.query_one("#right", ContentSwitcher)
         if self.selected_agent == agent_id and switcher.current != f"feed-{css_id(agent_id)}":
@@ -832,12 +776,12 @@ class SynthApp(App):
             old_agent: The previously selected agent ID.
             agent_id: The newly selected agent ID.
         """
-        # Release hold on previous agent if it's not composing
-        if old_agent and old_agent in self._delivery_holding:
+        # Try draining queued MCP messages for previous agent if not composing
+        if old_agent:
             old_feed = self._panels.get(old_agent)
             if not old_feed or not old_feed.input_bar or not old_feed.input_bar.is_composing:
-                self._delivery_holding.discard(old_agent)
-                self.broker.release_delivery(old_agent)
+                from synth_acp.models.commands import ReleaseQueue
+                self.run_worker(self.broker.handle(ReleaseQueue(agent_id=old_agent)))
         if not agent_id:
             return
         feed_id = f"feed-{css_id(agent_id)}"
@@ -849,37 +793,8 @@ class SynthApp(App):
         switcher.current = feed_id
         for tile in self._tiles.values():
             tile.set_class(tile._agent_id == agent_id, "tile-active")
-        try:
-            self.query_one("#mcp-btn", MCPButton).remove_class("btn-active")
-        except Exception:
-            log.debug("MCP button deselect failed", exc_info=True)
         self._update_input_bar_state(agent_id, self._agent_states.get(agent_id, AgentState.IDLE))
 
-    async def show_messages(self) -> None:
-        """Toggle the MCP messages view. Close it if already active."""
-        switcher = self.query_one("#right", ContentSwitcher)
-
-        if switcher.current == "messages":
-            # Close messages panel — return to selected agent
-            if self.selected_agent:
-                await self.select_agent(self.selected_agent)
-            return
-
-        for tile in self._tiles.values():
-            tile.remove_class("tile-active")
-        try:
-            self.query_one("#mcp-btn", MCPButton).add_class("btn-active")
-        except Exception:
-            log.debug("MCP button select failed", exc_info=True)
-
-        if self._mcp_panel is None:
-            panel = MessageQueue(self._mcp_threads, id="messages")
-            self._mcp_panel = panel
-            await switcher.add_content(panel, set_current=False)
-        else:
-            await self._mcp_panel.update_threads(self._mcp_threads)
-
-        switcher.current = "messages"
 
     async def action_next_agent(self) -> None:
         """Cycle to the next live agent, skipping terminated ones."""
@@ -889,9 +804,6 @@ class SynthApp(App):
         idx = ids.index(self.selected_agent) if self.selected_agent in ids else -1
         await self.select_agent(ids[(idx + 1) % len(ids)])
 
-    async def action_messages(self) -> None:
-        """Show the MCP messages panel."""
-        await self.show_messages()
 
     @work(exclusive=True, group="modal")
     async def action_launch(self) -> None:
