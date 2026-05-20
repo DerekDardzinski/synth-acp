@@ -45,6 +45,7 @@ def _make_broker(events: list[BrokerEvent] | None = None, agent_ids: list[str] |
     broker.get_agent_harness = MagicMock(return_value="kiro")
     broker.get_agent_cwd = MagicMock(return_value=".")
     broker.get_agent_display_name = MagicMock(return_value=None)
+    broker.get_usage = MagicMock(return_value=None)
 
     async def _events():
         for e in events or []:
@@ -118,16 +119,44 @@ class TestRouteEventThought:
 
 
 class TestRouteEventUsage:
-    async def test_route_event_when_usage_updated_calls_handler(self) -> None:
-        """UsageUpdated routes to _update_usage_display."""
+    async def test_usage_updated_dispatched_in_pre_routing(self) -> None:
+        """UsageUpdated fires _update_usage_display in pre-routing (no panel needed)."""
         app = _make_app("a")
-        feed = MagicMock()
+        app._agent_states["a"] = AgentState.IDLE
+        app._dynamic_agents["a"] = DynamicAgentInfo(parent=None, task="", harness="kiro")
         event = UsageUpdated(agent_id="a", size=128000, used=32000, cost_amount=0.14)
 
         with patch.object(app, "_update_usage_display") as mock_handler:
-            await app._route_event_to_feed(feed, event)
+            await app.on_broker_event_message(BrokerEventMessage(event))
 
         mock_handler.assert_called_once_with(event)
+
+
+class TestFormatCost:
+    def test_format_cost_usd(self) -> None:
+        """USD amounts get dollar-sign prefix."""
+        app = _make_app("a")
+        assert app._format_cost(1.23, "USD") == "$1.23"
+
+    def test_format_cost_usd_case_insensitive(self) -> None:
+        """USD matching is case-insensitive."""
+        app = _make_app("a")
+        assert app._format_cost(0.50, "usd") == "$0.50"
+
+    def test_format_cost_other_currency(self) -> None:
+        """Non-USD currencies appear as suffix."""
+        app = _make_app("a")
+        assert app._format_cost(1.23, "EUR") == "1.23 EUR"
+
+    def test_format_cost_none_amount(self) -> None:
+        """None amount returns empty string."""
+        app = _make_app("a")
+        assert app._format_cost(None, None) == ""
+
+    def test_format_cost_no_currency(self) -> None:
+        """Amount without currency returns just the formatted number."""
+        app = _make_app("a")
+        assert app._format_cost(1.23, None) == "1.23"
 
 
 class TestWorkerErrorHandling:

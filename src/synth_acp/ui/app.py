@@ -63,6 +63,7 @@ from synth_acp.ui.screens.permission import PermissionBar
 from synth_acp.ui.screens.session_picker import SessionPickerScreen
 from synth_acp.ui.widgets.agent_list import AgentList, AgentTile
 from synth_acp.ui.widgets.conversation import ConversationFeed
+from synth_acp.ui.widgets.gradient_bar import ActivityBar
 from synth_acp.ui.widgets.input_bar import InputBar
 
 _DISABLED_STATES = {AgentState.AWAITING_PERMISSION}
@@ -398,6 +399,9 @@ class SynthApp(App):
             if opt_match and getattr(opt_match, "category", None) == "mode":
                 self._update_tile_mode_from_config(event.agent_id)
 
+        if isinstance(event, UsageUpdated):
+            self._update_usage_display(event)
+
         # Route to the agent's panel if it exists and not draining
         if event.agent_id in self._panels and event.agent_id not in self._draining:
             feed = self._panels[event.agent_id]
@@ -450,8 +454,6 @@ class SynthApp(App):
         elif isinstance(event, AvailableCommandsReceived):
             if feed.input_bar is not None:
                 feed.input_bar.update_slash_commands(event.commands)
-        elif isinstance(event, UsageUpdated):
-            self._update_usage_display(event)
         elif isinstance(event, HookFired):
             await feed.add_hook_notification(event.hook_name)
         elif isinstance(event, UserPromptSubmitted):
@@ -673,13 +675,41 @@ class SynthApp(App):
             bar.update_config_options(self._agent_config_options.get(agent_id, []))
 
     def _update_usage_display(self, event: UsageUpdated) -> None:
-        """Update usage display for the selected agent.
+        """Update usage display for the agent's tile and (if selected) input bar.
 
         Args:
             event: Usage snapshot from the broker.
         """
-        if event.agent_id != self.selected_agent:
-            return
+        cost_text = self._format_cost(event.cost_amount, event.cost_currency)
+
+        # Always update the tile
+        tile = self._tiles.get(event.agent_id)
+        if tile is not None:
+            tile.update_usage(event.used, event.size, cost_text)
+
+        # Also update the input bar if this is the selected agent
+        if event.agent_id == self.selected_agent:
+            bar = self._get_input_bar(event.agent_id)
+            if bar is not None:
+                bar.query_one(ActivityBar).update_usage(event.used, event.size, cost_text)
+
+    def _format_cost(self, amount: float | None, currency: str | None) -> str:
+        """Format cost amount and currency into display string.
+
+        Args:
+            amount: Cost amount (None = no cost data).
+            currency: Currency code (e.g. "USD").
+
+        Returns:
+            Formatted string like "$1.23" or "" if no data.
+        """
+        if amount is None:
+            return ""
+        if currency and currency.upper() == "USD":
+            return f"${amount:.2f}"
+        if currency:
+            return f"{amount:.2f} {currency}"
+        return f"{amount:.2f}"
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """Handle worker state changes — notify and restart on error.
@@ -762,6 +792,14 @@ class SynthApp(App):
                     feed.input_bar.set_busy(False)
             # Push any config option data that arrived before the panel existed
             self._update_input_bar_config_options(agent_id)
+
+        # Sync cached usage into the InputBar on every selection
+        usage = self.broker.get_usage(agent_id)
+        if usage is not None:
+            cost_text = self._format_cost(usage.cost_amount, usage.cost_currency)
+            bar = self._get_input_bar(agent_id)
+            if bar is not None:
+                bar.query_one(ActivityBar).update_usage(usage.used, usage.size, cost_text)
 
         switcher = self.query_one("#right", ContentSwitcher)
         if self.selected_agent == agent_id and switcher.current != f"feed-{css_id(agent_id)}":

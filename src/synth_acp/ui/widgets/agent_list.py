@@ -145,6 +145,16 @@ class AgentTile(Vertical):
         self._current_mode = mode_name
         self.query_one(".tile-label", Static).update(self._build_markup())
 
+    def update_usage(self, used: int, size: int, cost_text: str = "") -> None:
+        """Update the tile's usage bar.
+
+        Args:
+            used: Tokens used in context window.
+            size: Total context window size (0 = unknown).
+            cost_text: Formatted cost string.
+        """
+        self.query_one(ActivityBar).update_usage(used, size, cost_text)
+
     def on_click(self) -> None:
         """Select this agent in the app."""
         from synth_acp.ui.app import SynthApp

@@ -29,6 +29,7 @@ def _make_broker(*agent_ids: str) -> MagicMock:
     broker.get_agent_harness = MagicMock(return_value="kiro")
     broker.get_agent_parent = MagicMock(return_value=None)
     broker.get_agent_cwd = MagicMock(return_value=".")
+    broker.get_usage = MagicMock(return_value=None)
 
     async def _events():
         return

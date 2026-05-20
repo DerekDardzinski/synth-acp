@@ -27,6 +27,7 @@ def _make_broker() -> MagicMock:
     broker.handle = AsyncMock()
     broker.shutdown = AsyncMock()
     broker._initial_agent = AgentConfig(agent_id="a1", harness="kiro")
+    broker.get_usage = MagicMock(return_value=None)
 
     async def _events():
         return

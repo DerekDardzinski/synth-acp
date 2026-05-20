@@ -642,6 +642,15 @@ class InputBar(Vertical):
                 else:
                     items.append((entry.value, entry.name))
 
+            # Disambiguate entries that share the same display name
+            name_counts: dict[str, int] = {}
+            for _, name in items:
+                name_counts[name] = name_counts.get(name, 0) + 1
+            items = [
+                (val, f"{name} ({val})" if name_counts.get(name, 1) > 1 else name)
+                for val, name in items
+            ]
+
             try:
                 existing = container.query_one(f"#{picker_id}", _PickerLabel)
                 existing.set_items(items, opt.current_value)
