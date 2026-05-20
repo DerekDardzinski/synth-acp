@@ -10,12 +10,13 @@ import sqlite3
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from synth_acp.broker.lifecycle import AgentLifecycle
 from synth_acp.broker.message_bus import MessageBus
 from synth_acp.broker.permissions import PermissionEngine
+from synth_acp.broker.prompt_queue import PromptQueue, QueuedItem
 from synth_acp.broker.registry import AgentRegistry
 from synth_acp.db import ensure_schema_sync
 from synth_acp.discovery import DiscoveredAgent, discover_agents
@@ -23,7 +24,13 @@ from synth_acp.models.agent import AgentConfig, AgentMode, AgentModel, AgentStat
 from synth_acp.models.commands import (
     BrokerCommand,
     CancelTurn,
+    CommitQueueEdit,
+    DeleteQueueItem,
+    DrainQueue,
+    EditQueueItem,
+    HoldQueue,
     LaunchAgent,
+    ReleaseQueue,
     RespondPermission,
     RestoreSession,
     ResurrectAgent,
@@ -39,11 +46,11 @@ from synth_acp.models.events import (
     AgentThoughtReceived,
     BrokerError,
     BrokerEvent,
-    McpMessageDelivered,
-    McpMessageHeld,
     MessageChunkReceived,
     PermissionAutoResolved,
     PermissionRequested,
+    QueueItemSnapshot,
+    QueueUpdated,
     ToolCallUpdated,
     TurnComplete,
     UsageUpdated,
@@ -88,7 +95,8 @@ class ACPBroker:
         self._turn_buffer: dict[str, list[tuple[int, BrokerEvent]]] = {}
         self._turn_buffer_tool_index: dict[str, dict[str, int]] = {}
         self._pending_flushes: set[asyncio.Task] = set()
-        self._delivery_held: set[str] = set()
+        self._prompt_queue = PromptQueue()
+        self._is_composing: Callable[[str], bool] = lambda _: False
         self._discovery_cache: dict[str, list[DiscoveredAgent]] = {}
 
     @property
@@ -116,8 +124,7 @@ class ACPBroker:
                 await self._start_message_bus()
                 await lifecycle.resurrect(aid)
             case SendPrompt(agent_id=aid, text=text):
-                await self._sink(UserPromptSubmitted(agent_id=aid, text=text))
-                await lifecycle.prompt(aid, text)
+                await self.submit_prompt(aid, text, source="user")
             case RespondPermission(agent_id=aid, request_id=rid, option_id=oid):
                 await self._resolve_permission(aid, rid, oid)
             case CancelTurn(agent_id=aid):
@@ -133,18 +140,132 @@ class ACPBroker:
                     await lifecycle.set_config_option(aid, cid, val)
             case RestoreSession(broker_session_id=sid):
                 await self.restore_session(sid)
+            case HoldQueue():
+                pass  # Deprecated — composing state checked at delivery time
+            case ReleaseQueue(agent_id=aid):
+                # User stopped composing — try draining queued MCP messages
+                await self._try_drain(aid)
+            case DrainQueue(agent_id=aid):
+                # User explicitly requested drain — force regardless of composing
+                await self._force_drain(aid)
+            case EditQueueItem(agent_id=aid, item_id=iid):
+                self._prompt_queue.mark_editing(aid, iid)
+                await self._emit_queue_state(aid)
+            case CommitQueueEdit(agent_id=aid, item_id=iid, text=text):
+                self._prompt_queue.commit_edit(aid, iid, text)
+                await self._emit_queue_state(aid)
+                await self._try_drain(aid)
+            case DeleteQueueItem(agent_id=aid, item_id=iid):
+                self._prompt_queue.delete(aid, iid)
+                await self._emit_queue_state(aid)
+                await self._try_drain(aid)
 
     # ------------------------------------------------------------------
-    # Synchronous delivery hold/release
+    # Prompt queue — unified delivery for user and MCP messages
     # ------------------------------------------------------------------
 
-    def hold_delivery(self, agent_id: str) -> None:
-        """Synchronously hold MCP delivery for agent. Messages will be queued in UI."""
-        self._delivery_held.add(agent_id)
+    async def submit_prompt(
+        self, agent_id: str, text: str, source: str = "user", from_agent: str | None = None
+    ) -> None:
+        """Single entry point for all message submission (user and MCP).
 
-    def release_delivery(self, agent_id: str) -> None:
-        """Synchronously release MCP delivery hold. Messages deliver directly."""
-        self._delivery_held.discard(agent_id)
+        Delivery rules checked at decision time (no stale flags):
+        - User message: deliver directly if IDLE (queue items wait)
+        - MCP message: deliver if IDLE + queue empty + user not composing
+        - Otherwise: enqueue, attempt drain
+        """
+        lifecycle = await self._ensure_lifecycle()
+        session = self._registry.get_session(agent_id)
+        idle = session is not None and session.state == AgentState.IDLE
+
+        if source == "user" and idle:
+            # User submit always delivers directly — their explicit action
+            # takes priority. Queued MCP messages wait until next IDLE.
+            await self._sink(UserPromptSubmitted(agent_id=agent_id, text=text))
+            await lifecycle.prompt(agent_id, text)
+            return
+
+        if source != "user":
+            # MCP: deliver if IDLE + queue empty + not composing
+            empty = self._prompt_queue.is_empty(agent_id)
+            if idle and empty and not self._is_composing(agent_id):
+                await self._sink(UserPromptSubmitted(agent_id=agent_id, text=text))
+                await lifecycle.prompt(agent_id, text)
+                return
+
+        # Enqueue and attempt immediate drain
+        item = QueuedItem(text=text, source=source, from_agent=from_agent)  # type: ignore[arg-type]
+        self._prompt_queue.enqueue(agent_id, item)
+        drained = await self._try_drain(agent_id)
+        if not drained:
+            # Item is sitting in queue — notify UI
+            await self._emit_queue_state(agent_id)
+
+    async def _try_drain(self, agent_id: str) -> bool:
+        """Attempt to drain the front of the queue to the agent.
+
+        Returns True if an item was drained and delivered.
+        Won't auto-drain while user is typing — show drain button instead.
+        """
+        session = self._registry.get_session(agent_id)
+        if not session or session.state != AgentState.IDLE:
+            return False
+        if not self._prompt_queue.can_drain(agent_id):
+            return False
+        # Don't auto-drain while user is composing — they should see the
+        # drain button and choose when to inject. Emit queue state so the
+        # UI can show the button.
+        if self._is_composing(agent_id):
+            await self._emit_queue_state(agent_id)
+            return False
+        lifecycle = await self._ensure_lifecycle()
+        item = self._prompt_queue.pop(agent_id)
+        if not item:
+            return False
+        await self._sink(UserPromptSubmitted(agent_id=agent_id, text=item.text))
+        await lifecycle.prompt(agent_id, item.text)
+        await self._emit_queue_state(agent_id)
+        return True
+
+    async def _force_drain(self, agent_id: str) -> bool:
+        """Force-drain the front queue item regardless of composing state.
+
+        Used when the user explicitly clicks the drain button.
+        """
+        session = self._registry.get_session(agent_id)
+        if not session or session.state != AgentState.IDLE:
+            return False
+        if not self._prompt_queue.can_drain(agent_id):
+            return False
+        lifecycle = await self._ensure_lifecycle()
+        item = self._prompt_queue.pop(agent_id)
+        if not item:
+            return False
+        await self._sink(UserPromptSubmitted(agent_id=agent_id, text=item.text))
+        await lifecycle.prompt(agent_id, item.text)
+        await self._emit_queue_state(agent_id)
+        return True
+
+    async def _emit_queue_state(self, agent_id: str) -> None:
+        """Emit a QueueUpdated event with current queue snapshot."""
+        items = self._prompt_queue.items(agent_id)
+        snapshots = [
+            QueueItemSnapshot(
+                id=i.id, text=i.text, source=i.source,
+                from_agent=i.from_agent, editing=i.editing,
+            )
+            for i in items
+        ]
+        await self._sink(QueueUpdated(agent_id=agent_id, items=snapshots))
+
+    def set_composing_check(self, fn: Callable[[str], bool]) -> None:
+        """Set the callback that checks if a user is composing for an agent.
+
+        The UI provides this — it reads TextArea.text.strip() directly.
+        Called synchronously from submit_prompt and _try_drain to decide
+        whether MCP messages should queue or deliver.
+        """
+        self._is_composing = fn
 
     # ------------------------------------------------------------------
     # State queries (thin delegations to registry)
@@ -486,6 +607,8 @@ class ACPBroker:
         if isinstance(event, AgentStateChanged) and event.new_state == AgentState.IDLE:
             if self._message_bus:
                 self._message_bus.wake(event.agent_id)
+            # Drain the prompt queue now that the agent is IDLE
+            await self._try_drain(event.agent_id)
 
     # ------------------------------------------------------------------
     # Agent state cleanup
@@ -510,8 +633,6 @@ class ACPBroker:
         "ToolCallUpdated",
         "TurnComplete",
         "HookFired",
-        "InitialPromptDelivered",
-        "McpMessageDelivered",
         "PlanReceived",
         "UserPromptSubmitted",
     })
@@ -821,10 +942,11 @@ class ACPBroker:
                 self._expired = True
                 await lifecycle.expire_old_sessions()
             self._message_bus = MessageBus(
-                self._db_path, self._session_id, self._deliver_message, self._process_commands
+                self._db_path, self._session_id, self._on_mcp_message, self._process_commands
             )
             await self._message_bus.start()
-            lifecycle.set_message_bus(self._message_bus.socket_path, self._message_bus.enqueue_pending, self._message_bus.enqueue_raw)
+            lifecycle.set_message_bus(self._message_bus.socket_path)
+            lifecycle.set_submit_prompt(self.submit_prompt)
         finally:
             self._message_bus_starting = False
 
@@ -848,33 +970,9 @@ class ACPBroker:
             except Exception as exc:
                 await lifecycle.update_command_status(cmd_id, "rejected", str(exc))
 
-    async def _deliver_message(self, agent_id: str, text: str, from_agents: list[str]) -> bool:
-        """Deliver a message to an agent. Non-blocking — dispatches prompt as a task."""
-        if agent_id in self._delivery_held:
-            for sender in from_agents:
-                await self._sink(
-                    McpMessageHeld(agent_id=agent_id, from_agent=sender, preview=text)
-                )
-            return True
-        session = self._registry.get_session(agent_id)
-        if not session or session.state != AgentState.IDLE:
-            for sender in from_agents:
-                await self._sink(
-                    McpMessageHeld(agent_id=agent_id, from_agent=sender, preview=text)
-                )
-            return True
-        try:
-            if self._lifecycle:
-                success = await self._lifecycle.prompt(agent_id, text)
-                if not success:
-                    return False
-            for sender in from_agents:
-                await self._sink(
-                    McpMessageDelivered(agent_id=agent_id, from_agent=sender, to_agent=agent_id, preview=text)
-                )
-            return True
-        except Exception:
-            return False
+    async def _on_mcp_message(self, to_agent: str, body: str, from_agent: str) -> None:
+        """Callback from message bus — an inter-agent message was found in DB."""
+        await self.submit_prompt(to_agent, body, source="mcp", from_agent=from_agent)
 
     # ------------------------------------------------------------------
     # Event stream

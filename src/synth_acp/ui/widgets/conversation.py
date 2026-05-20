@@ -17,8 +17,6 @@ from synth_acp.models.events import (
     AgentThoughtReceived,
     BrokerEvent,
     HookFired,
-    InitialPromptDelivered,
-    McpMessageDelivered,
     MessageChunkReceived,
     PlanReceived,
     ToolCallDiff,
@@ -158,11 +156,9 @@ class ConversationFeed(Vertical):
             await self.finalize_current_message()
         elif isinstance(event, PlanReceived):
             await self.update_plan(event.entries)
-        elif isinstance(event, McpMessageDelivered):
-            await self.add_mcp_message(event.from_agent, event.to_agent, event.preview)
         elif isinstance(event, HookFired):
             await self.add_hook_notification(event.hook_name)
-        elif isinstance(event, (InitialPromptDelivered, UserPromptSubmitted)):
+        elif isinstance(event, UserPromptSubmitted):
             await self.add_prompt(event.text)
 
     async def _mount_target(self) -> TurnContainer | PruningScrollContainer | None:

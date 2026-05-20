@@ -358,58 +358,6 @@ class TestPromptLock:
         assert "b" in lock_acquired_at
 
 
-class TestInitialPromptDeliveredAtEnqueue:
-    async def test_initial_prompt_delivered_emitted_at_enqueue(self, tmp_path: Path) -> None:
-        """handle_launch_command must emit InitialPromptDelivered immediately on enqueue."""
-        from unittest.mock import patch
-
-        from synth_acp.models.events import HookFired, InitialPromptDelivered
-
-        config = _config("orchestrator")
-        reg = AgentRegistry()
-        events: list = []
-
-        async def sink(e: object) -> None:
-            events.append(e)
-
-        lc = AgentLifecycle(config, reg, sink, db_path=tmp_path / "test.db", session_id="s1")
-        lc._enqueue_raw = MagicMock()
-        lc._enqueue_pending = MagicMock()
-
-        import sqlite3
-
-        from synth_acp.db import ensure_schema_sync
-
-        conn = sqlite3.connect(str(tmp_path / "test.db"))
-        ensure_schema_sync(conn)
-        conn.close()
-
-        mock_session = AsyncMock()
-        mock_session.run = AsyncMock()
-
-        with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_session):
-            await lc.handle_launch_command(
-                cmd_id=1,
-                from_agent="orchestrator",
-                data={
-                    "agent_id": "worker-1",
-                    "harness": "kiro",
-                    "cwd": ".",
-                    "task": "Fix bug",
-                    "message": "Please fix the auth bug",
-                },
-            )
-
-        prompt_events = [e for e in events if isinstance(e, InitialPromptDelivered)]
-        assert len(prompt_events) == 1
-        assert prompt_events[0].agent_id == "worker-1"
-        assert prompt_events[0].from_agent == "orchestrator"
-        assert prompt_events[0].text == "Please fix the auth bug"
-
-        hook_events = [e for e in events if isinstance(e, HookFired) and e.hook_name == "on_agent_startup"]
-        assert len(hook_events) == 1
-        assert hook_events[0].agent_id == "worker-1"
-
 
 class TestStartupHookForDynamicChild:
     async def test_startup_hook_fires_for_dynamic_child(self, tmp_path: Path) -> None:
@@ -426,8 +374,12 @@ class TestStartupHookForDynamicChild:
             events.append(e)
 
         lc = AgentLifecycle(config, reg, sink, db_path=tmp_path / "test.db", session_id="s1")
-        lc._enqueue_raw = MagicMock()
-        lc._enqueue_pending = MagicMock()
+        submitted: list[tuple] = []
+
+        async def mock_submit(agent_id: str, text: str, source: str, from_agent: str | None) -> None:
+            submitted.append((agent_id, text, source, from_agent))
+
+        lc.set_submit_prompt(mock_submit)
 
         import sqlite3
 
@@ -455,7 +407,8 @@ class TestStartupHookForDynamicChild:
             )
 
         # Verify startup context was prepended with correct slots
-        enqueued_msg = lc._enqueue_raw.call_args[0][1]
+        assert len(submitted) == 1
+        enqueued_msg = submitted[0][1]
         assert enqueued_msg.startswith("<ctx>child-1,orchestrator,Do work</ctx>")
         assert enqueued_msg.endswith("Hello child")
 
@@ -479,8 +432,12 @@ class TestStartupHookForDynamicChild:
             events.append(e)
 
         lc = AgentLifecycle(config, reg, sink, db_path=tmp_path / "test.db", session_id="s1")
-        lc._enqueue_raw = MagicMock()
-        lc._enqueue_pending = MagicMock()
+        submitted: list[tuple] = []
+
+        async def mock_submit(agent_id: str, text: str, source: str, from_agent: str | None) -> None:
+            submitted.append((agent_id, text, source, from_agent))
+
+        lc.set_submit_prompt(mock_submit)
 
         import sqlite3
 
@@ -508,7 +465,8 @@ class TestStartupHookForDynamicChild:
             )
 
         # No startup context prepended
-        enqueued_msg = lc._enqueue_raw.call_args[0][1]
+        assert len(submitted) == 1
+        enqueued_msg = submitted[0][1]
         assert enqueued_msg == "Hello child"
 
         # Agent is marked as first-prompted — subsequent prompt() won't inject

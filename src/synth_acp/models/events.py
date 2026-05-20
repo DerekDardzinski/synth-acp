@@ -134,35 +134,30 @@ class UsageUpdated(BrokerEvent):
     cost_currency: str | None = None
 
 
-class McpMessageDelivered(BrokerEvent):
-    """An inter-agent message was delivered via the poller."""
-
-    from_agent: str
-    to_agent: str
-    preview: str = ""
-    message_id: int | None = None
-    kind: str = "chat"
-    reply_to: int | None = None
-
-
 class HookFired(BrokerEvent):
     """A lifecycle hook was executed. UI renders as a dim system line."""
 
     hook_name: str
 
 
-class McpMessageHeld(BrokerEvent):
-    """An MCP message was held (not delivered) because delivery is on hold."""
+class QueueItemSnapshot(BaseModel, frozen=True):
+    """Serializable snapshot of a single queued prompt item."""
 
-    from_agent: str
-    preview: str
-
-
-class InitialPromptDelivered(BrokerEvent):
-    """The initial message from a parent was delivered to a launched agent."""
-
-    from_agent: str
+    id: str
     text: str
+    source: Literal["user", "mcp"]
+    from_agent: str | None = None
+    editing: bool = False
+
+
+class QueueUpdated(BrokerEvent):
+    """Full queue state snapshot for UI reconciliation.
+
+    Emitted after every queue mutation. The UI reconciles its widget
+    state against this snapshot.
+    """
+
+    items: list[QueueItemSnapshot]
 
 
 class AgentModesReceived(BrokerEvent):
@@ -275,7 +270,7 @@ type ConfigEvent = (
 
 type SystemEvent = (
     BrokerError | PermissionRequested | PermissionAutoResolved
-    | UsageUpdated | McpMessageDelivered | McpMessageHeld | HookFired | InitialPromptDelivered
+    | UsageUpdated | HookFired | QueueUpdated
     | SessionRestoreComplete | UserPromptSubmitted
 )
 

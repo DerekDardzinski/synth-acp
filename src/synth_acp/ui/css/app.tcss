@@ -68,18 +68,6 @@ AgentTile.tile-permission.tile-active { border-top: tall $warning; }
 .tile-activity GradientBar { background: $background-lighten-1; }
 .tile-activity .activity-bar-bg { background: $background-lighten-1; }
 
-#mcp-btn {
-    height: 3;
-    width: 1fr;
-    margin: 0 1 1 1;
-    background: $background-lighten-1;
-    padding: 0 2;
-    color: $text-muted;
-    content-align: center middle;
-    transition: color 0.15s in_out_cubic;
-}
-#mcp-btn:hover { color: $foreground; }
-#mcp-btn.btn-active { color: $foreground; }
 
 #sidebar-buttons-dock {
     height: auto;

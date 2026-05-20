@@ -28,15 +28,14 @@ from synth_acp.models.config import (
     load_startup_context,
     render_template,
 )
-from synth_acp.models.events import BrokerError, BrokerEvent, HookFired, InitialPromptDelivered
+from synth_acp.models.events import BrokerError, BrokerEvent, HookFired
 from synth_acp.models.visibility import get_visible_agents
 
 log = logging.getLogger(__name__)
 
 RE_FILE_REF = re.compile(r"(?:^|(?<=\s))@(\S+)")
 type EventSink = Callable[[BrokerEvent], Awaitable[None]]
-type EnqueuePendingFn = Callable[[str, str, str], None]
-type EnqueueRawFn = Callable[[str, str], None]
+type SubmitPromptFn = Callable[[str, str, str, str | None], Awaitable[None]]
 
 
 def _natural_list(items: list[str]) -> str:
@@ -71,18 +70,19 @@ class AgentLifecycle:
         self._db_path = db_path
         self._session_id = session_id
         self._notify_socket_path: str = ""
-        self._enqueue_pending: EnqueuePendingFn | None = None
-        self._enqueue_raw: EnqueueRawFn | None = None
+        self._submit_prompt: SubmitPromptFn | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._first_prompted: set[str] = set()
         self._harness_registry = load_harness_registry()
         self._terminate_timeout: float = 5.0
 
-    def set_message_bus(self, socket_path: str, enqueue: EnqueuePendingFn, enqueue_raw: EnqueueRawFn) -> None:
-        """Wire the message bus after construction. Must be called before launching agents."""
+    def set_message_bus(self, socket_path: str) -> None:
+        """Wire the message bus socket path. Must be called before launching agents."""
         self._notify_socket_path = socket_path
-        self._enqueue_pending = enqueue
-        self._enqueue_raw = enqueue_raw
+
+    def set_submit_prompt(self, fn: SubmitPromptFn) -> None:
+        """Wire the broker's submit_prompt callback for launch_command initial messages."""
+        self._submit_prompt = fn
 
     def _make_run_task(self, agent_id: str, session: ACPSession) -> asyncio.Task[None]:
         task = asyncio.create_task(session.run(), name=f"run-{agent_id}")
@@ -448,7 +448,7 @@ class AgentLifecycle:
             self._registry.register(agent_id, session)
             self._tasks[agent_id] = self._make_run_task(agent_id, session)
 
-        if message and self._enqueue_pending:
+        if message and self._submit_prompt:
             self._first_prompted.add(agent_id)
             self._registry.set_initial_message(agent_id, message)
             hook = self._config.settings.hooks.on_agent_startup
@@ -462,13 +462,7 @@ class AgentLifecycle:
                 rendered = render_template(context, slots)
                 log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)
                 message = rendered + message
-            if self._enqueue_raw:
-                self._enqueue_raw(agent_id, message)
-            else:
-                self._enqueue_pending(agent_id, from_agent, message)
-            await self._sink(
-                InitialPromptDelivered(agent_id=agent_id, from_agent=from_agent, text=data.get("message", ""))
-            )
+            await self._submit_prompt(agent_id, message, "mcp", from_agent)
             if hook.active:
                 await self._sink(HookFired(agent_id=agent_id, hook_name="on_agent_startup"))
 

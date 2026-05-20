@@ -1,4 +1,4 @@
-"""Sidebar widgets: AgentTile, AgentList, LaunchButton, MCPButton."""
+"""Sidebar widgets: AgentTile, AgentList, LaunchButton."""
 
 from __future__ import annotations
 
@@ -178,36 +178,6 @@ class LaunchButton(Static):
         self.app.action_launch()
 
 
-class MCPButton(Static):
-    """MCP Messages button with pending count badge."""
-
-    def __init__(self) -> None:
-        super().__init__(self._build_markup(0), id="mcp-btn")
-        self._count = 0
-
-    def _build_markup(self, count: int) -> str:
-        """Build button markup with optional badge."""
-        badge = f"  [$warning bold]{count}[/]" if count else ""
-        return f"◈  MCP Messages{badge}"
-
-    def update_count(self, count: int) -> None:
-        """Update the pending message count badge.
-
-        Args:
-            count: Number of pending messages.
-        """
-        self._count = count
-        self.update(self._build_markup(count))
-
-    def on_click(self) -> None:
-        """Switch to MCP messages panel."""
-        from synth_acp.ui.app import SynthApp
-
-        app = self.app
-        if not isinstance(app, SynthApp):
-                    return
-        app.run_worker(app.show_messages(), name="show-messages")
-
 
 class AgentList(Vertical):
     """Sidebar container with agent tiles, launch button, and MCP button.
@@ -231,7 +201,6 @@ class AgentList(Vertical):
                 yield AgentTile(agent_id)
         yield Vertical(
             LaunchButton(),
-            MCPButton(),
             id="sidebar-buttons-dock",
         )
 

@@ -10,7 +10,6 @@ from acp.schema import SessionConfigOptionBoolean, SessionConfigOptionSelect
 from synth_acp.models.commands import SetConfigOption
 from synth_acp.ui.file_discovery import FileEntry
 from synth_acp.ui.widgets.input_bar import InputBar, PromptTextArea, _PickerLabel, _short_path
-from synth_acp.ui.widgets.prompt_queue import QueuedPrompt
 
 
 class TestShortPath:
@@ -189,7 +188,7 @@ class TestCheckAtTrigger:
 
 
 class TestQueueIntegration:
-    """Tests for InputBar queue routing, enqueue/drain_next/is_composing, and DrainReady."""
+    """Tests for InputBar is_composing property."""
 
     def _make_input_bar(self, busy: bool = False) -> InputBar:
         """Create an InputBar with mocked internals for queue testing."""
@@ -206,57 +205,6 @@ class TestQueueIntegration:
         bar._at_row = 0
         bar._filter_timer = None
         return bar
-
-    def test_submit_when_busy_enqueues(self) -> None:
-        """Submission while busy routes to queue, not SendPrompt."""
-        bar = self._make_input_bar(busy=True)
-        queue_mock = MagicMock()
-        ta_mock = MagicMock()
-        ta_mock.text = "hello agent"
-
-        with patch.object(bar, "query_one", return_value=queue_mock):
-            message = PromptTextArea.Submitted(ta_mock)
-            bar.on_prompt_text_area_submitted(message)
-
-        ta_mock.clear.assert_called_once()
-        queue_mock.enqueue.assert_called_once_with("hello agent", "user", None)
-
-    def test_submit_when_not_busy_sends_prompt(self) -> None:
-        """Submission while not busy does NOT enqueue."""
-        bar = self._make_input_bar(busy=False)
-        ta_mock = MagicMock()
-        ta_mock.text = "hello agent"
-
-        # When not busy, the code skips the enqueue branch and tries to access self.app.
-        # Since we're not in a Textual tree, it raises AttributeError — that's fine.
-        # We only need to verify enqueue was never called.
-        enqueue_called = False
-
-        def fake_query_one(*args, **kwargs):
-            nonlocal enqueue_called
-            enqueue_called = True
-            return MagicMock()
-
-        with patch.object(bar, "query_one", side_effect=fake_query_one):
-            message = PromptTextArea.Submitted(ta_mock)
-            try:
-                bar.on_prompt_text_area_submitted(message)
-            except AttributeError:
-                pass  # Expected — self.app not available outside Textual tree
-
-        assert not enqueue_called
-
-    def test_drain_next_delegates(self) -> None:
-        """drain_next delegates to PromptQueue.drain_next."""
-        bar = self._make_input_bar()
-        expected = QueuedPrompt(text="queued text", source="user")
-        queue_mock = MagicMock()
-        queue_mock.drain_next.return_value = expected
-
-        with patch.object(bar, "query_one", return_value=queue_mock):
-            result = bar.drain_next()
-
-        assert result is expected
 
     def test_is_composing_true_when_text(self) -> None:
         """is_composing returns True when textarea has non-empty text."""
@@ -275,22 +223,6 @@ class TestQueueIntegration:
 
         with patch.object(bar, "query_one", return_value=ta_mock):
             assert bar.is_composing is False
-
-    def test_drain_ready_posts_with_agent_id(self) -> None:
-        """DrainReady from PromptQueue bubbles as InputBar.DrainReady with agent_id."""
-        bar = self._make_input_bar()
-        bar._agent_id = "my-agent"
-        posted = []
-        bar.post_message = posted.append  # type: ignore[assignment]
-
-        drain_msg = MagicMock()
-        drain_msg.stop = MagicMock()
-        bar.on_prompt_queue_drain_ready(drain_msg)
-
-        assert len(posted) == 1
-        assert isinstance(posted[0], InputBar.DrainReady)
-        assert posted[0].agent_id == "my-agent"
-        drain_msg.stop.assert_called_once()
 
 
 class TestFileInjection:
