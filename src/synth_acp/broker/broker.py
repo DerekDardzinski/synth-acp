@@ -681,8 +681,14 @@ class ACPBroker:
         elif isinstance(event, ToolCallUpdated):
             existing_pos = tool_idx.get(event.tool_call_id)
             if existing_pos is not None:
-                prev_seq, _ = buf[existing_pos]
-                buf[existing_pos] = (prev_seq, event)
+                prev_seq, prev_event = buf[existing_pos]
+                assert isinstance(prev_event, ToolCallUpdated)
+                merged = prev_event.model_copy(update={
+                    k: v for k, v in event.model_dump().items()
+                    if k != "tool_call_id" and v not in (None, "", [])
+                    and not (k == "kind" and v == "other")
+                })
+                buf[existing_pos] = (prev_seq, merged)
             else:
                 tool_idx[event.tool_call_id] = len(buf)
                 buf.append((_next_seq(), event))
