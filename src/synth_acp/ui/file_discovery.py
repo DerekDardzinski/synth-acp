@@ -7,10 +7,6 @@ import subprocess
 from pathlib import Path
 from typing import NamedTuple
 
-_IGNORE_DIRS = frozenset(
-    {".git", "node_modules", "__pycache__", ".venv", "dist", "build", ".cache", "target"}
-)
-
 
 class FileEntry(NamedTuple):
     """A discovered project file."""
@@ -30,7 +26,13 @@ async def discover_files(cwd: Path) -> list[FileEntry]:
 
 
 def _discover_files_sync(cwd: Path) -> list[FileEntry]:
-    """Synchronous file discovery implementation."""
+    """Synchronous file discovery implementation.
+
+    Only works in git repositories. Returns empty list for non-git dirs
+    or if cwd is the user's home directory.
+    """
+    if cwd == Path.home():
+        return []
     try:
         tracked = subprocess.run(
             ["git", "ls-files"],
@@ -48,7 +50,7 @@ def _discover_files_sync(cwd: Path) -> list[FileEntry]:
         ).stdout.splitlines()
         paths = [p for p in tracked + untracked if p]
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return _fallback_discover(cwd)
+        return []
 
     entries: list[FileEntry] = []
     for rel in paths:
@@ -57,23 +59,6 @@ def _discover_files_sync(cwd: Path) -> list[FileEntry]:
         except OSError:
             continue
         entries.append(FileEntry(rel_path=rel, size_bytes=size))
-    entries.sort(key=lambda e: e.rel_path)
-    return entries
-
-
-def _fallback_discover(cwd: Path) -> list[FileEntry]:
-    """Fallback discovery using Path.rglob when git is unavailable."""
-    entries: list[FileEntry] = []
-    for p in cwd.rglob("*"):
-        if not p.is_file():
-            continue
-        if any(part in _IGNORE_DIRS for part in p.relative_to(cwd).parts):
-            continue
-        try:
-            size = p.stat().st_size
-        except OSError:
-            continue
-        entries.append(FileEntry(rel_path=p.relative_to(cwd).as_posix(), size_bytes=size))
     entries.sort(key=lambda e: e.rel_path)
     return entries
 

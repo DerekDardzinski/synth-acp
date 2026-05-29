@@ -65,21 +65,13 @@ class TestDiscoverFilesGitRepo:
 
 
 class TestDiscoverFilesFallback:
-    async def test_non_git_dir_uses_rglob(self, tmp_path: Path) -> None:
-        """Non-git directory falls back to rglob, excluding standard ignore dirs."""
+    async def test_non_git_dir_returns_empty(self, tmp_path: Path) -> None:
+        """Non-git directory returns empty list (no rglob fallback)."""
         (tmp_path / "src").mkdir()
         (tmp_path / "src" / "main.py").write_text("code")
-        (tmp_path / "node_modules").mkdir()
-        (tmp_path / "node_modules" / "pkg.js").write_text("pkg")
-        (tmp_path / "__pycache__").mkdir()
-        (tmp_path / "__pycache__" / "mod.pyc").write_bytes(b"\x00")
 
         result = await discover_files(tmp_path)
-        rel_paths = [e.rel_path for e in result]
-
-        assert "src/main.py" in rel_paths
-        assert "node_modules/pkg.js" not in rel_paths
-        assert "__pycache__/mod.pyc" not in rel_paths
+        assert result == []
 
 
 class TestDiscoverFilesSorted:

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -393,6 +394,7 @@ class InputBar(Vertical):
         self._busy = False
         self._slash_commands: list[object] = []
         self._file_cache: list[FileEntry] = []
+        self._file_cache_time: float = 0.0
         self._file_picker: _FilePickerPopup | None = None
         self._at_pos: int | None = None
         self._at_row: int = 0
@@ -410,8 +412,6 @@ class InputBar(Vertical):
         if self._cwd:
             self.run_worker(self._async_poll_git_branch(), name="git-poll-init")
             self.set_interval(5, self._poll_git_branch)
-            self.run_worker(self._refresh_file_cache(), exclusive=True, group="file-cache", name="file-cache-init")
-            self.set_interval(30, self._schedule_file_cache_refresh)
 
     def _poll_git_branch(self) -> None:
         """Timer callback — spawn async worker to avoid blocking the event loop."""
@@ -430,13 +430,10 @@ class InputBar(Vertical):
             except Exception:
                 pass
 
-    def _schedule_file_cache_refresh(self) -> None:
-        """Timer callback — spawn async worker to refresh file cache."""
-        self.run_worker(self._refresh_file_cache(), exclusive=True, group="file-cache", name="file-cache-refresh")
-
     async def _refresh_file_cache(self) -> None:
         """Discover project files and cache the result."""
         self._file_cache = await discover_files(Path(self._cwd))
+        self._file_cache_time = time.monotonic()
 
     # --- File picker ---
 
@@ -445,10 +442,24 @@ class InputBar(Vertical):
         self._at_pos = event.at_pos
         self._at_row = event.cursor_row
         self._at_textarea = event._sender  # type: ignore[assignment]
+        # Lazily discover files on first @ or when cache is stale (>30s)
+        now = time.monotonic()
+        if not self._file_cache or (now - self._file_cache_time) > 30:
+            self.run_worker(self._refresh_and_show_picker(event.query), exclusive=True, group="file-cache", name="file-cache-lazy")
+            return
         if self._file_picker is None:
             self._open_file_picker(event.query)
         else:
             self._schedule_filter(event.query)
+            self._file_picker.on_resize()
+
+    async def _refresh_and_show_picker(self, query: str) -> None:
+        """Refresh file cache then open/update the picker."""
+        await self._refresh_file_cache()
+        if self._file_picker is None:
+            self._open_file_picker(query)
+        else:
+            self._schedule_filter(query)
             self._file_picker.on_resize()
 
     def on_prompt_text_area_at_dismiss(self, event: PromptTextArea.AtDismiss) -> None:  # noqa: ARG002

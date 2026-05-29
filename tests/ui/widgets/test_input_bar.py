@@ -37,6 +37,7 @@ class TestAtDetection:
             FileEntry("src/bar.py", 800),
             FileEntry("README.md", 200),
         ]
+        bar._file_cache_time = float("inf")  # Treat cache as fresh
         bar._file_picker = None
         bar._at_pos = None
         bar._at_row = 0
