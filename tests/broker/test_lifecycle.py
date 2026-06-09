@@ -393,7 +393,7 @@ class TestStartupHookForDynamicChild:
         mock_session.run = AsyncMock()
 
         with patch("synth_acp.broker.lifecycle.ACPSession", return_value=mock_session), \
-             patch("synth_acp.broker.lifecycle.load_startup_context", return_value="<ctx>{agent_id},{parent_id},{task}</ctx>\n\n"):
+             patch("synth_acp.broker.lifecycle.load_startup_context", return_value="<ctx>{agent_id},{parent_id},{task},{harness}</ctx>\n\n"):
             await lc.handle_launch_command(
                 cmd_id=1,
                 from_agent="orchestrator",
@@ -409,7 +409,7 @@ class TestStartupHookForDynamicChild:
         # Verify startup context was prepended with correct slots
         assert len(submitted) == 1
         enqueued_msg = submitted[0][1]
-        assert enqueued_msg.startswith("<ctx>child-1,orchestrator,Do work</ctx>")
+        assert enqueued_msg.startswith("<ctx>child-1,orchestrator,Do work,kiro</ctx>")
         assert enqueued_msg.endswith("Hello child")
 
         hook_events = [e for e in events if isinstance(e, HookFired) and e.hook_name == "on_agent_startup"]

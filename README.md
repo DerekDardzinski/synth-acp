@@ -96,14 +96,17 @@ Settable keys: `default_harness`, `default_agent_id`, `default_agent_mode`, `com
 Created alongside the global config on first run. This file is prepended to every agent's first prompt, giving it awareness of the Synth session:
 
 - Agent identity and parent
+- The harness the agent is running in
 - Visibility rules (text output vs inter-agent messaging)
 - Available MCP tools
-- Native subagent warning (use `launch_agent`, not `session/fork`)
+- Guidance to prefer `launch_agent` over the harness's native subagent feature
 - Message delivery semantics
 
 Edit `~/.synth/context.md` to customize what agents know about your workflow. Set `on_agent_startup.active: false` in config to disable injection entirely.
 
-**Template slots in context.md:** `{agent_id}`, `{parent_id}`, `{task}`
+**Template slots in context.md:** `{agent_id}`, `{parent_id}`, `{task}`, `{harness}`
+
+For the root agent, `{parent_id}` and `{task}` render empty; they carry values for dynamically launched child agents.
 
 ## Project Config (`.synth.json`)
 

@@ -250,7 +250,15 @@ class AgentLifecycle:
                 hook = self._config.settings.hooks.on_agent_startup
                 if hook.active:
                     context = load_startup_context()
-                    rendered = render_template(context, {"agent_id": agent_id, "parent_id": "", "task": ""})
+                    rendered = render_template(
+                        context,
+                        {
+                            "agent_id": agent_id,
+                            "parent_id": "",
+                            "task": "",
+                            "harness": self._registry.get_harness(agent_id),
+                        },
+                    )
                     log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)
                     text = rendered + text
                     await self._sink(HookFired(agent_id=agent_id, hook_name="on_agent_startup"))
@@ -458,6 +466,7 @@ class AgentLifecycle:
                     "agent_id": agent_id,
                     "parent_id": from_agent,
                     "task": task,
+                    "harness": self._registry.get_harness(agent_id),
                 }
                 rendered = render_template(context, slots)
                 log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)
