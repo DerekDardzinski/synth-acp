@@ -139,18 +139,30 @@ def create_mcp_server(
         """Launch a new child agent.
 
         Args:
-            agent_id: Unique name for the new agent.
+            agent_id: Name for the new agent. Must be unique within the session:
+                launching with the id of any existing agent — including a terminated
+                one — is rejected ("Agent already exists"). To bring a terminated
+                agent back, use resurrect_agent, not launch_agent.
             harness: Runtime to use: 'kiro', 'claude', 'opencode', etc.
             message: Initial prompt sent to the agent once it becomes idle. Include
                 explicit instructions to report back using send_message. Example:
                 "...When complete, call send_message(to_agent='YOUR_ID', kind='response')
                 with your findings."
             cwd: Working directory.
-            agent_mode: Optional ACP mode ID.
+            agent_mode: Launch the child as a specific pre-defined agent
+                configuration — a persona with its own system prompt, tools, and
+                model that the harness already knows. This is the same named-agent
+                concept the harness uses for its native subagents (Kiro agent
+                configs, Claude Code agents). The value must match an agent
+                configuration that already exists in this harness. It is not
+                a task description or a free-form label — pass the task itself in
+                `message` and a short summary in `task`.
             task: Short description shown in list_agents.
 
         Returns:
-            {"ok": true, "agent_id": str}.
+            {"ok": true, "agent_id": str} on success, or {"error": str} if the
+            launch is rejected (e.g. the agent_id already exists, or the
+            max-agents limit is reached).
         """
         def _sync(conn: sqlite3.Connection) -> tuple[int, str | None]:
             _ensure_registered(conn)
@@ -207,7 +219,9 @@ def create_mcp_server(
 
     @mcp.tool()
     async def terminate_agent(target_agent_id: str) -> str:
-        """Terminate a child agent you previously launched.
+        """Terminate a child agent you previously launched. Its id stays reserved
+        for the session; bring the agent back later with resurrect_agent
+        (launch_agent cannot reuse the id).
 
         Args:
             target_agent_id: ID of the child agent to terminate.
@@ -232,6 +246,10 @@ def create_mcp_server(
     @mcp.tool()
     async def resurrect_agent(target_agent_id: str) -> str:
         """Resurrect a previously terminated agent, restoring its conversation history.
+
+        This is the only way to bring back a terminated agent — launch_agent rejects
+        a reused id. Resurrection restores the agent with its prior conversation
+        history intact.
 
         Args:
             target_agent_id: ID of the terminated agent to resurrect.
@@ -276,7 +294,9 @@ def create_mcp_server(
         """List all agents visible to you in this session.
 
         Returns:
-            JSON array of agent info objects.
+            JSON array of agent objects, each with: agent_id (str), status (str),
+            parent (str|null — the agent that launched it), task (str|null), and
+            is_self (bool). Only agents currently visible to you are included.
         """
         def _sync(conn: sqlite3.Connection) -> str:
             _ensure_registered(conn)
