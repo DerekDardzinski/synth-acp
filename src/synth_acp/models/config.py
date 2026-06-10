@@ -8,9 +8,12 @@ import os
 from collections import defaultdict
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, model_validator
+
+if TYPE_CHECKING:
+    from synth_acp.discovery import DiscoveredAgent
 
 log = logging.getLogger(__name__)
 
@@ -280,6 +283,19 @@ could plausibly need either, use launch_agent. You are the parent of any agent y
 launch, and you coordinate it with send_message.
 </spawning_subagents>
 
+<managing_child_agents>
+Each agent_id is permanent within the session: once used it cannot be reused by
+launch_agent, even after the agent is terminated. You can manage any agent you
+launched — terminate_agent ends it, and resurrect_agent is the only way to bring
+a terminated agent back, restoring it with its conversation history intact.
+
+To launch a child as a specific agent configuration, set agent_mode to one of the
+configurations available in your harness ({harness}):
+{available_agents}
+Other harnesses have their own configurations. See the launch_agent tool
+description for details.
+</managing_child_agents>
+
 <working_rules>
 1. Visibility: Your text output goes to the dashboard only — other agents cannot
    see it. Reach other agents with send_message.
@@ -344,6 +360,34 @@ def render_template(template: str, slots: dict[str, str]) -> str:
     Unknown slots are left as empty strings rather than raising KeyError.
     """
     return template.format_map(defaultdict(str, slots))
+
+
+def format_available_agents(agents: list[DiscoveredAgent]) -> str:
+    """Render the ``{available_agents}`` slot body.
+
+    Args:
+        agents: Discovered agent configurations for the current harness.
+
+    Returns:
+        A non-empty list renders one line per agent, two-space indented::
+
+            '  - {qualified_name} — {description}'
+
+        When ``description`` is empty, the line is just ``'  - {qualified_name}'``.
+        An empty list renders the single line
+        ``'  (no named agent configurations are available in this harness)'``.
+        Lines are joined with newlines; there is no trailing newline (the
+        template supplies the surrounding newlines around the slot).
+    """
+    if not agents:
+        return "  (no named agent configurations are available in this harness)"
+    lines: list[str] = []
+    for agent in agents:
+        if agent.description:
+            lines.append(f"  - {agent.qualified_name} — {agent.description}")
+        else:
+            lines.append(f"  - {agent.qualified_name}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

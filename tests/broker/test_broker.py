@@ -916,48 +916,33 @@ class TestBrokerAgentRouting:
 
 
 class TestDiscoveryCache:
-    async def test_get_discovered_agents_caches_by_identity(self, tmp_path: Path) -> None:
-        """Discovery is only called once per harness identity.
-        Silent failure: filesystem scan runs on every config option emission."""
-        from unittest.mock import patch as _patch
+    async def test_get_discovered_agents_delegates_to_lifecycle(self, tmp_path: Path) -> None:
+        """Broker is a pure delegate: it forwards to lifecycle and returns its result.
+        Silent failure: broker re-implements discovery or drops the agent_id."""
+        from unittest.mock import MagicMock
 
         from synth_acp.discovery import DiscoveredAgent
-        from synth_acp.models.config import HarnessEntry
 
         broker = _make_broker("agent-1", tmp_path=tmp_path)
         lifecycle = await broker._ensure_lifecycle()
 
-        entry = HarnessEntry(
-            identity="claude",
-            name="Claude Code",
-            short_name="claude",
-            binary_names=["claude"],
-            run_cmd="claude acp",
-            agent_mode_target="meta_agent",
-        )
-        lifecycle._harness_registry = [entry]
-
-        session = ACPSession(
-            agent_id="agent-1",
-            binary="echo",
-            args=[],
-            cwd="/tmp/project",
-            event_sink=broker._sink,
-        )
-        broker._registry._sessions["agent-1"] = session
-        broker._registry.set_harness("agent-1", "claude")
-
         fake_agents = [
             DiscoveredAgent(qualified_name="planner", name="planner", description="", source="user")
         ]
+        lifecycle.get_discovered_agents = MagicMock(return_value=fake_agents)  # type: ignore[method-assign]
 
-        with _patch("synth_acp.broker.broker.discover_agents", return_value=fake_agents) as mock_discover:
-            result1 = broker.get_discovered_agents("agent-1")
-            result2 = broker.get_discovered_agents("agent-1")
+        result = broker.get_discovered_agents("agent-1")
 
-        assert result1 == fake_agents
-        assert result2 == fake_agents
-        assert mock_discover.call_count == 1
+        assert result == fake_agents
+        lifecycle.get_discovered_agents.assert_called_once_with("agent-1")
+
+    async def test_get_discovered_agents_returns_empty_without_lifecycle(
+        self, tmp_path: Path
+    ) -> None:
+        """Broker returns [] when the lifecycle has not been initialized."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        assert broker._lifecycle is None
+        assert broker.get_discovered_agents("agent-1") == []
 
     async def test_get_discovered_agents_returns_empty_for_unknown_harness(self, tmp_path: Path) -> None:
         """Unknown harness returns empty list gracefully.

@@ -19,12 +19,14 @@ from acp.schema import EnvVariable, McpServerStdio
 from synth_acp.acp.session import ACPSession
 from synth_acp.broker.registry import AgentRegistry
 from synth_acp.db import ensure_schema_sync, expire_old_sessions_sync
+from synth_acp.discovery import DiscoveredAgent, discover_agents
 from synth_acp.harnesses import load_harness_registry
 from synth_acp.models.agent import AgentConfig, AgentState
 from synth_acp.models.config import (
     HarnessEntry,
     MessageHook,
     SessionConfig,
+    format_available_agents,
     load_startup_context,
     render_template,
 )
@@ -74,6 +76,7 @@ class AgentLifecycle:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._first_prompted: set[str] = set()
         self._harness_registry = load_harness_registry()
+        self._discovery_cache: dict[str, list[DiscoveredAgent]] = {}
         self._terminate_timeout: float = 5.0
 
     def set_message_bus(self, socket_path: str) -> None:
@@ -83,6 +86,29 @@ class AgentLifecycle:
     def set_submit_prompt(self, fn: SubmitPromptFn) -> None:
         """Wire the broker's submit_prompt callback for launch_command initial messages."""
         self._submit_prompt = fn
+
+    def get_discovered_agents(self, agent_id: str) -> list[DiscoveredAgent]:
+        """Return cached discovered agent configs for the agent's harness.
+
+        Resolves the agent's harness short_name to a HarnessEntry via
+        ``self._harness_registry``, caches results by harness *identity* in
+        ``self._discovery_cache``, and calls ``discover_agents(entry, cwd)`` on
+        first access. Returns ``[]`` when the agent has no harness, the harness
+        is unknown, or the harness exposes no discoverable agents
+        (opencode/gemini). Never raises.
+        """
+        harness_name = self._registry.get_harness(agent_id)
+        if not harness_name:
+            return []
+        entry = next(
+            (e for e in self._harness_registry if e.short_name == harness_name), None
+        )
+        if entry is None:
+            return []
+        if entry.identity not in self._discovery_cache:
+            cwd = self._registry.get_cwd(agent_id)
+            self._discovery_cache[entry.identity] = discover_agents(entry, Path(cwd))
+        return self._discovery_cache[entry.identity]
 
     def _make_run_task(self, agent_id: str, session: ACPSession) -> asyncio.Task[None]:
         task = asyncio.create_task(session.run(), name=f"run-{agent_id}")
@@ -257,6 +283,9 @@ class AgentLifecycle:
                             "parent_id": "",
                             "task": "",
                             "harness": self._registry.get_harness(agent_id),
+                            "available_agents": format_available_agents(
+                                self.get_discovered_agents(agent_id)
+                            ),
                         },
                     )
                     log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)
@@ -467,6 +496,9 @@ class AgentLifecycle:
                     "parent_id": from_agent,
                     "task": task,
                     "harness": self._registry.get_harness(agent_id),
+                    "available_agents": format_available_agents(
+                        self.get_discovered_agents(agent_id)
+                    ),
                 }
                 rendered = render_template(context, slots)
                 log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)

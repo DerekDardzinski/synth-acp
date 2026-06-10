@@ -6,7 +6,11 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-from synth_acp.broker.lifecycle import AgentLifecycle
+from synth_acp.broker.lifecycle import (
+    AgentLifecycle,
+    DiscoveredAgent,
+    format_available_agents,
+)
 from synth_acp.broker.registry import AgentRegistry
 from synth_acp.models.agent import AgentState
 from synth_acp.models.config import SessionConfig
@@ -849,3 +853,120 @@ class TestSetAgent:
         errors = [e for e in events if isinstance(e, BrokerError)]
         assert len(errors) == 1
         assert "cannot switch agent" in errors[0].message
+
+
+class TestAvailableAgents:
+    def test_format_available_agents_populated(self) -> None:
+        """Populated list renders compact two-space lines; empty description drops the em dash."""
+        agents = [
+            DiscoveredAgent(
+                qualified_name="plan", name="plan", description="Planning agent", source="user"
+            ),
+            DiscoveredAgent(qualified_name="x", name="x", description="", source="user"),
+        ]
+        result = format_available_agents(agents)
+        lines = result.split("\n")
+        assert lines == ["  - plan — Planning agent", "  - x"]
+        # No-description agent must not emit a dangling em dash.
+        assert "x —" not in result
+
+    def test_format_available_agents_empty(self) -> None:
+        """Empty list renders the graceful no-configurations line, never an empty block."""
+        assert (
+            format_available_agents([])
+            == "  (no named agent configurations are available in this harness)"
+        )
+
+    async def test_prompt_first_prompt_injects_available_agents(self) -> None:
+        """First prompt renders the discovered configs into the {available_agents} slot."""
+        from unittest.mock import patch
+
+        config = _config("a")
+        reg = AgentRegistry()
+
+        async def sink(e: object) -> None:
+            pass
+
+        lc = AgentLifecycle(config, reg, sink, db_path=Path("/tmp/unused.db"), session_id="s1")
+
+        mock_session = AsyncMock()
+        mock_session.state = AgentState.IDLE
+        mock_session._cwd = ""
+        reg.register("a", mock_session)
+        reg.set_harness("a", "kiro")
+
+        lc.get_discovered_agents = lambda _agent_id: [  # type: ignore[method-assign]
+            DiscoveredAgent(
+                qualified_name="plan", name="plan", description="Planning agent", source="user"
+            )
+        ]
+
+        # Patch the template source so the test is hermetic and does not depend
+        # on the developer's live ~/.synth/context.md (mirrors sibling tests).
+        with patch(
+            "synth_acp.broker.lifecycle.load_startup_context",
+            return_value="<ctx>{available_agents}</ctx>\n\n",
+        ):
+            assert await lc.prompt("a", "hello") is True
+            task = lc._tasks.get("prompt-a")
+            if task:
+                await task
+
+        rendered = mock_session.prompt.call_args[0][0]
+        assert "  - plan — Planning agent" in rendered
+        assert rendered.endswith("hello")
+
+
+class TestGetDiscoveredAgents:
+    async def test_caches_by_harness_identity(self) -> None:
+        """Discovery runs once per harness identity; subsequent calls hit the cache.
+
+        Silent failure: a filesystem scan runs on every startup-context render."""
+        from unittest.mock import patch as _patch
+
+        from synth_acp.harnesses import HarnessEntry
+
+        config = _config("agent-1")
+        reg = AgentRegistry()
+
+        async def sink(e: object) -> None:
+            pass
+
+        lc = AgentLifecycle(config, reg, sink, db_path=Path("/tmp/unused.db"), session_id="s1")
+        lc._harness_registry = [
+            HarnessEntry(
+                identity="claude",
+                name="Claude Code",
+                short_name="claude",
+                binary_names=["claude"],
+                run_cmd="claude acp",
+            )
+        ]
+        reg.set_harness("agent-1", "claude")
+
+        fake_agents = [
+            DiscoveredAgent(qualified_name="planner", name="planner", description="", source="user")
+        ]
+
+        with _patch(
+            "synth_acp.broker.lifecycle.discover_agents", return_value=fake_agents
+        ) as mock_discover:
+            result1 = lc.get_discovered_agents("agent-1")
+            result2 = lc.get_discovered_agents("agent-1")
+
+        assert result1 == fake_agents
+        assert result2 == fake_agents
+        assert mock_discover.call_count == 1
+
+    def test_returns_empty_for_unknown_harness(self) -> None:
+        """Unknown harness short_name resolves to [] without raising."""
+        config = _config("agent-1")
+        reg = AgentRegistry()
+
+        async def sink(e: object) -> None:
+            pass
+
+        lc = AgentLifecycle(config, reg, sink, db_path=Path("/tmp/unused.db"), session_id="s1")
+        reg.set_harness("agent-1", "nonexistent")
+
+        assert lc.get_discovered_agents("agent-1") == []

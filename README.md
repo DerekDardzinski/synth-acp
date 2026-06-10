@@ -100,13 +100,14 @@ Created alongside the global config on first run. This file is prepended to ever
 - Visibility rules (text output vs inter-agent messaging)
 - Available MCP tools
 - Guidance to prefer `launch_agent` over the harness's native subagent feature
+- The agent configurations available in the current harness (valid `agent_mode` values for `launch_agent`)
 - Message delivery semantics
 
 Edit `~/.synth/context.md` to customize what agents know about your workflow. Set `on_agent_startup.active: false` in config to disable injection entirely.
 
-**Template slots in context.md:** `{agent_id}`, `{parent_id}`, `{task}`, `{harness}`
+**Template slots in context.md:** `{agent_id}`, `{parent_id}`, `{task}`, `{harness}`, `{available_agents}`
 
-For the root agent, `{parent_id}` and `{task}` render empty; they carry values for dynamically launched child agents.
+For the root agent, `{parent_id}` and `{task}` render empty; they carry values for dynamically launched child agents. `{available_agents}` renders the agent configurations discovered for the current harness (the valid `agent_mode` values), or a "no named agent configurations" line when the harness exposes none.
 
 ## Project Config (`.synth.json`)
 
