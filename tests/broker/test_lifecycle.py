@@ -23,6 +23,16 @@ from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import AgentHandedOff, BrokerError, HookFired
 
 
+@pytest.fixture(autouse=True)
+def _isolate_harness_binary_discovery():
+    """Make harness availability explicit instead of inheriting the developer's PATH."""
+    with patch(
+        "synth_acp.broker.lifecycle.shutil.which",
+        side_effect=lambda binary: f"/test-bin/{binary}",
+    ):
+        yield
+
+
 def _config(*ids: str) -> SessionConfig:
     return SessionConfig(
         project="test",
@@ -1433,17 +1443,28 @@ class TestHandoffShutdownOrdering:
         lc._sink = sink
 
         handoff = asyncio.create_task(lc.handoff("worker", "brief"))
-        await registered.wait()
-        assert reg.get_session("worker") is successors[0], "successor must be registered by now"
+        shutdown: asyncio.Task | None = None
+        try:
+            await asyncio.wait_for(registered.wait(), timeout=1.0)
+            assert reg.get_session("worker") is successors[0], (
+                "successor must be registered by now"
+            )
 
-        shutdown = asyncio.create_task(lc.shutdown())
-        await asyncio.sleep(0)
-        assert lc._shutting_down is True
-        assert not shutdown.done(), "shutdown must wait for the in-flight handoff"
+            shutdown = asyncio.create_task(lc.shutdown())
+            await asyncio.sleep(0)
+            assert lc._shutting_down is True
+            assert not shutdown.done(), "shutdown must wait for the in-flight handoff"
 
-        released.set()
-        result = await handoff
-        await shutdown
+            released.set()
+            result = await asyncio.wait_for(handoff, timeout=1.0)
+            await asyncio.wait_for(shutdown, timeout=1.0)
+        finally:
+            released.set()
+            pending = [task for task in (handoff, shutdown) if task is not None]
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
         assert result.successor_started is True
         assert not handoff.cancelled()

@@ -63,6 +63,16 @@ from synth_acp.models.events import (
 from synth_acp.models.permissions import PermissionDecision
 
 
+@pytest.fixture(autouse=True)
+def _isolate_harness_binary_discovery():
+    """Make harness availability explicit instead of inheriting the developer's PATH."""
+    with patch(
+        "synth_acp.broker.lifecycle.shutil.which",
+        side_effect=lambda binary: f"/test-bin/{binary}",
+    ):
+        yield
+
+
 def _make_config() -> SessionConfig:
     """Create a minimal SessionConfig."""
     return SessionConfig(project="test-session")
