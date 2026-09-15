@@ -22,15 +22,7 @@ from synth_acp.models.agent import AgentConfig, AgentState
 from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import AgentHandedOff, BrokerError, HookFired
 
-
-@pytest.fixture(autouse=True)
-def _isolate_harness_binary_discovery():
-    """Make harness availability explicit instead of inheriting the developer's PATH."""
-    with patch(
-        "synth_acp.broker.lifecycle.shutil.which",
-        side_effect=lambda binary: f"/test-bin/{binary}",
-    ):
-        yield
+pytestmark = pytest.mark.usefixtures("available_harness_binaries")
 
 
 def _config(*ids: str) -> SessionConfig:

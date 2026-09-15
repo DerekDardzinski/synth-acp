@@ -55,6 +55,17 @@ from synth_acp.ui.messages import BrokerEventMessage
 from synth_acp.ui.widgets.conversation import ConversationFeed
 from synth_acp.ui.widgets.gradient_bar import GradientBarVisual
 
+
+@pytest.fixture
+def available_harness_binaries() -> Iterator[None]:
+    """Make harness availability explicit instead of inheriting the developer's PATH."""
+    with patch(
+        "synth_acp.broker.lifecycle.shutil.which",
+        side_effect=lambda binary: f"/test-bin/{binary}",
+    ):
+        yield
+
+
 # ── synthetic journal ──────────────────────────────────────────────────────────
 
 # Measured proportions from session SHScienceRetrieverDataset-86d5d716: 2560 events

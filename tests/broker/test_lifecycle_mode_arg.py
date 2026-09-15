@@ -5,10 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from synth_acp.broker.lifecycle import AgentLifecycle
 from synth_acp.broker.registry import AgentRegistry
 from synth_acp.models.agent import AgentConfig
 from synth_acp.models.config import HarnessEntry, SessionConfig
+
+pytestmark = pytest.mark.usefixtures("available_harness_binaries")
 
 
 def _make_entry(mode_arg: str | None = "--agent") -> HarnessEntry:
