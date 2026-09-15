@@ -337,10 +337,10 @@ class SessionPickerScreen(ModalScreen[str | None]):
         """Load embeddings from DB, deserialize, build grouped matrix."""
         import numpy as np
 
-        from synth_acp.db import load_all_embeddings_sync
+        from synth_acp.db import configure_connection, load_all_embeddings_sync
 
         with contextlib.closing(sqlite3.connect(str(self._db_path))) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+            configure_connection(conn)
             rows = load_all_embeddings_sync(conn)
 
         # Filter out empty blobs (sentinel for agents with no text)

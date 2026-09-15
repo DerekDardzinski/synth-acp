@@ -20,6 +20,7 @@ from textual import events, on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.content import Content
+from textual.css.query import NoMatches
 from textual.highlight import highlight
 from textual.markup import escape
 from textual.message import Message
@@ -392,6 +393,7 @@ class InputBar(Vertical):
         self._cwd_display = _short_path(cwd) if cwd else ""
         self._git_branch: str | None = None
         self._busy = False
+        self._disabled = False
         self._slash_commands: list[object] = []
         self._file_cache: list[FileEntry] = []
         self._file_cache_time: float = 0.0
@@ -403,7 +405,13 @@ class InputBar(Vertical):
 
     def on_mount(self) -> None:
         """Start polling git branch if cwd is set."""
-        self.query_one("#drain-btn").display = False
+        # Re-apply anything recorded before this bar composed.  The app syncs an agent's
+        # bar as soon as the FEED reports an input_bar, which is one level above this
+        # widget's own children, so set_busy/set_disabled are routinely called first.
+        self._apply_busy()
+        self._apply_disabled()
+        if not self._busy:
+            self.query_one("#drain-btn").display = False
         cwd = self.query_one("#cwd-label", Static)
         if self._cwd_display:
             cwd.update(self._build_cwd_label())
@@ -742,12 +750,53 @@ class InputBar(Vertical):
         self.query_one("#drain-btn").display = visible
 
     def set_busy(self, busy: bool) -> None:
-        """Toggle between submit/cancel button and activity bar."""
+        """Toggle between submit/cancel button and activity bar.
+
+        Records the state and applies it only once this bar has composed.  Callers reach
+        this before compose -- the app syncs an agent's bar as soon as the feed reports an
+        ``input_bar``, which happens on the FEED's mount, one level above this widget's
+        own children.  ``on_mount`` re-applies it, so nothing is lost.
+        """
         self._busy = busy
-        self.query_one("#submit-btn").display = not busy
-        self.query_one("#cancel-btn").display = busy
-        self.query_one("#drain-btn").display = False
-        self.query_one(ActivityBar).active = busy
+        self._apply_busy()
+
+    def _apply_busy(self) -> None:
+        """Push the recorded busy state onto the buttons and the activity bar.
+
+        MISSING NODES ARE THE ONLY GUARD, and both earlier attempts at a cheaper one were
+        wrong in opposite directions.
+
+        ``children`` being non-empty does not mean the queried nodes exist: the three
+        buttons are GRANDCHILDREN, composed inside the ``Horizontal`` above them, so the bar
+        can hold its direct children while that container's own children are gone.  Tearing
+        a feed down with a deferred sync still queued against it reaches exactly that state,
+        and ``query_one`` then raised ``NoMatches`` out of ``Screen._on_idle`` -- an
+        unhandled Textual exception.  It surfaced only as a 1-in-4 intermittent failure of
+        ``test_unmounted_feed_never_restarts_the_executor``, which removes a feed and so
+        creates the condition; the executor was never the defect.
+
+        ``is_mounted`` is worse than redundant, which is why it is gone.  It is False while
+        Textual runs ``on_mount`` -- the very place this is called to replay a state
+        recorded before the bar composed -- so it discarded exactly the work it was meant to
+        allow.  MEASURED with busy and disabled both recorded pre-compose: Submit and Cancel
+        were BOTH visible afterwards and the prompt was left enabled.  The pre-compose case
+        it was guarding is already covered, because a query before ``compose`` raises
+        ``NoMatches`` like any other missing node.
+
+        Every node is resolved BEFORE anything is assigned, so a bar caught mid-teardown
+        cannot end up with some state applied and the rest stale.
+        """
+        try:
+            submit = self.query_one("#submit-btn")
+            cancel = self.query_one("#cancel-btn")
+            drain = self.query_one("#drain-btn")
+            activity = self.query_one(ActivityBar)
+        except NoMatches:
+            return
+        submit.display = not self._busy
+        cancel.display = self._busy
+        drain.display = False
+        activity.active = self._busy
 
     def on_prompt_text_area_submitted(self, message: PromptTextArea.Submitted) -> None:
         """Send prompt to the focused agent."""
@@ -780,11 +829,22 @@ class InputBar(Vertical):
             disabled: Whether to disable the input.
             hint: Placeholder text to show.
         """
+        self._disabled = disabled
+        self._apply_disabled()
+
+    def _apply_disabled(self) -> None:
+        """Push the recorded disabled state onto the prompt input.
+
+        Same guard discipline as ``_apply_busy``, and it had the same defect: the
+        ``is_mounted`` check discarded the state replayed from ``on_mount``, which is where
+        a state recorded before the bar composed is meant to land.  A missing node is the
+        only condition worth skipping on.
+        """
         try:
             inp = self.query_one("#prompt-input", PromptTextArea)
-            inp.disabled = disabled
-        except Exception:
-            log.debug("Input disable failed", exc_info=True)
+        except NoMatches:
+            return
+        inp.disabled = self._disabled
 
     # --- Queue API ---
 

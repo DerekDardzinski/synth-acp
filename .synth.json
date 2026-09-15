@@ -3,18 +3,24 @@
   "settings": {
     "communication_mode": "LOCAL",
     "auto_approve_tools": [
-      "synth-mcp/send_message",
-      "synth-mcp/check_delivery",
-      "synth-mcp/launch_agent",
-      "synth-mcp/terminate_agent",
-      "synth-mcp/list_agents",
-      "synth-mcp/get_my_context",
-      "synth-mcp/resurrect_agent"
+      "synth-mcp"
     ],
     "hooks": {
-      "on_agent_startup": { "active": true },
-      "on_agent_join": { "active": false, "recipients": "parent", "template": "Agent \"{agent_id}\" is now active. Task: \"{task}\".", "kind": "system" },
-      "on_agent_exit": { "active": false, "recipients": "parent", "template": "Agent \"{agent_id}\" has exited.", "kind": "system" }
+      "on_agent_startup": {
+        "active": true
+      },
+      "on_agent_join": {
+        "active": false,
+        "recipients": "parent",
+        "template": "Agent \"{agent_id}\" is now active. Task: \"{task}\".",
+        "kind": "system"
+      },
+      "on_agent_exit": {
+        "active": false,
+        "recipients": "parent",
+        "template": "Agent \"{agent_id}\" has exited.",
+        "kind": "system"
+      }
     }
   }
 }

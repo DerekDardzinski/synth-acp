@@ -6,15 +6,18 @@ import asyncio
 from pathlib import Path
 
 from synth_acp.broker.message_bus import MessageBus
+from synth_acp.models.config import MessageKind
 
 
-async def _noop_on_message(to_agent: str, body: str, from_agent: str) -> None:
+async def _noop_on_message(to_agent: str, body: str, from_agent: str, kind: MessageKind) -> None:
     pass
 
 
 class TestMessageBusLifecycle:
     async def test_stop_does_not_hang_when_delivery_is_slow(self, tmp_path: Path) -> None:
-        async def slow_on_message(to_agent: str, body: str, from_agent: str) -> None:
+        async def slow_on_message(
+            to_agent: str, body: str, from_agent: str, kind: MessageKind
+        ) -> None:
             await asyncio.sleep(10)
 
         bus = MessageBus(tmp_path / "test.db", "s1", slow_on_message, fallback_interval=0.1)
@@ -53,7 +56,7 @@ class TestMessageBusDelivery:
         session_id = "s1"
         delivered: list[str] = []
 
-        async def on_message(to_agent: str, body: str, from_agent: str) -> None:
+        async def on_message(to_agent: str, body: str, from_agent: str, kind: MessageKind) -> None:
             delivered.append(to_agent)
 
         bus = MessageBus(db_path, session_id, on_message, fallback_interval=30.0)
@@ -100,7 +103,7 @@ class TestMessageBusDelivery:
         session_id = "s1"
         delivered: list[str] = []
 
-        async def on_message(to_agent: str, body: str, from_agent: str) -> None:
+        async def on_message(to_agent: str, body: str, from_agent: str, kind: MessageKind) -> None:
             delivered.append(to_agent)
 
         bus = MessageBus(db_path, session_id, on_message, fallback_interval=0.3)
@@ -209,4 +212,101 @@ class TestAtomicCommandClaim:
             assert processed[0][0] == cmd_id
         finally:
             await bus.stop()
+
+
+class TestMessageBusKindThreading:
+    """Kind propagation/normalization and status transitions in the poller."""
+
+    def _insert_message(
+        self,
+        db_path: Path,
+        session_id: str,
+        *,
+        to_agent: str,
+        body: str,
+        kind: str,
+    ) -> None:
+        import sqlite3
+        import time
+
+        from synth_acp.db import ensure_schema_sync
+
+        conn = sqlite3.connect(str(db_path))
+        ensure_schema_sync(conn)
+        now = int(time.time() * 1000)
+        conn.execute(
+            "INSERT INTO messages (session_id, from_agent, to_agent, body, kind, status, created_at) "
+            "VALUES (?, 's', ?, ?, ?, 'pending', ?)",
+            (session_id, to_agent, body, kind, now),
+        )
+        conn.commit()
+        conn.close()
+
+    async def test_kind_and_body_threaded_and_normalized(self, tmp_path: Path) -> None:
+        """SELECT carries kind, unknown kind narrows to 'chat', body passes verbatim.
+
+        Guards three distinct silent failures: kind not threaded (always default),
+        unknown kind leaking un-normalized to the Literal, and any body transform
+        inside the metadata-only poller (a wrong-data failure the .2 broker tests
+        cannot catch, since they invoke _on_mcp_message directly).
+        """
+        db_path = tmp_path / "test.db"
+        session_id = "s1"
+        captured: list[tuple[str, str, MessageKind]] = []
+
+        async def on_message(
+            to_agent: str, body: str, from_agent: str, kind: MessageKind
+        ) -> None:
+            captured.append((to_agent, body, kind))
+
+        self._insert_message(db_path, session_id, to_agent="a1", body="b1", kind="request")
+        self._insert_message(db_path, session_id, to_agent="a2", body="b2", kind="bogus")
+
+        bus = MessageBus(db_path, session_id, on_message, fallback_interval=30.0)
+        await bus._poll_messages()
+
+        assert captured == [("a1", "b1", "request"), ("a2", "b2", "chat")]
+
+    async def test_successful_delivery_marks_row_delivered_with_timestamp(
+        self, tmp_path: Path
+    ) -> None:
+        """After a successful callback, the row is 'delivered' with delivered_at set."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        session_id = "s1"
+        self._insert_message(db_path, session_id, to_agent="a1", body="hi", kind="chat")
+
+        bus = MessageBus(db_path, session_id, _noop_on_message, fallback_interval=30.0)
+        await bus._poll_messages()
+
+        conn = sqlite3.connect(str(db_path))
+        status, delivered_at = conn.execute(
+            "SELECT status, delivered_at FROM messages WHERE to_agent = 'a1'"
+        ).fetchone()
+        conn.close()
+        assert status == "delivered"
+        assert delivered_at is not None
+
+    async def test_callback_exception_leaves_row_pending(self, tmp_path: Path) -> None:
+        """When the callback raises, the row stays 'pending' with delivered_at NULL."""
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        session_id = "s1"
+        self._insert_message(db_path, session_id, to_agent="a1", body="hi", kind="chat")
+
+        async def failing(to_agent: str, body: str, from_agent: str, kind: MessageKind) -> None:
+            raise RuntimeError("delivery failed")
+
+        bus = MessageBus(db_path, session_id, failing, fallback_interval=30.0)
+        await bus._poll_messages()
+
+        conn = sqlite3.connect(str(db_path))
+        status, delivered_at = conn.execute(
+            "SELECT status, delivered_at FROM messages WHERE to_agent = 'a1'"
+        ).fetchone()
+        conn.close()
+        assert status == "pending"
+        assert delivered_at is None
 

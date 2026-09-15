@@ -6,14 +6,14 @@ import asyncio
 import asyncio.subprocess as aio_subprocess
 import contextlib
 import logging
+import math
 import os
 import signal
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, TypeVar
 
 from acp.client.connection import ClientSideConnection
-from acp.contrib.session_state import SessionAccumulator
 from acp.exceptions import RequestError
 from acp.schema import (
     AgentMessageChunk,
@@ -37,7 +37,6 @@ from acp.schema import (
     SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
-    SessionNotification,
     TerminalExitStatus,
     TerminalOutputResponse,
     ToolCallProgress,
@@ -82,11 +81,127 @@ from synth_acp.terminal.manager import Command, TerminalProcess
 
 log = logging.getLogger(__name__)
 
+_T = TypeVar("_T")
+
 EventSink = Callable[[BrokerEvent], Awaitable[None]]
 
 
 _SHUTDOWN_TIMEOUT = 2.0
+DRAIN_PASSES: int = 4
 _PIPE_LIMIT = 8 * 1024 * 1024  # 8 MiB — agent tool responses can be large
+
+_STEER_ACCEPTANCE_TIMEOUT = 10.0
+"""Seconds to wait for Kiro's deterministic steering acceptance response."""
+
+_HANDSHAKE_TIMEOUT = 60.0
+"""Seconds to wait for one handshake request before declaring the agent dead.
+
+The ACP SDK has no internal timeout on any request, so without this bound a child that
+never answers leaves its session in INITIALIZING for the lifetime of the synth process,
+with nothing reported.  That was reachable and was observed: an unpinned package-manager
+wrapper in the spawn path, facing an unreachable registry, was measured writing nothing
+at all to either stream for 30 seconds, and from here that is indistinguishable from a
+harness that is merely slow.
+
+Generous on purpose.  A cold ACP adaptor start plus MCP server connection was measured
+between 4.4 and 9.1 seconds, so 60 is well clear of a slow-but-healthy launch while still
+bounded.  A handshake timeout is TERMINAL and is never retried: it means the child is dead
+rather than transiently busy, and a retry would burn the whole budget again before saying
+anything.
+"""
+
+_STDERR_TAIL_LIMIT = 8192
+"""Bytes of the child's most recent stderr retained for error reports.
+
+Bounded rather than accumulating: the point of reading the pipe is to keep it readable,
+and an unbounded buffer would trade a stalled child for unbounded memory on a chatty one.
+"""
+
+
+class _StderrTail:
+    """Bounded, continuously drained tail of a child process's stderr.
+
+    Exists for two reasons that happen to share one read loop.
+
+    The diagnostic one: when a handshake times out, the child's last words are the only
+    evidence of why, and before this nothing in synth ever read them.
+
+    The correctness one, which is more serious than it looks and was measured rather than
+    reasoned about.  ``asyncio`` drains a subprocess pipe into its ``StreamReader``
+    without being asked, so a small volume of unread stderr is harmless -- but past
+    roughly twice the ``limit`` passed to ``create_subprocess_exec`` the transport pauses
+    reading, and from then on the pipe is a real pipe again.  What that breaks here is
+    ``run()``, which spends the session's whole life in ``await proc.wait()``.  MEASURED
+    with synth's 8 MiB ``_PIPE_LIMIT``, child writes stderr then exits: at 50 KB
+    ``wait()`` returns in 0.02s; at 20 MB it NEVER RETURNS, with or without the child
+    already dead.  So an agent that logged enough to stderr could exit and synth would
+    never learn it had -- the session would sit in IDLE rather than transitioning to
+    TERMINATED, with no error and no dead-agent tile.  With the drain running, the same
+    20 MB case returns in 0.05s.
+
+    Measured stderr volume for the harnesses synth ships against is tiny -- 105 bytes
+    across a full session plus a 95-second tool-heavy turn -- so this is a latent hazard
+    rather than today's failure.  It is closed here because the fix is the same loop.
+    """
+
+    def __init__(self, limit: int = _STDERR_TAIL_LIMIT) -> None:
+        self._limit = limit
+        self._buf = bytearray()
+
+    async def drain(self, stream: asyncio.StreamReader) -> None:
+        """Read until EOF, retaining only the last ``limit`` bytes."""
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return
+            self._buf.extend(chunk)
+            if len(self._buf) > self._limit:
+                del self._buf[: len(self._buf) - self._limit]
+
+    def text(self) -> str:
+        """Decoded tail, empty when the child wrote nothing."""
+        return self._buf.decode("utf-8", "replace")
+
+
+class HandshakeTimeoutError(Exception):
+    """One ACP handshake request did not complete within ``_HANDSHAKE_TIMEOUT``.
+
+    Carries the child's stderr tail because that is the only evidence available at the
+    point of failure, and a separate type because the restore path must NOT treat a
+    timeout the way it treats other ``load_session`` failures: falling back to
+    ``new_session`` there would spend a second full budget before reporting anything.
+    """
+
+    def __init__(self, step: str, timeout: float, command: str, stderr: str) -> None:
+        self.step = step
+        self.timeout = timeout
+        self.command = command
+        self.stderr = stderr
+        # Branches on EMPTINESS, not on strip(): a tail of only whitespace is still
+        # output, and reporting it as silence would send an operator looking for a
+        # process that never started.  The empty branch claims nothing about stdout,
+        # which is consumed by the JSON-RPC reader and never observed here.
+        if not stderr:
+            detail = "the process wrote nothing to stderr"
+        elif stripped := stderr.strip():
+            detail = f"stderr tail: {stripped}"
+        else:
+            # Whitespace only: shown quoted, because unquoted it would read as the
+            # empty case it is not.
+            detail = f"stderr tail (whitespace only): {stderr!r}"
+        super().__init__(
+            f"'{step}' did not respond within {timeout:g}s. Command: {command}. {detail}"
+        )
+
+
+# Kiro's proprietary usage notification. The wire method is "_kiro.dev/metadata";
+# the acp SDK strips the leading underscore before dispatching to a client, so the
+# name matched here has none. See ACPSession.ext_notification.
+_KIRO_METADATA_NOTIFICATION = "kiro.dev/metadata"
+
+# Denominator used when a harness reports context fullness as a percentage rather
+# than as token counts, so UsageUpdated.used / .size is the true fraction.
+_PERCENT_SCALE = 100
 
 
 @asynccontextmanager
@@ -96,13 +211,18 @@ async def _spawn_isolated_agent(
     *args: str,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
-) -> AsyncIterator[tuple[ClientSideConnection, aio_subprocess.Process]]:
+) -> AsyncIterator[tuple[ClientSideConnection, aio_subprocess.Process, _StderrTail]]:
     """Spawn an ACP agent in its own process group.
 
     Uses ``process_group=0`` so the child calls ``setpgid(0, 0)`` before
     exec — no race with the parent.  This lets ``os.killpg`` safely
     terminate the agent and all its children (e.g. synth-mcp) without
     hitting the synth parent process.
+
+    Yields the drained ``StderrTail`` alongside the connection so a caller reporting a
+    failure has the child's own account of it.  The drain task is started immediately
+    after spawn and cancelled before the process-group kill, so it cannot outlive the
+    stream it reads.
     """
     merged_env = dict(default_environment())
     if env:
@@ -120,12 +240,29 @@ async def _spawn_isolated_agent(
         process_group=0,
     )
     if not process.stdout or not process.stdin:
+        # Kill before raising: this is the one exit that precedes the cleanup block
+        # below, so without it the child outlives the failure that abandoned it.
+        with contextlib.suppress(OSError, ProcessLookupError):
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(process.wait(), timeout=1.0)
         raise RuntimeError("Failed to open stdin/stdout pipes for agent subprocess")
+
+    stderr_tail = _StderrTail()
+    drain_task: asyncio.Task[None] | None = None
+    if process.stderr:
+        drain_task = asyncio.create_task(
+            stderr_tail.drain(process.stderr), name=f"stderr-{process.pid}"
+        )
 
     conn = ClientSideConnection(client, process.stdin, process.stdout)
     try:
-        yield conn, process
+        yield conn, process, stderr_tail
     finally:
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await drain_task
         if process.returncode is None:
             try:
                 pgid = os.getpgid(process.pid)
@@ -156,6 +293,7 @@ class ACPSession:
         agent_mode: str | None = None,
         env: dict[str, str] | None = None,
         agent_mode_target: str | None = None,
+        steer_protocol: str | None = None,
     ) -> None:
         self.agent_id = agent_id
         self._sm = AgentStateMachine(agent_id, self._on_state_transition)
@@ -171,6 +309,7 @@ class ACPSession:
         self._capabilities: Any = None
         self._agent_mode = agent_mode
         self._agent_mode_target = agent_mode_target
+        self._steer_protocol = steer_protocol
         self._env = env
         self._available_modes: list[AgentMode] = []
         self._current_mode_id: str | None = None
@@ -179,13 +318,18 @@ class ACPSession:
         self._config_options: list[SessionConfigOptionSelect | SessionConfigOptionBoolean] = []
         self._has_native_config_options: bool = False
         self._suppress_history_replay: bool = False
-        self._accumulator = SessionAccumulator()
-        self._unsubscribe: Callable[[], None] = self._accumulator.subscribe(self._on_snapshot)
         self._pending_emissions: set[asyncio.Task[None]] = set()
         self._terminals: dict[str, TerminalProcess] = {}
         self._terminal_count: int = 0
         self._on_session_created: Callable[[str, str], Awaitable[None]] | None = None
         self._shutting_down: bool = False
+        self._stderr_tail: _StderrTail = _StderrTail()
+        """Drained stderr of the current agent process, replaced on each spawn.
+
+        Held on the session rather than passed to each handshake because a parameter is a
+        thing a call site can forget: two load_session calls were left unbounded exactly
+        that way, and each one hung a state the user could not leave.
+        """
 
     @property
     def state(self) -> AgentState:
@@ -200,6 +344,11 @@ class ACPSession:
     def agent_mode(self) -> str | None:
         """The configured agent_mode value, or None."""
         return self._agent_mode
+
+    @property
+    def steer_protocol(self) -> str | None:
+        """The harness's in-turn steering protocol, or None when unsupported."""
+        return self._steer_protocol
 
     @property
     def agent_mode_target(self) -> str | None:
@@ -225,6 +374,22 @@ class ACPSession:
             pass
         if self._proc.stdin and not self._proc.stdin.is_closing():
             self._proc.stdin.close()
+
+    def rename(self, new_agent_id: str) -> None:
+        """Re-stamp this session's identity, for an agent handoff.
+
+        Synchronous and total: BOTH copies of the id are updated.  ``self.agent_id``
+        stamps every outgoing event, and the state machine holds its own copy used in
+        transition errors and logs, so updating only one leaves this session attributing
+        its output to two different agents.
+
+        Exists so callers do not reach into ``self._sm``, following ``force_terminate``.
+
+        Args:
+            new_agent_id: The id this session is known by from now on.
+        """
+        self.agent_id = new_agent_id
+        self._sm._agent_id = new_agent_id
 
     async def _on_state_transition(self, old: AgentState, new: AgentState) -> None:
         """Callback fired by the state machine after every transition."""
@@ -287,6 +452,50 @@ class ACPSession:
                 )
             )
 
+    async def _handshake(self, awaitable: Awaitable[_T], step: str) -> _T:
+        """Await one request to the agent under ``_HANDSHAKE_TIMEOUT``.
+
+        THE RULE, rather than a list to conform to: a request belongs here when the session
+        holds a state the user cannot leave until the agent answers.  Apply it to the CALL
+        SITE, not to the method name, because the same method appears under both states --
+        ``session/load`` holds INITIALIZING from ``run_restored`` and CONFIGURING from
+        ``_restore_mcp_servers``, and ``session/fork`` and ``session/new`` hold CONFIGURING
+        inside ``fork_with_agent``.  Every call of initialize, session/new, session/load,
+        session/fork, session/set_mode, session/set_model and session/set_config_option
+        currently qualifies, which is why all of them are wrapped.
+
+        An earlier version of this docstring listed only the first four methods, which was
+        worse than carrying no list: a maintainer conforming to it would have removed the
+        bounds on the config requests.
+
+        DO NOT wrap ``prompt`` in this.  A turn legitimately runs for many minutes -- one
+        tool-heavy turn was measured at 95 seconds -- so a 60-second bound would abort
+        healthy work.  ``cancel`` and ``ext_method`` are likewise unbounded on purpose, and
+        a test asserts all three stay out.
+
+        EVERY request synth makes before the agent is usable goes through here.  That is
+        wider than the three-method handshake the name suggests, and deliberately so: a
+        ``session/load`` issued for its MCP-reconnect side effect hangs CONFIGURING just
+        as completely as an unanswered ``initialize`` hangs INITIALIZING.
+
+        Args:
+            awaitable: The in-flight SDK call.
+            step: Wire method name for the error message, e.g. ``"initialize"``.
+
+        Returns:
+            Whatever the request returned.
+
+        Raises:
+            HandshakeTimeoutError: The request did not complete in time.
+        """
+        try:
+            return await asyncio.wait_for(awaitable, timeout=_HANDSHAKE_TIMEOUT)
+        except TimeoutError:
+            command = " ".join([self._binary, *self._args])
+            raise HandshakeTimeoutError(
+                step, _HANDSHAKE_TIMEOUT, command, self._stderr_tail.text()
+            ) from None
+
     async def run(self) -> None:
         """Main lifecycle — spawns agent, handshakes, waits for exit."""
         try:
@@ -294,23 +503,33 @@ class ACPSession:
             async with _spawn_isolated_agent(self, self._binary, *self._args, cwd=self._cwd, env=self._env) as (
                 conn,
                 proc,
+                stderr_tail,
             ):
                 self._conn = conn
                 self._proc = proc
+                self._stderr_tail = stderr_tail
 
-                init_response = await conn.initialize(
-                    protocol_version=1,
-                    client_capabilities=ClientCapabilities(
-                        fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
-                        terminal=True,
+                init_response = await self._handshake(
+                    conn.initialize(
+                        protocol_version=1,
+                        client_capabilities=ClientCapabilities(
+                            fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
+                            terminal=True,
+                        ),
+                        client_info=Implementation(name="synth", version="0.1.0"),
                     ),
-                    client_info=Implementation(name="synth", version="0.1.0"),
+                    "initialize",
                 )
                 self._capabilities = getattr(init_response, "agent_capabilities", None)
                 new_session_kwargs: dict[str, Any] = {}
                 if self._agent_mode_target == "meta_agent" and self._agent_mode:
                     new_session_kwargs["claudeCode"] = {"options": {"agent": self._agent_mode}}
-                session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers, **new_session_kwargs)
+                session = await self._handshake(
+                    conn.new_session(
+                        cwd=self._cwd, mcp_servers=self._mcp_servers, **new_session_kwargs
+                    ),
+                    "session/new",
+                )
                 self._session_id = session.session_id
 
                 if self._on_session_created:
@@ -358,8 +577,11 @@ class ACPSession:
                 if self._agent_mode is not None and self._agent_mode_target != "meta_agent":
                     mode_ids = {m.id for m in self._available_modes}
                     if self._agent_mode in mode_ids:
-                        await conn.set_session_mode(
-                            mode_id=self._agent_mode, session_id=self._session_id
+                        await self._handshake(
+                            conn.set_session_mode(
+                                mode_id=self._agent_mode, session_id=self._session_id
+                            ),
+                            "session/set_mode",
                         )
                         self._current_mode_id = self._agent_mode
                         await self._event_sink(
@@ -369,10 +591,13 @@ class ACPSession:
                         # Safe to load_session here because no conversation history
                         # exists yet.
                         try:
-                            loaded = await conn.load_session(
-                                session_id=self._session_id,
-                                cwd=self._cwd,
-                                mcp_servers=self._mcp_servers or None,
+                            loaded = await self._handshake(
+                                conn.load_session(
+                                    session_id=self._session_id,
+                                    cwd=self._cwd,
+                                    mcp_servers=self._mcp_servers or None,
+                                ),
+                                "session/load",
                             )
                             if loaded.models is not None:
                                 new_model = loaded.models.current_model_id
@@ -383,6 +608,23 @@ class ACPSession:
                                             agent_id=self.agent_id, model_id=new_model
                                         )
                                     )
+                        except HandshakeTimeoutError:
+                            # Explicit re-raise, because the broad handler below would
+                            # otherwise swallow it -- HandshakeTimeoutError is an Exception,
+                            # so a comment alone does not exempt it.  An earlier revision
+                            # here consisted of exactly that comment and no branch, and the
+                            # timeout went on being swallowed while the comment said it did
+                            # not.
+                            raise
+                        # An earlier version reported the timeout and carried on, reasoning
+                        # that the agent had already answered three requests so a stall
+                        # confined to this best-effort re-read was a harness quirk.  That was
+                        # wrong: asyncio.wait_for cancels only synth's local future and sends
+                        # no ACP cancellation, so the agent goes on processing the load, and
+                        # carrying on to IDLE would permit a prompt concurrent with a live
+                        # load_session -- which set_mode's docstring records as hanging Kiro
+                        # indefinitely.  Propagating reaches run()'s handler, which reports
+                        # it, and leaving the spawn context kills the process group.
                         except Exception:
                             log.debug(
                                 "Model re-read after initial mode switch failed", exc_info=True
@@ -397,6 +639,13 @@ class ACPSession:
                 await self._capture_config_options(session)
                 await self._sm.transition(AgentState.IDLE)
                 await proc.wait()
+        except HandshakeTimeoutError as e:
+            # Reported rather than logged at error level with a traceback: the cause is in
+            # the message and the traceback would only point back at asyncio.wait_for.
+            log.warning("Handshake timeout for %s: %s", self.agent_id, e)
+            await self._event_sink(
+                BrokerError(agent_id=self.agent_id, message=str(e), severity="error")
+            )
         except InvalidTransitionError as e:
             log.error("Invalid state transition in session %s: %s", self.agent_id, e, exc_info=True)
             await self._event_sink(
@@ -425,7 +674,6 @@ class ACPSession:
                 if not fut.done():
                     fut.cancel()
             self._permission_futures.clear()
-            self._unsubscribe()
             await self._sm.force_terminal()
 
     async def run_restored(self, saved_acp_session_id: str) -> None:
@@ -434,13 +682,14 @@ class ACPSession:
         Key invariant: self._session_id MUST be set before load_session is
         called.  The ACP SDK fires session_update notifications during the
         load_session await, and session_update drops any notification whose
-        session_id does not match self._session_id.  Setting it after the
-        call means all history notifications are silently discarded and the
-        accumulator stays empty.
+        session_id does not match self._session_id — so setting it afterwards
+        would make the guard order below meaningless.
 
-        We set _suppress_history_replay=True so _on_snapshot skips emitting
-        per-notification events while the accumulator collects the full
-        history silently.  The broker replays the UI event journal separately.
+        We set _suppress_history_replay=True so session_update returns early
+        without emitting while the agent replays its whole conversation.  The
+        broker replays the UI event journal separately.  The flag is cleared in
+        a finally block, after _settle_replay_guard() has let already-created
+        replay runners reach the guard.
 
         If load_session fails (e.g. the agent has no history for that
         session ID), we fall back to new_session and invoke
@@ -451,17 +700,22 @@ class ACPSession:
             async with _spawn_isolated_agent(self, self._binary, *self._args, cwd=self._cwd, env=self._env) as (
                 conn,
                 proc,
+                stderr_tail,
             ):
                 self._conn = conn
                 self._proc = proc
+                self._stderr_tail = stderr_tail
 
-                init_response = await conn.initialize(
-                    protocol_version=1,
-                    client_capabilities=ClientCapabilities(
-                        fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
-                        terminal=True,
+                init_response = await self._handshake(
+                    conn.initialize(
+                        protocol_version=1,
+                        client_capabilities=ClientCapabilities(
+                            fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
+                            terminal=True,
+                        ),
+                        client_info=Implementation(name="synth", version="0.1.0"),
                     ),
-                    client_info=Implementation(name="synth", version="0.1.0"),
+                    "initialize",
                 )
                 self._capabilities = getattr(init_response, "agent_capabilities", None)
 
@@ -470,11 +724,20 @@ class ACPSession:
 
                 self._suppress_history_replay = True
                 try:
-                    session = await conn.load_session(
-                        session_id=saved_acp_session_id,
-                        cwd=self._cwd,
-                        mcp_servers=self._mcp_servers,
+                    session = await self._handshake(
+                        conn.load_session(
+                            session_id=saved_acp_session_id,
+                            cwd=self._cwd,
+                            mcp_servers=self._mcp_servers,
+                        ),
+                        "session/load",
                     )
+                except HandshakeTimeoutError:
+                    # Deliberately NOT the fallback below.  A timeout means the child is
+                    # not answering at all, so new_session would spend a second full
+                    # budget before anything was reported.  Propagates to run_restored's
+                    # own handler, which reports it.
+                    raise
                 except Exception as exc:
                     log.warning(
                         "load_session failed for %s (session %s), falling back to new_session: %s",
@@ -489,16 +752,27 @@ class ACPSession:
                             severity="warning",
                         )
                     )
-                    self._accumulator.reset()
                     new_session_kwargs: dict[str, Any] = {}
                     if self._agent_mode_target == "meta_agent" and self._agent_mode:
                         new_session_kwargs["claudeCode"] = {"options": {"agent": self._agent_mode}}
-                    session = await conn.new_session(cwd=self._cwd, mcp_servers=self._mcp_servers, **new_session_kwargs)
+                    session = await self._handshake(
+                        conn.new_session(
+                            cwd=self._cwd, mcp_servers=self._mcp_servers, **new_session_kwargs
+                        ),
+                        "session/new",
+                    )
                     self._session_id = session.session_id
                     if self._on_session_created:
                         await self._on_session_created(self.agent_id, session.session_id)
                 finally:
-                    self._suppress_history_replay = False
+                    # Let already-created replay runners reach the suppress
+                    # guard before it clears.  Nested finally so the flag is
+                    # cleared even if settling raises or is cancelled — a flag
+                    # left set would silence the agent for the whole session.
+                    try:
+                        await self._settle_replay_guard()
+                    finally:
+                        self._suppress_history_replay = False
 
                 # On the happy path (session_id unchanged), fire the callback
                 # to flip DB status → active. The fallback path already calls
@@ -532,8 +806,11 @@ class ACPSession:
                     and self._agent_mode != self._current_mode_id
                     and self._agent_mode in {m.id for m in self._available_modes}
                 ):
-                    await conn.set_session_mode(
-                        mode_id=self._agent_mode, session_id=self._session_id
+                    await self._handshake(
+                        conn.set_session_mode(
+                            mode_id=self._agent_mode, session_id=self._session_id
+                        ),
+                        "session/set_mode",
                     )
                     self._current_mode_id = self._agent_mode
                     await self._event_sink(
@@ -562,6 +839,13 @@ class ACPSession:
                 await self._capture_config_options(session)
                 await self._sm.transition(AgentState.IDLE)
                 await proc.wait()
+        except HandshakeTimeoutError as e:
+            # Reported rather than logged at error level with a traceback: the cause is in
+            # the message and the traceback would only point back at asyncio.wait_for.
+            log.warning("Handshake timeout for %s: %s", self.agent_id, e)
+            await self._event_sink(
+                BrokerError(agent_id=self.agent_id, message=str(e), severity="error")
+            )
         except InvalidTransitionError as e:
             log.error("Invalid state transition in session %s: %s", self.agent_id, e, exc_info=True)
             await self._event_sink(
@@ -589,7 +873,6 @@ class ACPSession:
                 if not fut.done():
                     fut.cancel()
             self._permission_futures.clear()
-            self._unsubscribe()
             await self._sm.force_terminal()
 
     async def prompt(self, text: str) -> None:
@@ -637,17 +920,89 @@ class ACPSession:
         if self._conn and self._session_id and self.state == AgentState.IDLE:
             await self._sm.transition(AgentState.CONFIGURING)
             try:
-                await self._conn.set_session_mode(mode_id=mode_id, session_id=self._session_id)
+                await self._handshake(
+                    self._conn.set_session_mode(mode_id=mode_id, session_id=self._session_id),
+                    "session/set_mode",
+                )
                 if self._current_model_id:
-                    await self._conn.set_session_model(
-                        model_id=self._current_model_id, session_id=self._session_id
+                    await self._handshake(
+                        self._conn.set_session_model(
+                            model_id=self._current_model_id, session_id=self._session_id
+                        ),
+                        "session/set_model",
                     )
                 await self._restore_mcp_servers()
+                # _restore_mcp_servers TERMINATES the session on a timeout, and returns
+                # normally rather than raising, because raising would change the contract
+                # of a method the broker calls without a handler.  So the success path
+                # below has to be guarded, or a killed agent is announced as having
+                # switched: subscribers saw AgentModeChanged for a session the same call
+                # had just terminated.  CONFIGURING is the right predicate rather than a
+                # returned flag -- it is the state this method itself established, and the
+                # finally below already trusts it.
+                if self.state != AgentState.CONFIGURING:
+                    return
                 self._current_mode_id = mode_id
                 await self._event_sink(AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id))
+            except HandshakeTimeoutError as exc:
+                # ONE handler for every request in the block above.  Caught rather than
+                # allowed to propagate because the broker awaits this method with no
+                # handler of its own; the success path is skipped by the unwinding, so
+                # there is no per-request flag for a later edit to forget.
+                await self._end_session_on_config_timeout(exc, "Mode switch")
             finally:
                 if self.state == AgentState.CONFIGURING:
                     await self._sm.transition(AgentState.IDLE)
+
+    async def _end_session_on_config_timeout(
+        self, exc: HandshakeTimeoutError, what: str
+    ) -> None:
+        """Report a POST-LAUNCH request timeout and end the session.
+
+        Every handshake timeout is terminal.  For the requests made during ``run()`` and
+        ``run_restored()`` that is free -- the exception leaves the spawn context manager,
+        which kills the process group on the way out.  The requests made after launch, by
+        ``set_mode``, ``set_model``, ``set_config_option`` and ``_restore_mcp_servers``,
+        are outside that context, so the kill is explicit and lives here rather than in
+        four copies.
+
+        Terminal rather than recoverable, and neither of the two obvious alternatives
+        works.  Reporting and returning to IDLE is unsafe, for one MEASURED reason and one
+        JUDGMENT that are worth keeping apart.  Measured: ``asyncio.wait_for`` cancels only
+        synth's LOCAL future and sends no ACP cancellation (SDK ``connection.py`` sends the
+        request then awaits its future with no cancellation path), so the agent goes on
+        processing, and for ``session/load`` specifically ``set_mode``'s docstring records
+        that a concurrent prompt hangs Kiro indefinitely.  Judgment, alternatives not
+        discriminated: for ``set_session_mode``, ``set_session_model`` and
+        ``set_config_option`` no equivalent hang has been observed, and the reason to end
+        the session there is that the abandoned request may still succeed, leaving synth and
+        the agent disagreeing about the session's mode, model or option set.  Nobody has
+        probed a concurrent prompt against each of those.
+
+        Raising to the caller does not work either: every caller wraps its work in a
+        ``try/finally`` that transitions CONFIGURING back to IDLE regardless.
+
+        Every caller's ``finally`` is guarded on ``state == CONFIGURING``, so moving to
+        TERMINATED here means none of them resurrects a bogus IDLE.
+
+        Args:
+            exc: The timeout, whose message already names the step and the command.
+            what: Operation name for the report, e.g. ``"Mode switch"``.
+        """
+        log.warning("%s timed out for %s, terminating: %s", what, self.agent_id, exc)
+        await self._event_sink(
+            BrokerError(
+                agent_id=self.agent_id,
+                message=(
+                    f"{what}: {exc} The agent stopped answering and was terminated, "
+                    "because synth cannot cancel the request it is still processing: if it "
+                    "later succeeds, synth and the agent could disagree about the session."
+                ),
+                severity="error",
+            )
+        )
+        self.force_kill()
+        await self.force_terminate()
 
     async def _restore_mcp_servers(self) -> None:
         """Re-establish MCP server connections after a mode switch.
@@ -664,17 +1019,24 @@ class ACPSession:
         by Kiro — it returns Method not found.
 
         The flag is always cleared in a finally block so a failed load_session
-        cannot leave session_update permanently suppressed.
+        cannot leave session_update permanently suppressed, and
+        _settle_replay_guard() runs first so a replay runner the SDK created but
+        has not yet started still meets the guard while it is set.
         """
         if not self._mcp_servers or not self._conn or not self._session_id:
             return
         self._suppress_history_replay = True
         try:
-            await self._conn.load_session(
-                session_id=self._session_id,
-                cwd=self._cwd,
-                mcp_servers=self._mcp_servers,
+            await self._handshake(
+                self._conn.load_session(
+                    session_id=self._session_id,
+                    cwd=self._cwd,
+                    mcp_servers=self._mcp_servers,
+                ),
+                "session/load",
             )
+        except HandshakeTimeoutError as exc:
+            await self._end_session_on_config_timeout(exc, "MCP server restore after mode switch")
         except Exception:
             log.debug(
                 "MCP server restore via load_session failed for %s",
@@ -682,16 +1044,27 @@ class ACPSession:
                 exc_info=True,
             )
         finally:
-            self._suppress_history_replay = False
+            # See run_restored: settle first, clear unconditionally.
+            try:
+                await self._settle_replay_guard()
+            finally:
+                self._suppress_history_replay = False
 
     async def set_model(self, model_id: str) -> None:
         """Switch the agent's model, transitioning through CONFIGURING."""
         if self._conn and self._session_id and self.state == AgentState.IDLE:
             await self._sm.transition(AgentState.CONFIGURING)
             try:
-                await self._conn.set_session_model(model_id=model_id, session_id=self._session_id)
+                await self._handshake(
+                    self._conn.set_session_model(
+                        model_id=model_id, session_id=self._session_id
+                    ),
+                    "session/set_model",
+                )
                 self._current_model_id = model_id
                 await self._event_sink(AgentModelChanged(agent_id=self.agent_id, model_id=model_id))
+            except HandshakeTimeoutError as exc:
+                await self._end_session_on_config_timeout(exc, "Model switch")
             finally:
                 if self.state == AgentState.CONFIGURING:
                     await self._sm.transition(AgentState.IDLE)
@@ -718,9 +1091,15 @@ class ACPSession:
         try:
             if self._has_native_config_options:
                 try:
-                    resp = await self._conn.set_config_option(
-                        config_id, self._session_id, value
+                    resp = await self._handshake(
+                        self._conn.set_config_option(config_id, self._session_id, value),
+                        "session/set_config_option",
                     )
+                except HandshakeTimeoutError:
+                    # Explicit re-raise: HandshakeTimeoutError IS an Exception, so without
+                    # this the handler below reports it as a recoverable warning and
+                    # returns, leaving a live request on an agent presented as usable.
+                    raise
                 except Exception as exc:
                     log.warning("set_config_option failed for %s: %s", self.agent_id, exc)
                     await self._event_sink(
@@ -738,15 +1117,29 @@ class ACPSession:
                     )
                 )
             elif config_id == "mode":
-                await self._conn.set_session_mode(
-                    mode_id=value, session_id=self._session_id
+                await self._handshake(
+                    self._conn.set_session_mode(mode_id=value, session_id=self._session_id),
+                    "session/set_mode",
                 )
                 if self._current_model_id:
-                    await self._conn.set_session_model(
-                        model_id=self._current_model_id,
-                        session_id=self._session_id,
+                    await self._handshake(
+                        self._conn.set_session_model(
+                            model_id=self._current_model_id,
+                            session_id=self._session_id,
+                        ),
+                        "session/set_model",
                     )
                 await self._restore_mcp_servers()
+                # _restore_mcp_servers TERMINATES the session on a timeout, and returns
+                # normally rather than raising, because raising would change the contract
+                # of a method the broker calls without a handler.  So the success path
+                # below has to be guarded, or a killed agent is announced as having
+                # switched: subscribers saw AgentModeChanged for a session the same call
+                # had just terminated.  CONFIGURING is the right predicate rather than a
+                # returned flag -- it is the state this method itself established, and the
+                # finally below already trusts it.
+                if self.state != AgentState.CONFIGURING:
+                    return
                 self._current_mode_id = str(value)
                 for opt in self._config_options:
                     if opt.id == "mode":
@@ -763,8 +1156,9 @@ class ACPSession:
                     )
                 )
             elif config_id == "model":
-                await self._conn.set_session_model(
-                    model_id=value, session_id=self._session_id
+                await self._handshake(
+                    self._conn.set_session_model(model_id=value, session_id=self._session_id),
+                    "session/set_model",
                 )
                 self._current_model_id = str(value)
                 for opt in self._config_options:
@@ -789,6 +1183,8 @@ class ACPSession:
                         severity="warning",
                     )
                 )
+        except HandshakeTimeoutError as exc:
+            await self._end_session_on_config_timeout(exc, f"Config change {config_id}={value}")
         finally:
             if self.state == AgentState.CONFIGURING:
                 await self._sm.transition(AgentState.IDLE)
@@ -822,20 +1218,26 @@ class ACPSession:
             if agent_name:
                 meta_kwargs["claudeCode"] = {"options": {"agent": agent_name}}
             try:
-                response = await self._conn.fork_session(
-                    cwd=self._cwd,
-                    session_id=self._session_id,
-                    mcp_servers=self._mcp_servers or None,
-                    **meta_kwargs,
+                response = await self._handshake(
+                    self._conn.fork_session(
+                        cwd=self._cwd,
+                        session_id=self._session_id,
+                        mcp_servers=self._mcp_servers or None,
+                        **meta_kwargs,
+                    ),
+                    "session/fork",
                 )
             except RequestError as exc:
                 if exc.code == -32002:
                     # Empty session — no history to fork. Fall back to new_session.
                     log.debug("Fork failed (no history), falling back to new_session for %s", self.agent_id)
-                    response = await self._conn.new_session(
-                        cwd=self._cwd,
-                        mcp_servers=self._mcp_servers,
-                        **meta_kwargs,
+                    response = await self._handshake(
+                        self._conn.new_session(
+                            cwd=self._cwd,
+                            mcp_servers=self._mcp_servers,
+                            **meta_kwargs,
+                        ),
+                        "session/new",
                     )
                 else:
                     raise
@@ -843,6 +1245,30 @@ class ACPSession:
             self._agent_mode = agent_name or None
             await self._capture_config_options(response)
             return response.session_id
+        except HandshakeTimeoutError as exc:
+            # TERMINAL, like every other handshake timeout, and for a reason specific to
+            # this call: synth gave up locally but sent no ACP cancellation, so the agent
+            # may still COMPLETE the fork afterwards.  It would then be on a session id
+            # synth never learned, while synth kept using the old one -- silent state
+            # divergence, which is worse than ending the session.  The Kiro prompt/load
+            # hang recorded on set_mode is evidence for load_session specifically; this
+            # divergence argument is a property of the protocol's local-only cancellation
+            # and so applies to any session-creating request.
+            log.warning("fork timed out for %s, terminating: %s", self.agent_id, exc)
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=(
+                        f"Failed to switch agent to {agent_name}: {exc} "
+                        "The agent stopped answering and was terminated, because it may "
+                        "still complete the switch on a session synth cannot see."
+                    ),
+                    severity="error",
+                )
+            )
+            self.force_kill()
+            await self.force_terminate()
+            return None
         except Exception as exc:
             log.warning("fork_with_agent failed for %s: %s", self.agent_id, exc)
             await self._event_sink(
@@ -882,6 +1308,102 @@ class ACPSession:
         if self._conn and self._session_id and self.state == AgentState.BUSY:
             await self._conn.cancel(session_id=self._session_id)
 
+    async def steer(self, text: str) -> bool:
+        """Inject text into the agent's RUNNING turn via the harness steer method.
+
+        Args:
+            text: The message body to inject, sent to the harness unchanged.
+
+        Returns:
+            True if the harness ACCEPTED the steer. Acceptance is NOT
+            confirmation of in-turn delivery: Kiro returns an opaque
+            ``{"queued": true}`` that does not say which delivery path ran.
+            False on any failure, including an unsupported protocol, a JSON-RPC
+            error, or a lost connection — the caller falls back to queueing.
+
+        Kiro payload: ``{"sessionId": <sid>, "message": text}`` to method
+        ``"session/steer"``. NO leading underscore: the acp SDK's ``ext_method``
+        prepends one itself, so ``"_session/steer"`` reaches the wire as
+        ``__session/steer`` and returns -32601, which reads exactly like the
+        harness not supporting steering.
+
+        Never raises for an acceptance timeout or transport failure. The acp
+        SDK's ``RequestError`` is not a ``ConnectionError`` subclass, so it is
+        caught explicitly.
+        """
+        if not self._conn or not self._session_id or self._steer_protocol != "kiro":
+            return False
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        log.debug(
+            "Steer acceptance started agent=%s session=%s timeout_s=%s",
+            self.agent_id,
+            self._session_id,
+            _STEER_ACCEPTANCE_TIMEOUT,
+        )
+        try:
+            result = await asyncio.wait_for(
+                self._conn.ext_method(
+                    "session/steer",
+                    {"sessionId": self._session_id, "message": text},
+                ),
+                timeout=_STEER_ACCEPTANCE_TIMEOUT,
+            )
+        except TimeoutError:
+            elapsed_ms = (loop.time() - started) * 1000
+            log.warning(
+                "Steer acceptance outcome=timed_out agent=%s session=%s "
+                "elapsed_ms=%.3f timeout_s=%s",
+                self.agent_id,
+                self._session_id,
+                elapsed_ms,
+                _STEER_ACCEPTANCE_TIMEOUT,
+            )
+            try:
+                await self._event_sink(
+                    BrokerError(
+                        agent_id=self.agent_id,
+                        message=(
+                            "Steering acceptance timed out. The message will use the "
+                            "existing queue fallback and may arrive twice if Kiro accepted "
+                            "it before the response timed out."
+                        ),
+                        severity="warning",
+                    )
+                )
+            except Exception as exc:
+                log.warning(
+                    "Steer timeout warning reporting failed agent=%s session=%s "
+                    "exception_type=%s",
+                    self.agent_id,
+                    self._session_id,
+                    type(exc).__name__,
+                )
+            return False
+        except (RequestError, ConnectionError, OSError) as exc:
+            elapsed_ms = (loop.time() - started) * 1000
+            log.debug(
+                "Steer acceptance outcome=transport_failed agent=%s session=%s "
+                "elapsed_ms=%.3f exception_type=%s",
+                self.agent_id,
+                self._session_id,
+                elapsed_ms,
+                type(exc).__name__,
+            )
+            return False
+
+        elapsed_ms = (loop.time() - started) * 1000
+        log.debug(
+            "Steer acceptance outcome=accepted agent=%s session=%s elapsed_ms=%.3f "
+            "queued=%r",
+            self.agent_id,
+            self._session_id,
+            elapsed_ms,
+            result.get("queued"),
+        )
+        return True
+
     async def terminate(self) -> None:
         """Terminate the agent and all its children via process group kill.
 
@@ -917,9 +1439,32 @@ class ACPSession:
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         """Called by ACP SDK when agent streams a response.
 
-        Ordering: session_id guard → UsageUpdate isinstance check →
-        accumulator.apply(). UsageUpdate bypasses the accumulator because
-        SessionAccumulator silently ignores it.
+        Dispatches directly to a ``BrokerEvent`` with no ``SessionAccumulator``
+        involved.  Guards in order: shutting-down → session_id mismatch →
+        ``UsageUpdate`` special case → ``_suppress_history_replay``.
+
+        A non-matching ``session_id`` is dropped silently.  ``UsageUpdate``
+        emits ``UsageUpdated`` unless ``_suppress_history_replay`` is set, then
+        returns.  After that branch this returns early and SYNCHRONOUSLY when
+        ``_suppress_history_replay`` is set; that guard is relocated from the
+        deleted ``_on_snapshot`` and is load-bearing, because without it
+        ``load_session`` history replay during ``run_restored`` and
+        ``_restore_mcp_servers`` would emit into the live UI and be journalled,
+        duplicating the journal on every restore and mode switch.
+
+        For all other update types an emission task is created SYNCHRONOUSLY:
+        no await may execute between entry to the non-``UsageUpdate`` path and
+        task creation, because the SDK dispatches one task per notification and
+        arrival order is preserved only by that synchronicity.  The suppress
+        guard introduces no await.
+
+        Exceptions raised while dispatching are logged and swallowed; nothing
+        propagates to the SDK caller.
+
+        Args:
+            session_id: ACP session the notification belongs to.
+            update: The raw session update to dispatch.
+            **kwargs: Ignored; present for the SDK Client protocol.
         """
         if self._shutting_down:
             return
@@ -928,7 +1473,8 @@ class ACPSession:
 
         log.debug("session_update type=%s agent=%s", type(update).__name__, self.agent_id)
 
-        # UsageUpdate bypasses accumulator (it doesn't track usage).
+        # UsageUpdate is emitted inline — it carries no streaming content, so
+        # the await below cannot reorder chunks relative to each other.
         if isinstance(update, UsageUpdate):
             if self._suppress_history_replay:
                 return
@@ -944,47 +1490,166 @@ class ACPSession:
             )
             return
 
-        # Everything else goes through the accumulator.
+        # Relocated from the deleted _on_snapshot.  LOAD-BEARING: load_session
+        # replays the whole conversation as session/update notifications, so
+        # without this guard run_restored and _restore_mcp_servers would emit
+        # every historical notification into the live UI and the broker sink
+        # would journal it, duplicating the entire journal on every restore
+        # and every mode switch.  Synchronous by necessity — see below.
+        if self._suppress_history_replay:
+            return
+
+        # No await may execute between the end of the UsageUpdate branch and
+        # task creation below.  The SDK dispatches one task per notification
+        # without awaiting it (acp/task/dispatcher.py:90-94), so chunk-to-chunk
+        # arrival order is preserved only while emission tasks are created
+        # synchronously in arrival order.
         try:
-            notification = SessionNotification(session_id=session_id, update=update)
-            self._accumulator.apply(notification)
+            task = asyncio.create_task(self._emit_from_notification(update))
+            self._pending_emissions.add(task)
+            task.add_done_callback(self._pending_emissions.discard)
+            task.add_done_callback(self._log_task_exception)
         except Exception:
             log.warning(
-                "accumulator.apply() failed for %s on %s",
+                "Failed to dispatch %s for %s",
                 type(update).__name__,
                 self.agent_id,
                 exc_info=True,
             )
 
-    def _on_snapshot(
-        self,
-        snapshot: Any,
-        notification: SessionNotification,
-    ) -> None:
-        """Subscriber callback fired by SessionAccumulator after apply().
+    async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
+        """Adapt harness-proprietary notifications onto typed broker events.
 
-        Checks suppress flag, then dispatches async event emission via
-        create_task with a done-callback that logs exceptions.  Tasks are
-        tracked in ``_pending_emissions`` so that ``prompt()`` can drain
-        them before emitting ``TurnComplete``, guaranteeing all streaming
-        events are enqueued in order.
+        Kiro reports context-window fullness here instead of through the standard
+        ACP ``usage_update``, which it never sends.  The wire method is
+        ``_kiro.dev/metadata``; the acp SDK strips the leading underscore before
+        dispatching, so the name matched below carries none
+        (``acp/client/router.py``).  Payload shape, measured on kiro-cli 2.18.1::
+
+            mid-turn:  {sessionId, contextUsagePercentage}
+            turn-end:  {sessionId, contextUsagePercentage,
+                        meteringUsage: [{value, unit, unitPlural}], turnDurationMs}
+
+        ``contextUsagePercentage`` IS A PERCENTAGE AND KIRO REPORTS NO TOKEN
+        COUNTS, so this maps it onto ``UsageUpdated`` as ``size=100`` with ``used``
+        the rounded percent.  Every consumer of those two fields treats them as a
+        ratio -- the TUI's only use is ``used / size`` rendered as a percent
+        (``UsageBarVisual._build_label``), and the handoff nudge compares the same
+        ratio to a threshold -- so the ratio is exact and the resolution is one
+        percent, which is all Kiro reports.  A consumer that read ``size`` as a
+        token budget would be wrong for Kiro agents; none does today.  Claude's
+        real ``usage_update`` still arrives through ``session_update`` carrying
+        genuine token counts.
+
+        An unrecognized method is ignored, which is also the SDK's behavior when a
+        client omits this handler entirely (``acp/client/router.py``).
+
+        Guards, in the same order and for the same reasons as ``session_update``:
+        shutting-down, then method, then ``sessionId`` mismatch -- which includes
+        having no session yet -- then ``_suppress_history_replay``, then the
+        reading itself.  The ``sessionId``
+        guard is not decorative: without it a delayed notification from a session
+        this agent has already left is attributed to the current one, storing a
+        usage figure for the wrong conversation and possibly consuming the
+        agent's single handoff nudge.
         """
+        if self._shutting_down:
+            return
+        if method != _KIRO_METADATA_NOTIFICATION:
+            return
+        # `is None` first: without it a payload that omits sessionId compares
+        # equal while _session_id is still unset, and usage is emitted for an
+        # agent that has no ACP session yet. Usage without a session is not a
+        # measurement of anything.
+        if self._session_id is None or params.get("sessionId") != self._session_id:
+            return
+        # Same guard as the UsageUpdate branch of session_update: load_session
+        # replays history, and a replayed usage figure is not the current one.
         if self._suppress_history_replay:
             return
-        task = asyncio.create_task(self._emit_from_notification(notification))
-        self._pending_emissions.add(task)
-        task.add_done_callback(self._pending_emissions.discard)
-        task.add_done_callback(self._log_task_exception)
+        raw_pct = params.get("contextUsagePercentage")
+        if isinstance(raw_pct, bool) or not isinstance(raw_pct, int | float):
+            return
+        # NaN and the infinities survive json.loads, which the SDK uses verbatim,
+        # and the clamp below does not stop them: every comparison against NaN is
+        # False, so min(100.0, nan) returns 100.0 and a NaN reading became a false
+        # full-context event. A non-finite reading is no reading at all.
+        if not math.isfinite(raw_pct):
+            return
+        pct = max(0.0, min(float(_PERCENT_SCALE), float(raw_pct)))
+
+        cost_amount: float | None = None
+        cost_currency: str | None = None
+        metering = params.get("meteringUsage")
+        if isinstance(metering, list) and metering and isinstance(metering[0], dict):
+            first = metering[0]
+            value = first.get("value")
+            if not isinstance(value, bool) and isinstance(value, int | float):
+                cost_amount = float(value)
+                unit = first.get("unitPlural") or first.get("unit")
+                cost_currency = unit if isinstance(unit, str) else None
+
+        await self._event_sink(
+            UsageUpdated(
+                agent_id=self.agent_id,
+                size=_PERCENT_SCALE,
+                used=round(pct),
+                cost_amount=cost_amount,
+                cost_currency=cost_currency,
+            )
+        )
 
     async def _drain_pending_emissions(self) -> None:
-        """Await all in-flight ``_emit_from_notification`` tasks.
+        """Await emission tasks registered during a finite number of passes.
 
-        Called before emitting ``TurnComplete`` to guarantee every
-        ``MessageChunkReceived`` / ``ToolCallUpdated`` event reaches the
-        broker queue before the turn-end marker.
+        At most ``DRAIN_PASSES`` iterations of: gather a snapshot of
+        ``_pending_emissions``, await it, then ``await asyncio.sleep(0)``.
+        Breaks early only when the set is empty AFTER a yield — awaiting an
+        empty ``gather()`` does not yield, and a runner the SDK has created
+        but not started has registered nothing yet, so deciding quiescence
+        without yielding would exit in exactly the state that matters.
+
+        There is deliberately no unbounded loop: under continuous
+        registration it would never exit, ``prompt()`` would never reach its
+        finally block, and the agent would stay BUSY forever with queued
+        prompts wedged.
+
+        Guarantees only that emissions REGISTERED during these passes complete
+        before ``TurnComplete``.  It is NOT a guarantee that every chunk
+        precedes ``TurnComplete``: a response carries no ``method`` and so
+        bypasses the SDK dispatcher queue (acp/client/connection.py:248), and
+        ``MessageQueue.join()`` proves runner creation rather than execution,
+        so runners still queued inside the SDK cannot be observed from here.
+        The same-boundary residual is made correct in the UI layer.
+
+        Returns cleanly on ``CancelledError`` so shutdown cannot wedge.
         """
-        if self._pending_emissions:
-            await asyncio.gather(*self._pending_emissions, return_exceptions=True)
+        try:
+            for _ in range(DRAIN_PASSES):
+                await asyncio.gather(*tuple(self._pending_emissions), return_exceptions=True)
+                await asyncio.sleep(0)
+                if not self._pending_emissions:
+                    break
+        except asyncio.CancelledError:
+            return
+
+    async def _settle_replay_guard(self) -> None:
+        """Let already-created SDK runners reach the suppress guard.
+
+        Awaited before ``_suppress_history_replay`` is cleared.  The SDK
+        creates one task per notification without awaiting it, so a runner
+        created during a history replay can first reach ``session_update``
+        after the flag has cleared — emitting historical content into the
+        live UI and journalling it.  Draining ``_pending_emissions`` does not
+        help: a suppressed notification never registers an emission task, so
+        the set is empty while the runner has simply not run yet.
+
+        Bounded at ``DRAIN_PASSES`` yields, so it cannot hang.  Like the
+        turn-end drain this is a mitigation, not a guarantee — a runner the
+        dispatcher has not yet created cannot be waited for.
+        """
+        for _ in range(DRAIN_PASSES):
+            await asyncio.sleep(0)
 
     @staticmethod
     def _log_task_exception(task: asyncio.Task[None]) -> None:
@@ -992,14 +1657,13 @@ class ACPSession:
         if not task.cancelled() and task.exception():
             log.error("_emit_from_notification failed", exc_info=task.exception())
 
-    async def _emit_from_notification(self, notification: SessionNotification) -> None:
-        """Map a notification's update type to the corresponding BrokerEvent.
+    async def _emit_from_notification(self, update: Any) -> None:
+        """Map a raw session update to the corresponding BrokerEvent and emit it.
 
         Args:
-            notification: The SessionNotification whose update to dispatch.
+            update: The raw session update to dispatch.  ``SessionNotification``
+                is not constructed on this path.
         """
-        update = notification.update
-
         if isinstance(update, AgentMessageChunk):
             content = update.content
             if content:

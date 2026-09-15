@@ -5,12 +5,14 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 from textual.app import App, ComposeResult
-from textual.color import Color
+from textual.color import Color, Gradient
 from textual.style import Style
 from textual.visual import RenderOptions
 
 from synth_acp.ui.widgets.gradient_bar import (
     ActivityBar,
+    GradientBar,
+    GradientBarVisual,
     UsageBar,
     UsageBarVisual,
 )
@@ -26,27 +28,82 @@ class _TestApp(App):
         yield ActivityBar()
 
 
-class TestGradientBarVisibility:
-    async def test_on_hide_pauses_auto_refresh(self) -> None:
-        """Hidden GradientBar stops firing timer events."""
+class _InactiveApp(App):
+    """An ActivityBar that is inactive from its very first layout.
+
+    Its GradientBar is therefore ``display: none`` before the compositor has ever
+    mapped it, which is exactly the case Textual never posts ``events.Hide`` to.
+    """
+
+    def compose(self) -> ComposeResult:
+        bar = ActivityBar()
+        bar.active = False
+        yield bar
+
+
+class TestGradientBarArming:
+    async def test_displayed_bar_still_animates(self) -> None:
+        """Gating arming on display must not leave a visible bar static.
+
+        Silent failure: every gradient in the app freezes while all functional
+        assertions pass — nothing else in the suite renders two frames.
+        """
+        app = _TestApp()
+        async with app.run_test(headless=True, size=(80, 24)) as pilot:
+            await pilot.pause()
+            gradient = app.query_one(ActivityBar).query_one(GradientBar)
+            assert gradient.auto_refresh == 1 / 15
+
+        # The visual always emits the same "━" character and animates by moving the
+        # gradient offset, so comparing segment TEXT across ticks would fail a correct
+        # implementation. The styles are what move.
+        clock = {"t": 0.0}
+        visual = GradientBarVisual(
+            Gradient.from_colors("#ff0000", "#00ff00", "#0000ff"),
+            get_time=lambda: clock["t"],
+        )
+        first = visual.render_strips(20, 1, Style(), _render_options())[0]
+        clock["t"] = 0.5
+        second = visual.render_strips(20, 1, Style(), _render_options())[0]
+
+        assert "".join(s.text for s in first._segments) == "".join(
+            s.text for s in second._segments
+        )
+        assert [s.style for s in first._segments] != [s.style for s in second._segments]
+
+    async def test_bar_hidden_from_first_layout_never_arms(self) -> None:
+        """A bar that is display:none from its first layout must hold no timer.
+
+        Silent failure: this is the original defect. Arming in on_mount and relying on
+        a Hide event Textual never posts for such a widget leaked 500 of 521 timers at
+        21 agents, and every tick forced a full compositor map rebuild.
+        """
+        app = _InactiveApp()
+        async with app.run_test(headless=True, size=(80, 24)) as pilot:
+            await pilot.pause()
+            gradient = app.query_one(ActivityBar).query_one(GradientBar)
+            assert gradient.display is False
+            assert gradient.auto_refresh is None
+            assert gradient._auto_refresh_timer is None
+
+    async def test_hide_clears_and_reshow_restores_the_timer(self) -> None:
+        """A bar that WAS mapped and is then hidden must stop, and resume on re-show.
+
+        Silent failure: routing both events through one assignment point could drop the
+        transition handling that stops a bar the user has toggled off, leaving a hidden
+        bar ticking — the leak this phase removes, arriving by a different route.
+        """
         app = _TestApp()
         async with app.run_test(headless=True, size=(80, 24)) as pilot:
             bar = app.query_one(ActivityBar)
+            gradient = bar.query_one(GradientBar)
+
             bar.active = False
             await pilot.pause()
-            gradient = bar.query_one("GradientBar")
             assert gradient.auto_refresh is None
 
-    async def test_on_show_resumes_auto_refresh(self) -> None:
-        """Re-shown GradientBar resumes animation timer."""
-        app = _TestApp()
-        async with app.run_test(headless=True, size=(80, 24)) as pilot:
-            bar = app.query_one(ActivityBar)
-            bar.active = False
-            await pilot.pause()
             bar.active = True
             await pilot.pause()
-            gradient = bar.query_one("GradientBar")
             assert gradient.auto_refresh == 1 / 15
 
 
@@ -155,6 +212,21 @@ class TestUsageBar:
 
 
 class TestActivityBarIntegration:
+    async def test_activity_bar_compose_is_unchanged(self) -> None:
+        """The shared ActivityBar must keep BOTH children.
+
+        Silent failure: dropping the UsageBar blanks the static context/cost readout for
+        every agent tile and input bar, which no ExpandableSection test would notice.
+        """
+        app = _TestApp()
+        async with app.run_test(headless=True, size=(80, 24)) as pilot:
+            bar = app.query_one(ActivityBar)
+            await pilot.pause()
+            assert len(bar.query(GradientBar)) == 1
+            usage_bars = bar.query(UsageBar)
+            assert len(usage_bars) == 1
+            assert usage_bars.first().has_class("activity-bar-bg")
+
     async def test_composes_usage_bar(self) -> None:
         """ActivityBar contains UsageBar child, not Static."""
         app = _TestApp()

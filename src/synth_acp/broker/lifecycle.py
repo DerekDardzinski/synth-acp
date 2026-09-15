@@ -11,17 +11,26 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import closing
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+from uuid import uuid4
 
 from acp.schema import EnvVariable, McpServerStdio
 
 from synth_acp.acp.session import ACPSession
 from synth_acp.broker.registry import AgentRegistry
-from synth_acp.db import ensure_schema_sync, expire_old_sessions_sync
+from synth_acp.db import (
+    AgentRenameError,
+    AgentRenameResult,
+    configure_connection,
+    ensure_schema_sync,
+    expire_old_sessions_sync,
+    rename_agent_sync,
+)
 from synth_acp.discovery import DiscoveredAgent, discover_agents
 from synth_acp.harnesses import load_harness_registry
-from synth_acp.models.agent import AgentConfig, AgentState
+from synth_acp.models.agent import AgentConfig, AgentState, HandoffResult
 from synth_acp.models.config import (
     HarnessEntry,
     MessageHook,
@@ -29,8 +38,15 @@ from synth_acp.models.config import (
     format_available_agents,
     load_startup_context,
     render_template,
+    resolve_harness_env,
 )
-from synth_acp.models.events import BrokerError, BrokerEvent, HookFired
+from synth_acp.models.events import (
+    AgentHandedOff,
+    BrokerError,
+    BrokerEvent,
+    HookFired,
+    UserPromptSubmitted,
+)
 from synth_acp.models.visibility import get_visible_agents
 
 log = logging.getLogger(__name__)
@@ -38,6 +54,34 @@ log = logging.getLogger(__name__)
 RE_FILE_REF = re.compile(r"(?:^|(?<=\s))@(\S+)")
 type EventSink = Callable[[BrokerEvent], Awaitable[None]]
 type SubmitPromptFn = Callable[[str, str, str, str | None], Awaitable[None]]
+
+_HANDOFF_DRAIN_TIMEOUT: float = 10.0
+"""Seconds shutdown waits for in-flight handoff work before proceeding.
+
+The wait is bounded but the task is NEVER cancelled on expiry: the shutting-down flag
+alone is what prevents a successor from being started, and cancelling a handoff between
+its committed rename and its in-memory re-key is the partial-state failure this design
+exists to make impossible.
+"""
+
+
+class HandoffBrokerState(Protocol):
+    """The broker-owned state a handoff has to reach.
+
+    ``AgentLifecycle`` owns no journal, prompt queue or per-agent diagnostics, so the
+    three operations a handoff needs from the broker are declared here and injected with
+    ``set_handoff_state``.  Declaring the protocol here rather than importing
+    ``ACPBroker`` keeps the dependency one-way; ``ACPBroker`` satisfies it structurally.
+    """
+
+    async def drain_agent_journal(self, agent_id: str) -> None:
+        """Await in-flight journal flushes for this agent and flush its turn buffer."""
+
+    def apply_handoff_rekey(self, result: AgentRenameResult) -> None:
+        """Re-key every broker-owned per-agent container.  Must not await."""
+
+    def seed_first_prompt(self, agent_id: str, text: str, from_agent: str) -> None:
+        """Place the successor's reserved opening prompt at the FRONT of its queue."""
 
 
 def _natural_list(items: list[str]) -> str:
@@ -54,8 +98,10 @@ def _natural_list(items: list[str]) -> str:
 class AgentLifecycle:
     """Manages agent launch, termination, prompting, and background tasks.
 
-    Every asyncio.Task created by this class has a done-callback that
-    removes it from _tasks on completion, preventing accumulation.
+    Every per-agent asyncio.Task in _tasks has a done-callback that removes it
+    from _tasks on completion, preventing accumulation.  The single _expiry_task
+    is the exception: it is deliberately retained after completion so the task
+    cannot be garbage collected mid-flight, and is cancelled in shutdown.
     """
 
     def __init__(
@@ -74,14 +120,84 @@ class AgentLifecycle:
         self._notify_socket_path: str = ""
         self._submit_prompt: SubmitPromptFn | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._expiry_task: asyncio.Task[None] | None = None
         self._first_prompted: set[str] = set()
         self._harness_registry = load_harness_registry()
         self._discovery_cache: dict[str, list[DiscoveredAgent]] = {}
         self._terminate_timeout: float = 5.0
+        self._handoff_state: HandoffBrokerState | None = None
+        self._shutting_down: bool = False
+        self._active_handoffs: dict[str, asyncio.Event] = {}
+        self._reserved_first_prompt: dict[str, str] = {}
+        """agent_id -> retired id, while that agent's handoff message is undelivered."""
 
     def set_message_bus(self, socket_path: str) -> None:
         """Wire the message bus socket path. Must be called before launching agents."""
         self._notify_socket_path = socket_path
+
+    def set_handoff_state(self, state: HandoffBrokerState) -> None:
+        """Wire the broker state a handoff mutates. Must be called before a handoff."""
+        self._handoff_state = state
+
+    def _build_session(self, agent_cfg: AgentConfig, entry: HarnessEntry) -> ACPSession:
+        """Construct one agent session from its config and harness entry.
+
+        The single place an ``ACPSession`` is built.  ``launch``,
+        ``handle_launch_command``, ``restore`` and ``handoff`` all need the same command
+        line, the same synth-mcp server and the same session-created callback, so a
+        fourth copy would be a fourth place for them to drift apart.
+
+        Args:
+            agent_cfg: Identity, harness, agent_mode and cwd for the session.
+            entry: The resolved harness entry, already looked up by the caller so it can
+                report an unknown harness in its own idiom.
+
+        Returns:
+            An unstarted session with its session-created callback registered.
+        """
+        cmd = entry.run_cmd.split()
+        if agent_cfg.agent_mode and entry.mode_arg:
+            cmd += [entry.mode_arg, agent_cfg.agent_mode]
+        mcp_servers = [
+            McpServerStdio(
+                name="synth-mcp",
+                command="synth-mcp",
+                args=[],
+                env=self._build_mcp_env(agent_cfg.agent_id, agent_cfg.env),
+            )
+        ]
+        session = ACPSession(
+            agent_id=agent_cfg.agent_id,
+            binary=cmd[0],
+            args=cmd[1:],
+            cwd=agent_cfg.cwd,
+            event_sink=self._sink,
+            mcp_servers=mcp_servers,
+            agent_mode=agent_cfg.agent_mode,
+            env=self._resolve_harness_env(entry),
+            agent_mode_target=entry.agent_mode_target,
+            steer_protocol=entry.steer_protocol,
+        )
+        session.set_session_created_callback(self._on_acp_session_created)
+        return session
+
+    async def _cancel_agent_tasks(self, agent_id: str) -> None:
+        """Cancel and await this agent's run and prompt tasks, then drop both keys.
+
+        Shared by ``terminate`` and ``handoff``.  The keys are popped explicitly rather
+        than left to the tasks' own done-callbacks: a handoff registers the SUCCESSOR
+        under the same bare key moments later, and a callback that fired after that would
+        delete the successor's run task.
+        """
+        for key in (agent_id, f"prompt-{agent_id}"):
+            task = self._tasks.get(key)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, ConnectionError, OSError, RuntimeError):
+                    pass
+            self._tasks.pop(key, None)
 
     def set_submit_prompt(self, fn: SubmitPromptFn) -> None:
         """Wire the broker's submit_prompt callback for launch_command initial messages."""
@@ -150,17 +266,9 @@ class AgentLifecycle:
             )
             return
 
-        cmd = entry.run_cmd.split()
-        if agent_cfg.agent_mode and entry.mode_arg:
-            cmd += [entry.mode_arg, agent_cfg.agent_mode]
-        mcp_servers = [
-            McpServerStdio(
-                name="synth-mcp",
-                command="synth-mcp",
-                args=[],
-                env=self._build_mcp_env(agent_id, agent_cfg.env),
-            )
-        ]
+        if missing := self._check_harness_binary(entry):
+            await self._sink(BrokerError(agent_id=agent_id, message=missing))
+            return
 
         if self._registry.has_session(agent_id):
             old = self._registry.get_session(agent_id)
@@ -174,18 +282,7 @@ class AgentLifecycle:
             if task and not task.done():
                 task.cancel()
 
-        session = ACPSession(
-            agent_id=agent_cfg.agent_id,
-            binary=cmd[0],
-            args=cmd[1:],
-            cwd=agent_cfg.cwd,
-            event_sink=self._sink,
-            mcp_servers=mcp_servers,
-            agent_mode=agent_cfg.agent_mode,
-            env=self._resolve_harness_env(entry),
-            agent_mode_target=entry.agent_mode_target,
-        )
-        session.set_session_created_callback(self._on_acp_session_created)
+        session = self._build_session(agent_cfg, entry)
         self._registry.register(agent_id, session)
         self._registry.set_harness(agent_id, agent_cfg.harness)
         self._tasks[agent_id] = self._make_run_task(agent_id, session)
@@ -218,14 +315,7 @@ class AgentLifecycle:
                     await asyncio.wait_for(session.terminate(), timeout=self._terminate_timeout)
                 except TimeoutError:
                     log.warning("session.terminate() timed out for %s", agent_id)
-                for key in (agent_id, f"prompt-{agent_id}"):
-                    task = self._tasks.get(key)
-                    if task and not task.done():
-                        task.cancel()
-                        try:
-                            await task
-                        except (asyncio.CancelledError, ConnectionError, OSError, RuntimeError):
-                            pass
+                await self._cancel_agent_tasks(agent_id)
 
             session_id = self._session_id
 
@@ -255,12 +345,42 @@ class AgentLifecycle:
         self._registry.orphan_children(agent_id)
         self._first_prompted.discard(agent_id)
 
-    async def prompt(self, agent_id: str, text: str) -> bool:
-        """Send a prompt to a running agent. Returns True if dispatched."""
+    async def prompt(self, agent_id: str, text: str, *, first_prompt: bool = False) -> bool:
+        """Send a prompt to a running agent. Returns True if dispatched.
+
+        THE ONLY PLACE ``UserPromptSubmitted`` IS EMITTED.  It is emitted here, after
+        every check has passed, so a prompt is announced only once it has actually been
+        accepted and only under the agent_id whose session accepted it.  Announcing
+        earlier -- as four broker call sites used to -- meant a refused prompt left a
+        bubble for text that was never delivered, and across a handoff it filed the
+        prompt in the PREDECESSOR's journal while the successor that received the text
+        had no prompt event at all.  The event carries the text as RECEIVED, before the
+        startup-context prepend and before file-ref injection, so what the transcript
+        shows is what the caller sent.
+
+        ``first_prompt`` admits the one item a handoff reserved as the successor's
+        opening turn.  While a reservation is pending every other caller is refused
+        here, inside the lock: a caller that checked anything before the reservation
+        existed is already parked on this agent's lock, so an outer check cannot order
+        it.  A refusal emits nothing and returns False; the caller preserves the text.
+
+        Args:
+            agent_id: Target agent.
+            text: Prompt body as authored by the caller.
+            first_prompt: True only for a handoff's reserved opening prompt.
+
+        Returns:
+            True if the prompt was dispatched to the session.
+        """
+        received = text
         async with self._registry.agent_lock(agent_id):
             session = self._registry.get_session(agent_id)
             if not session:
                 await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
+                return False
+            if not first_prompt and agent_id in self._reserved_first_prompt:
+                # Refused, silently: the successor's handoff message has not been
+                # delivered yet, and this text is preserved by its caller.
                 return False
             if session.state != AgentState.IDLE:
                 await self._sink(
@@ -293,7 +413,13 @@ class AgentLifecycle:
                     await self._sink(HookFired(agent_id=agent_id, hook_name="on_agent_startup"))
             # Inject file contents for @path references
             text = self._inject_file_refs(agent_id, text)
+            # Awaited BEFORE the prompt task exists, so no chunk can be journaled
+            # ahead of the prompt that caused it.
+            await self._sink(UserPromptSubmitted(agent_id=agent_id, text=received))
             self._tasks[f"prompt-{agent_id}"] = self._make_prompt_task(agent_id, session.prompt(text))
+            # Cleared only now, after an actual submission: clearing before the state
+            # check would drop the handoff message and its reservation together.
+            self._reserved_first_prompt.pop(agent_id, None)
             return True
 
     def _inject_file_refs(self, agent_id: str, text: str) -> str:
@@ -440,10 +566,12 @@ class AgentLifecycle:
                 await self.update_command_status(cmd_id, "rejected", f"Unknown harness: {harness}")
                 return
 
-            cmd = entry.run_cmd.split()
+            if missing := self._check_harness_binary(entry):
+                await self._sink(BrokerError(agent_id=agent_id, message=missing))
+                await self.update_command_status(cmd_id, "rejected", missing)
+                return
+
             agent_cfg = AgentConfig(agent_id=agent_id, harness=harness, agent_mode=agent_mode, cwd=cwd)
-            if agent_cfg.agent_mode and entry.mode_arg:
-                cmd += [entry.mode_arg, agent_cfg.agent_mode]
 
             now = int(time.time() * 1000)
             session_id = self._session_id
@@ -462,26 +590,7 @@ class AgentLifecycle:
             self._registry.set_parent(agent_id, from_agent)
             self._registry.set_harness(agent_id, harness)
 
-            mcp_servers = [
-                McpServerStdio(
-                    name="synth-mcp",
-                    command="synth-mcp",
-                    args=[],
-                    env=self._build_mcp_env(agent_id, agent_cfg.env),
-                )
-            ]
-            session = ACPSession(
-                agent_id=agent_cfg.agent_id,
-                binary=cmd[0],
-                args=cmd[1:],
-                cwd=agent_cfg.cwd,
-                event_sink=self._sink,
-                mcp_servers=mcp_servers,
-                agent_mode=agent_cfg.agent_mode,
-                env=self._resolve_harness_env(entry),
-                agent_mode_target=entry.agent_mode_target,
-            )
-            session.set_session_created_callback(self._on_acp_session_created)
+            session = self._build_session(agent_cfg, entry)
             self._registry.register(agent_id, session)
             self._tasks[agent_id] = self._make_run_task(agent_id, session)
 
@@ -584,29 +693,303 @@ class AgentLifecycle:
     async def handle_resurrect_command(
         self, cmd_id: int, from_agent: str, data: dict[str, str]
     ) -> None:
-        """Handle a resurrect command from an agent."""
+        """Handle a resurrect command from an agent.
+
+        Two relations authorize a resurrection, and the second exists because the first
+        cannot cover a handoff predecessor.  ``parent`` names the agent that LAUNCHED the
+        target, and a handoff never rewrites it, so a root agent's predecessor keeps
+        ``parent`` NULL and no caller could ever match it.  ``retired_from`` names the id
+        the target handed off TO, which is the id its successor now holds.
+
+        The same pair is what ``get_resurrectable_agents`` lists, and the two must stay in
+        step: a divergence would either advertise a revival the caller cannot perform or
+        hide one it can.
+        """
         agent_id = data["agent_id"]
         session_id = self._session_id
 
-        def _fetch_parent(conn: sqlite3.Connection) -> str | None:
+        def _fetch_relations(conn: sqlite3.Connection) -> tuple | None:
             row = conn.execute(
-                "SELECT parent FROM agents WHERE agent_id = ? AND session_id = ?",
+                "SELECT parent, retired_from FROM agents WHERE agent_id = ? AND session_id = ?",
                 (agent_id, session_id),
             ).fetchone()
-            return row[0] if row else None
+            return (row[0], row[1]) if row else None
 
-        parent = await self._db_op(_fetch_parent)
-        if parent != from_agent:
+        relations = await self._db_op(_fetch_relations)
+        parent, retired_from = relations if relations else (None, None)
+        if from_agent not in (parent, retired_from):
             await self.update_command_status(
                 cmd_id, "rejected",
-                f"Not authorized: {from_agent} is not parent of {agent_id}",
+                f"Not authorized: {from_agent} is neither parent nor successor of {agent_id}",
             )
             return
         await self.resurrect(agent_id)
         await self.update_command_status(cmd_id, "processed")
 
+    async def handoff(self, agent_id: str, handoff_message: str) -> HandoffResult:
+        """Retire an agent and start a successor under its id.
+
+        Runs inside an OWNED TASK that nothing cancels, so it awaits _db_op directly and
+        needs no shield, no deferred-cancellation loop and no exception-precedence
+        ordering.
+
+        Returns a HandoffResult rather than the retired id alone, because the rename can
+        commit and the successor can still fail to start.  In that case this returns
+        successor_started=False with a populated error, and does NOT raise: the rename is
+        durable, the retired id is real, and the caller needs both facts to report
+        truthfully.
+
+        Raises:
+            AgentRenameError: the rename itself failed and NOTHING was changed.  Nothing
+                is durable, no id was retired, and no BrokerError is warranted.
+            sqlite3.OperationalError: the write lock was not acquired within busy_timeout.
+                Nothing was changed; treat it exactly like AgentRenameError.
+            Exception: any failure raised by the synchronous in-memory re-key AFTER the
+                rename committed.  This is the one case where the database-and-memory
+                invariant has genuinely broken.
+        """
+        new_id = f"{agent_id}.h{uuid4().hex[:8]}"
+        finished = asyncio.Event()
+        self._active_handoffs[agent_id] = finished
+        try:
+            async with self._registry.agent_lock(agent_id):
+                session = self._registry.get_session(agent_id)
+                if session is None:
+                    raise AgentRenameError(f"Cannot hand off '{agent_id}': no live session")
+
+                # force_kill, NOT await session.terminate(): terminate() waits 5s then
+                # WARNS AND CONTINUES, leaving a live subprocess that can still write.
+                # This SIGKILLs the process group, which contains synth-mcp by
+                # construction.  Synth cannot prove that grandchild is dead -- it is a
+                # child of the harness -- so the defense is structural: the original id
+                # is never vacant, making a late INSERT OR IGNORE a no-op.
+                session.force_kill()
+
+                # Reaches ACPSession.run's finally, which force-transitions TERMINATED
+                # and emits it under the ORIGINAL id, because the re-key has not run
+                # yet.  The UI tears the predecessor's state down under that id, which
+                # is what frees it for the successor.
+                await self._cancel_agent_tasks(agent_id)
+
+                if self._handoff_state is not None:
+                    # An in-flight flush closes over the old id and would otherwise
+                    # write old-id rows AFTER the UPDATE has moved them.
+                    await self._handoff_state.drain_agent_journal(agent_id)
+
+                now = int(time.time() * 1000)
+                session_id = self._session_id
+                result: AgentRenameResult = await self._db_op(
+                    lambda conn: rename_agent_sync(
+                        conn,
+                        old_agent_id=agent_id,
+                        new_agent_id=new_id,
+                        session_id=session_id,
+                        now_ms=now,
+                    )
+                )
+
+                # ONE SYNCHRONOUS BLOCK, NO AWAIT: with no yield point no other
+                # coroutine can observe a partially re-keyed process.
+                self._first_prompted.add(new_id)
+                if self._handoff_state is not None:
+                    self._handoff_state.apply_handoff_rekey(result)
+
+                await self._sink(
+                    AgentHandedOff(
+                        agent_id=agent_id,
+                        retired_agent_id=new_id,
+                        parent=result.parent,
+                        task=result.task,
+                    )
+                )
+
+                try:
+                    entry = next(
+                        (e for e in self._harness_registry if e.short_name == result.harness),
+                        None,
+                    )
+                    if entry is None:
+                        return HandoffResult(
+                            retired_agent_id=new_id,
+                            successor_started=False,
+                            error=f"Unknown harness '{result.harness}'",
+                        )
+                    if missing := self._check_harness_binary(entry):
+                        return HandoffResult(
+                            retired_agent_id=new_id,
+                            successor_started=False,
+                            error=missing,
+                        )
+                    agent_cfg = AgentConfig(
+                        agent_id=agent_id,
+                        harness=result.harness,
+                        agent_mode=result.agent_mode,
+                        cwd=result.cwd or ".",
+                    )
+                    # Fresh session.run() path only.  restore() would replay the full
+                    # conversation via ACP session/load and suppress the startup hook,
+                    # and both defeat the feature.
+                    successor = self._build_session(agent_cfg, entry)
+                    text = self._render_handoff_prompt(agent_id, result, handoff_message)
+
+                    # SHUTDOWN CHECK AND REGISTRATION IN ONE SYNCHRONOUS BLOCK, NO
+                    # AWAIT BETWEEN THEM.  shutdown sets the flag, awaits owned
+                    # handoffs, and only THEN snapshots for force-kill, so a handoff
+                    # past this check is in the kill snapshot and one before it starts
+                    # nothing.  An await here would reopen that window.
+                    if self._shutting_down:
+                        return HandoffResult(
+                            retired_agent_id=new_id,
+                            successor_started=False,
+                            error="Lifecycle is shutting down; successor not started",
+                        )
+                    self._registry.register(agent_id, successor)
+                    self._reserved_first_prompt[agent_id] = new_id
+                    if self._handoff_state is not None:
+                        self._handoff_state.seed_first_prompt(agent_id, text, new_id)
+                    self._tasks[agent_id] = self._make_run_task(agent_id, successor)
+
+                    # INSIDE the try: a failing emission after the commit is still a
+                    # failed start, and it must report that rather than raise. Raising
+                    # here would leave the reservation installed -- refusing every later
+                    # prompt to this id -- and skip the caller's BrokerError mapping.
+                    if self._config.settings.hooks.on_agent_startup.active:
+                        await self._sink(
+                            HookFired(agent_id=agent_id, hook_name="on_agent_startup")
+                        )
+                except Exception as exc:
+                    # The rename is durable and the retired id is real, so report rather
+                    # than raise.  Drop the reservation or every later prompt to this id
+                    # would be refused for the rest of the session.
+                    self._reserved_first_prompt.pop(agent_id, None)
+                    log.error("Successor for %s failed to start", agent_id, exc_info=exc)
+                    return HandoffResult(
+                        retired_agent_id=new_id, successor_started=False, error=str(exc)
+                    )
+
+            return HandoffResult(retired_agent_id=new_id, successor_started=True, error=None)
+        finally:
+            self._active_handoffs.pop(agent_id, None)
+            finished.set()
+
+    def _render_handoff_prompt(
+        self, agent_id: str, result: AgentRenameResult, handoff_message: str
+    ) -> str:
+        """Build the successor's opening prompt, following handle_launch_command.
+
+        The handoff text is passed through VERBATIM: this phase makes no LLM call,
+        constructs no prompt template of its own, and must not summarize, truncate or
+        reformat what the predecessor wrote.  Pre-adding to _first_prompted is what stops
+        prompt() prepending the startup context a second time on delivery.
+        """
+        self._first_prompted.add(agent_id)
+        self._registry.set_initial_message(agent_id, handoff_message)
+        hook = self._config.settings.hooks.on_agent_startup
+        if not hook.active:
+            return handoff_message
+        rendered = render_template(
+            load_startup_context(),
+            {
+                "agent_id": agent_id,
+                "parent_id": result.parent or "",
+                "task": result.task,
+                "harness": result.harness,
+                "available_agents": format_available_agents(
+                    self.get_discovered_agents(agent_id)
+                ),
+            },
+        )
+        return rendered + handoff_message
+
+    async def handle_handoff_command(
+        self, cmd_id: int, from_agent: str, data: dict[str, str]
+    ) -> None:
+        """Handle a handoff command from an agent.
+
+        Self-service: an agent hands ITSELF off, so authorization is
+        data["agent_id"] == from_agent.  Reject otherwise.  This is deliberately NOT the
+        parent-derived check used by terminate and resurrect, because a handoff is not an
+        act performed on someone else.
+
+        Outcome mapping, which must be exactly this:
+          - shutting down / authorization fails -> rejected.  No BrokerError; nothing
+                                        happened.
+          - AgentRenameError         -> rejected with str(e).  No BrokerError; nothing
+                                        was changed.
+          - successor_started=True   -> processed.
+          - successor_started=False  -> emit BrokerError naming BOTH agent_id and
+                                        result.retired_agent_id, stating the successor did
+                                        not start and the predecessor is resurrectable,
+                                        THEN rejected with result.error.
+
+        Does NOT reproduce the bug in handle_resurrect_command, which reports "processed"
+        even when resurrect() bailed out with a BrokerError because resurrect() has no
+        return value.  That bug is the reason this method takes a typed result instead of
+        inferring success.
+        """
+        if self._shutting_down:
+            await self.update_command_status(
+                cmd_id, "rejected", "Lifecycle is shutting down; handoff not started"
+            )
+            return
+
+        agent_id = data.get("agent_id", "")
+        if agent_id != from_agent:
+            await self.update_command_status(
+                cmd_id,
+                "rejected",
+                f"Not authorized: an agent may only hand itself off, and {from_agent} "
+                f"asked to hand off {agent_id!r}",
+            )
+            return
+
+        try:
+            result = await self.handoff(agent_id, data.get("handoff_message", ""))
+        except (AgentRenameError, sqlite3.OperationalError) as exc:
+            # Nothing is durable and no id was retired, so this is not a BrokerError.
+            await self.update_command_status(cmd_id, "rejected", str(exc))
+            return
+
+        if result.successor_started:
+            await self.update_command_status(cmd_id, "processed")
+            return
+
+        await self._sink(
+            BrokerError(
+                agent_id=agent_id,
+                message=(
+                    f"Handoff of '{agent_id}' committed but its successor did not start: "
+                    f"{result.error}. The predecessor is retired as "
+                    f"'{result.retired_agent_id}' and remains resurrectable."
+                ),
+            )
+        )
+        await self.update_command_status(cmd_id, "rejected", result.error)
+
     async def shutdown(self) -> None:
-        """Shutdown all agents: SIGKILL all process groups, then cancel tasks."""
+        """Shutdown all agents: SIGKILL all process groups, then cancel tasks.
+
+        Order is load bearing.  The flag goes up first, then in-flight handoff work is
+        awaited with a bounded wait, and only THEN are the force-kill and _tasks
+        snapshots taken -- so a handoff that got past its own check has already
+        registered its successor and that successor IS in the kill snapshot, while one
+        still before the check starts nothing.  On expiry the owned task is NOT
+        cancelled: the flag alone prevents a later successor start, and cancelling would
+        reintroduce the partial-state problem this design removed.
+        """
+        self._shutting_down = True
+
+        if self._active_handoffs:
+            pending = [asyncio.create_task(e.wait()) for e in list(self._active_handoffs.values())]
+            _, unfinished = await asyncio.wait(pending, timeout=_HANDOFF_DRAIN_TIMEOUT)
+            for waiter in unfinished:
+                waiter.cancel()
+            if unfinished:
+                log.warning(
+                    "Shutdown proceeding with %d handoff(s) still in flight; not cancelling them",
+                    len(unfinished),
+                )
+
         for session in self._registry.all_sessions().values():
             session.force_kill()
 
@@ -615,6 +998,10 @@ class AgentLifecycle:
                 task.cancel()
         if self._tasks:
             await asyncio.wait(list(self._tasks.values()), timeout=1.0)
+
+        if (expiry := self._expiry_task) is not None and not expiry.done():
+            expiry.cancel()
+            await asyncio.wait([expiry], timeout=1.0)
 
     async def _on_acp_session_created(self, agent_id: str, acp_session_id: str) -> None:
         """Write back the ACP session ID after the agent process creates it.
@@ -628,7 +1015,7 @@ class AgentLifecycle:
         def _write() -> None:
             conn = sqlite3.connect(str(self._db_path))
             try:
-                conn.execute("PRAGMA journal_mode=WAL")
+                configure_connection(conn)
                 conn.execute(
                     "UPDATE agents SET acp_session_id = ?, status = 'active' "
                     "WHERE agent_id = ? AND session_id = ?",
@@ -660,37 +1047,19 @@ class AgentLifecycle:
             )
             return
 
+        if missing := self._check_harness_binary(entry):
+            await self._sink(BrokerError(agent_id=agent_id, message=f"Cannot restore: {missing}"))
+            return
+
         cmd = entry.run_cmd.split()
         agent_cfg = AgentConfig(agent_id=agent_id, harness=harness, agent_mode=agent_mode, cwd=cwd)
         if agent_cfg.agent_mode and entry.mode_arg:
             cmd += [entry.mode_arg, agent_cfg.agent_mode]
-        mcp_servers = [
-            McpServerStdio(
-                name="synth-mcp",
-                command="synth-mcp",
-                args=[],
-                env=self._build_mcp_env(agent_id, agent_cfg.env),
-            )
-        ]
-
-        session = ACPSession(
-            agent_id=agent_id,
-            binary=cmd[0],
-            args=cmd[1:],
-            cwd=cwd,
-            event_sink=self._sink,
-            mcp_servers=mcp_servers,
-            agent_mode=agent_mode,
-            env=self._resolve_harness_env(entry),
-            agent_mode_target=entry.agent_mode_target,
-        )
+        session = self._build_session(agent_cfg, entry)
         self._registry.register(agent_id, session)
         if parent:
             self._registry.set_parent(agent_id, parent)
         self._registry.set_harness(agent_id, harness)
-
-        # Always register the session-created callback on both branches.
-        session.set_session_created_callback(self._on_acp_session_created)
 
         # Suppress on_agent_startup hook — restored agents already have
         # orchestration context from their prior conversation history.
@@ -723,7 +1092,7 @@ class AgentLifecycle:
 
         def _run() -> Any:
             with closing(sqlite3.connect(db_path)) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
+                configure_connection(conn)
                 return fn(conn)
 
         return await asyncio.to_thread(_run)
@@ -750,8 +1119,36 @@ class AgentLifecycle:
         await self._db_op(_sync)
 
     async def expire_old_sessions(self) -> None:
-        """Remove restorable sessions older than 30 days."""
-        await self._db_op(expire_old_sessions_sync)
+        """Schedule a dry-run expiry preview and return IMMEDIATELY.
+
+        Does NOT perform or await the expiry.  Creates a task (retained on
+        _expiry_task so it is not garbage collected mid-flight) which runs
+        expire_old_sessions_sync with dry_run=True off the loop thread and logs
+        the ExpiryReport.
+
+        Callers may await this method — broker._start_message_bus does — and
+        will only be awaiting the scheduling, never the work.  That is what
+        keeps startup non-blocking.
+
+        Exceptions inside the task are logged and never propagate.  The task is
+        cancelled on shutdown; cancellation is not an error.
+        """
+        if self._expiry_task is not None and not self._expiry_task.done():
+            return
+        self._expiry_task = asyncio.create_task(
+            self._run_expiry_preview(), name="expiry-preview"
+        )
+
+    async def _run_expiry_preview(self) -> None:
+        """Run the retention preview off the loop thread and log what it found."""
+        try:
+            report = await self._db_op(partial(expire_old_sessions_sync, dry_run=True))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("Session expiry preview failed", exc_info=True)
+            return
+        log.info("Session expiry preview (nothing deleted): %s", report)
 
     async def update_command_status(self, cmd_id: int, status: str, error: str | None = None) -> None:
         def _sync(conn: sqlite3.Connection) -> None:
@@ -777,31 +1174,42 @@ class AgentLifecycle:
         return env
 
     def _resolve_harness_env(self, entry: HarnessEntry) -> dict[str, str] | None:
-        """Build environment overrides for a harness subprocess."""
-        overrides: dict[str, str] = {}
+        """Build environment overrides for a harness subprocess.
 
-        if entry.executable_env_var:
-            for name in entry.binary_names:
-                path = shutil.which(name)
-                if path:
-                    overrides[entry.executable_env_var] = path
-                    log.debug("Harness '%s': %s=%s", entry.short_name, entry.executable_env_var, path)
-                    break
-            else:
-                log.warning(
-                    "Harness '%s': executable_env_var '%s' set but none of %s found in PATH",
-                    entry.short_name, entry.executable_env_var, entry.binary_names,
-                )
+        Delegates the policy to ``resolve_harness_env``, passing this harness's
+        ``harness_env`` block from resolved settings and ``os.environ`` as the parent.
+        """
+        overrides = resolve_harness_env(
+            entry,
+            self._config.settings.harness_env.get(entry.short_name),
+            os.environ,
+        )
+        return overrides or None
 
-        for var in entry.clear_env_vars:
-            overrides[var] = ""
+    def _check_harness_binary(self, entry: HarnessEntry) -> str | None:
+        """Return an error message when the program in ``run_cmd`` is absent from PATH.
 
-        return overrides if overrides else None
+        Checked before spawning rather than left to ``create_subprocess_exec``, whose
+        ``FileNotFoundError`` cannot distinguish a missing executable from a missing
+        working directory, and which for a package-manager wrapper does not fire at
+        all -- the wrapper starts fine and then stalls resolving what to run.
+
+        Returns:
+            An error message naming the program and ``entry.install_hint``, or None
+            when the command resolves.
+        """
+        program = entry.run_cmd.split()[0]
+        if shutil.which(program):
+            return None
+        msg = f"Harness '{entry.short_name}' needs '{program}', which is not in PATH."
+        if entry.install_hint:
+            msg += f" Install it with: {entry.install_hint}"
+        return msg
 
     async def _get_visible_agents_for(self, agent_id: str) -> list[str]:
         def _query() -> list[str]:
             conn = sqlite3.connect(str(self._db_path))
-            conn.execute("PRAGMA journal_mode=WAL")
+            configure_connection(conn)
             try:
                 return get_visible_agents(
                     conn, agent_id, self._session_id,
@@ -849,6 +1257,42 @@ class AgentLifecycle:
         await self._db_op(_sync)
         for recipient in recipients:
             await self._sink(HookFired(agent_id=recipient, hook_name=hook_name))
+
+    async def send_notification(self, agent_id: str, body: str) -> None:
+        """Queue a synth-authored notification for one agent.
+
+        Writes a ``pending`` row exactly as ``_fire_message_hook`` does, so the
+        nudge reaches the agent through the one documented MCP delivery seam and
+        picks up the envelope, steer-eligibility, queueing and exactly-once
+        marking that path already provides.  Nothing on the delivery path
+        validates ``from_agent``: ``messages.from_agent`` has no foreign key, and
+        the join/exit hooks have shipped with the synthetic sender ``'system'``
+        since they were written.  ``'synth'`` is used instead of ``'system'``
+        because this value is rendered into the agent-visible envelope via the
+        ``{from_agent}`` slot, where "synth" is self-explanatory.
+
+        Durable by construction: a pending row survives a crash and is picked up
+        on the next poll.  The caller is responsible for waking the bus so the
+        delivery does not wait out the poll interval.
+
+        Args:
+            agent_id: Recipient.
+            body: Message body, already rendered. Delivered verbatim after the
+                ``on_mcp_message`` prefix.
+        """
+        now = int(time.time() * 1000)
+        session_id = self._session_id
+
+        def _sync(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO messages "
+                "(session_id, from_agent, to_agent, body, status, created_at, kind) "
+                "VALUES (?, 'synth', ?, ?, 'pending', ?, 'notification')",
+                (session_id, agent_id, body, now),
+            )
+            conn.commit()
+
+        await self._db_op(_sync)
 
     async def _resolve_recipients(
         self, mode: str, agent_id: str, parent_id: str | None,

@@ -35,6 +35,12 @@ PREVIEW_TEXT: dict[AgentState, str] = {
 
 DEFAULT_PREVIEW = "[$text-muted italic]idle[/]"
 
+# A RETIRED agent handed its id to a successor. Distinct from TERMINATED, whose tile
+# and feed are destroyed outright: a retired predecessor keeps its full transcript and
+# stays resurrectable, so it remains in the sidebar to be read.
+RETIRED_DOT = "[$text-muted]◌[/]"
+RETIRED_PREVIEW = "[$text-muted italic]retired — handed off[/]"
+
 
 _BUSY_STATES = {AgentState.INITIALIZING, AgentState.BUSY, AgentState.AWAITING_PERMISSION}
 
@@ -78,13 +84,13 @@ class AgentTile(Vertical):
         agent_id: str,
         state: AgentState = AgentState.IDLE,
         *,
-        task: str = "",
         parent: str | None = None,
+        retired: bool = False,
     ) -> None:
         self._agent_id = agent_id
         self._state = state
-        self._agent_task = task
         self._parent_agent = parent
+        self._retired = retired
         self._current_mode: str | None = None
         super().__init__(id=f"tile-{css_id(agent_id)}")
         self.has_permission = state == AgentState.AWAITING_PERMISSION
@@ -95,11 +101,31 @@ class AgentTile(Vertical):
         yield ActivityBar(classes="tile-activity")
 
     def on_mount(self) -> None:
+        # Re-applies EVERY piece of _state-derived presentation, so a state recorded
+        # while this tile had not composed is fully realized once it has.  compose()
+        # covers the label; these two are not otherwise recoverable, and has_permission
+        # drives the tile-permission CSS class.
         self.query_one(ActivityBar).active = self._state in _BUSY_STATES
+        self.has_permission = self._state == AgentState.AWAITING_PERMISSION
+
+    def _refresh_label(self) -> None:
+        """Re-render the label if this tile has composed, otherwise do nothing.
+
+        Callers mount a tile and update it within the same message-pump cycle, at which
+        point the children do not exist and ``query_one`` raises.  An exception out of a
+        Textual message handler breaks the message loop, so every mutator routes its
+        re-render through here rather than each caller guarding for itself.
+
+        Both conditions are load bearing: ``is_mounted`` is False before compose, and
+        ``children`` is empty after the tile has been removed.
+        """
+        if not self.is_mounted or not self.children:
+            return
+        self.query_one(".tile-label", Static).update(self._build_markup())
 
     def _build_markup(self) -> str:
         """Build the tile markup from current state."""
-        dot = STATUS_DOT.get(self._state, "[$text-muted]○[/]")
+        dot = RETIRED_DOT if self._retired else STATUS_DOT.get(self._state, "[$text-muted]○[/]")
         warn = (
             "  [$warning bold]⚠[/]"
             if self._state == AgentState.AWAITING_PERMISSION
@@ -116,9 +142,13 @@ class AgentTile(Vertical):
             if self._parent_agent
             else ""
         )
+        # The preview line is the tile's STATUS line.  It deliberately carries no task
+        # description: a task string is long enough to crowd the tile, and because it
+        # would take precedence here it would also suppress the state text for the rest
+        # of the agent's life.
         preview = (
-            f"[dim italic]{escape(self._agent_task)}[/dim italic]"
-            if self._agent_task
+            RETIRED_PREVIEW
+            if self._retired
             else PREVIEW_TEXT.get(self._state, DEFAULT_PREVIEW)
         )
         return f"{dot} {name}{warn}{mode_line}{parent_line}\n  {preview}"
@@ -126,11 +156,23 @@ class AgentTile(Vertical):
     def update_state(self, new_state: AgentState) -> None:
         """Update the tile to reflect a new agent state.
 
+        Clears the retired presentation: the only state a retired tile can receive is a
+        resurrection, and a resurrected agent is live again.
+
+        Does nothing to the widgets until this tile has composed. Callers mount a tile and
+        update it within the same message-pump cycle, at which point the label and
+        activity bar do not exist yet; ``compose`` renders from ``_state`` and ``on_mount``
+        applies it to the activity bar, so recording the state is sufficient and querying
+        would raise.
+
         Args:
             new_state: The new agent state.
         """
         self._state = new_state
-        self.query_one(".tile-label", Static).update(self._build_markup())
+        self._retired = False
+        self._refresh_label()
+        if not self.is_mounted or not self.children:
+            return
         self.query_one(ActivityBar).active = new_state in _BUSY_STATES
         self.has_permission = new_state == AgentState.AWAITING_PERMISSION
 
@@ -143,7 +185,7 @@ class AgentTile(Vertical):
             mode_name: Human-readable mode name, or None to clear.
         """
         self._current_mode = mode_name
-        self.query_one(".tile-label", Static).update(self._build_markup())
+        self._refresh_label()
 
     def update_usage(self, used: int, size: int, cost_text: str = "") -> None:
         """Update the tile's usage bar.
@@ -215,18 +257,22 @@ class AgentList(Vertical):
         )
 
     def add_agent_tile(
-        self, agent_id: str, *, task: str = "", parent: str | None = None
+        self,
+        agent_id: str,
+        *,
+        parent: str | None = None,
+        retired: bool = False,
     ) -> AgentTile:
         """Mount a new agent tile into the scrollable container.
 
         Args:
             agent_id: Unique agent identifier.
-            task: Optional task description.
             parent: Optional parent agent ID.
+            retired: True for an agent that handed its id to a successor.
 
         Returns:
             The newly created AgentTile.
         """
-        tile = AgentTile(agent_id, task=task, parent=parent)
+        tile = AgentTile(agent_id, parent=parent, retired=retired)
         self.query_one("#agent-list", ScrollableContainer).mount(tile)
         return tile

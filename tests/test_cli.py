@@ -14,22 +14,37 @@ from synth_acp.cli import (
     _load_config_with_agent,
     _resolve_config,
 )
+from synth_acp.models.config import (
+    GlobalConfig,
+    HarnessEntry,
+    HarnessEnvConfig,
+    RawSessionConfig,
+)
 
 
 class TestBuildTransientConfig:
     """Tests for _build_transient_config."""
 
     def test_build_transient_config_returns_tuple_with_correct_agent(self) -> None:
-        """Transient config must return (SessionConfig, AgentConfig) with correct harness and absolute cwd."""
+        """Transient config must return (SessionConfig, AgentConfig) with correct harness, absolute cwd, and the global on_mcp_message hook passed through."""
         from synth_acp.models.agent import AgentConfig
-        from synth_acp.models.config import GlobalConfig, SessionConfig
+        from synth_acp.models.config import (
+            GlobalConfig,
+            GlobalHooksConfig,
+            McpMessageHook,
+            SessionConfig,
+        )
 
-        config, agent = _build_transient_config("kiro", None, None, GlobalConfig())
+        global_hook = McpMessageHook(active=False, template="X {from_agent}: ")
+        global_cfg = GlobalConfig(hooks=GlobalHooksConfig(on_mcp_message=global_hook))
+        config, agent = _build_transient_config("kiro", None, None, global_cfg)
         assert isinstance(config, SessionConfig)
         assert isinstance(agent, AgentConfig)
         assert agent.harness == "kiro"
         assert agent.cwd != "."
         assert Path(agent.cwd).is_absolute()
+        # no-.synth.json path must carry the exact global hook, not the model default
+        assert config.settings.hooks.on_mcp_message == global_hook
 
 
 class TestLoadConfigWithAgent:
@@ -102,9 +117,11 @@ class TestConfigList:
         assert "default_agent_mode" in result.output
         assert "communication_mode" in result.output
         assert "auto_approve_tools" in result.output
+        assert "messages_interrupt" in result.output
         assert "on_agent_startup" in result.output
         assert "on_agent_join" in result.output
         assert "on_agent_exit" in result.output
+        assert "  on_mcp_message: active=True" in result.output
 
 
 class TestConfigSet:
@@ -165,6 +182,44 @@ class TestConfigSet:
         assert result.exit_code == 0
         cfg = config_mod.load_global_config()
         assert cfg.auto_approve_tools == ["synth-mcp/send_message", "synth-mcp/list_agents"]
+
+    def test_config_set_messages_interrupt_persists_bool(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Silent failure: without a bool branch the value persists as the string
+        'false', which is truthy, so steering stays on after the user turns it off."""
+        from typer.testing import CliRunner
+
+        import synth_acp.models.config as config_mod
+        from synth_acp.cli import app
+
+        monkeypatch.setattr(config_mod, "SYNTH_DIR", tmp_path)
+        monkeypatch.setattr(config_mod, "GLOBAL_CONFIG_PATH", tmp_path / "config.json")
+        runner = CliRunner()
+
+        assert runner.invoke(app, ["config", "set", "messages_interrupt", "false"]).exit_code == 0
+        assert config_mod.load_global_config().messages_interrupt is False
+
+        assert runner.invoke(app, ["config", "set", "messages_interrupt", "true"]).exit_code == 0
+        assert config_mod.load_global_config().messages_interrupt is True
+
+    def test_config_set_messages_interrupt_rejects_non_bool(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unparseable value must fail loudly rather than silently picking a side."""
+        from typer.testing import CliRunner
+
+        import synth_acp.models.config as config_mod
+        from synth_acp.cli import app
+
+        monkeypatch.setattr(config_mod, "SYNTH_DIR", tmp_path)
+        monkeypatch.setattr(config_mod, "GLOBAL_CONFIG_PATH", tmp_path / "config.json")
+        runner = CliRunner()
+        runner.invoke(app, ["config", "set", "messages_interrupt", "false"])
+
+        result = runner.invoke(app, ["config", "set", "messages_interrupt", "maybe"])
+        assert result.exit_code == 1
+        assert config_mod.load_global_config().messages_interrupt is False
 
     def test_config_set_unknown_key_exits(self) -> None:
         from typer.testing import CliRunner
@@ -257,6 +312,34 @@ class TestApplyGlobalSettings:
         result = _apply_global_settings(raw, global_cfg)
         assert result.settings.communication_mode == CommunicationMode.LOCAL
 
+    def test_apply_global_settings_messages_interrupt_project_wins(self) -> None:
+        from synth_acp.models.config import (
+            GlobalConfig,
+            RawSessionConfig,
+            RawSettingsConfig,
+        )
+
+        raw = RawSessionConfig(
+            project="test",
+            settings=RawSettingsConfig(messages_interrupt=False),
+        )
+        global_cfg = GlobalConfig(messages_interrupt=True)
+        result = _apply_global_settings(raw, global_cfg)
+        assert result.settings.messages_interrupt is False
+
+    def test_apply_global_settings_messages_interrupt_falls_through_to_global(self) -> None:
+        """Unset in .synth.json, the global value must survive resolution."""
+        from synth_acp.models.config import (
+            GlobalConfig,
+            RawSessionConfig,
+            RawSettingsConfig,
+        )
+
+        raw = RawSessionConfig(project="test", settings=RawSettingsConfig())
+        global_cfg = GlobalConfig(messages_interrupt=False)
+        result = _apply_global_settings(raw, global_cfg)
+        assert result.settings.messages_interrupt is False
+
     def test_apply_global_settings_hooks_merge_default_uses_global(self) -> None:
         from synth_acp.models.config import (
             GlobalConfig,
@@ -276,6 +359,43 @@ class TestApplyGlobalSettings:
         )
         result = _apply_global_settings(raw, global_cfg)
         assert result.settings.hooks.on_agent_join == global_join
+
+    def test_apply_global_settings_on_mcp_message_project_present_wins(self) -> None:
+        """Explicit project on_mcp_message overrides global even when it collides with the default."""
+        from synth_acp.models.config import (
+            GlobalConfig,
+            GlobalHooksConfig,
+            McpMessageHook,
+            RawSessionConfig,
+        )
+
+        global_cfg = GlobalConfig(
+            hooks=GlobalHooksConfig(on_mcp_message=McpMessageHook(active=False)),
+        )
+        raw = RawSessionConfig.model_validate(
+            {"project": "t", "settings": {"hooks": {"on_mcp_message": {"active": True}}}}
+        )
+        result = _apply_global_settings(raw, global_cfg)
+        assert result.settings.hooks.on_mcp_message.active is True
+
+    def test_apply_global_settings_on_mcp_message_omitted_uses_global(self) -> None:
+        """When the project hooks omit on_mcp_message, resolution falls through to global."""
+        from synth_acp.models.config import (
+            GlobalConfig,
+            GlobalHooksConfig,
+            McpMessageHook,
+            RawSessionConfig,
+        )
+
+        global_cfg = GlobalConfig(
+            hooks=GlobalHooksConfig(on_mcp_message=McpMessageHook(active=False)),
+        )
+        # Real JSON path: hooks present with a different hook, on_mcp_message omitted.
+        raw = RawSessionConfig.model_validate(
+            {"project": "t", "settings": {"hooks": {"on_agent_join": {"template": "hi"}}}}
+        )
+        result = _apply_global_settings(raw, global_cfg)
+        assert result.settings.hooks.on_mcp_message.active is False
 
 
 class TestResolveConfig:
@@ -563,3 +683,343 @@ class TestSelectAgent:
         runner = CliRunner()
         result = runner.invoke(app, ["--select-agent"])
         assert result.exit_code == 0
+
+
+class TestMaintenanceExpire:
+    """Tests for the synth maintenance expire command.
+
+    Every test points SYNTH_DB_PATH at tmp_path, so none can open the real
+    database.  TTY versus non-TTY is selected by patching cli._is_interactive,
+    because Click's CliRunner replaces sys.stdin during invoke.
+    """
+
+    OLD_MS = 1_700_000_000_000  # far older than any retention window
+
+    @staticmethod
+    def _seed(db_path: Path, *, legacy_embeddings: bool = False) -> None:
+        """Create a database with one long-dead session and one fresh session."""
+        import sqlite3
+        import time
+
+        from synth_acp.db import SCHEMA, ensure_schema_sync
+
+        conn = sqlite3.connect(str(db_path))
+        if legacy_embeddings:
+            conn.executescript(SCHEMA)
+            conn.executescript(
+                "CREATE TABLE session_embeddings ("
+                " session_id TEXT PRIMARY KEY, text_hash TEXT NOT NULL,"
+                " embedding BLOB NOT NULL, created_at INTEGER NOT NULL);"
+            )
+            conn.execute(
+                "INSERT INTO session_embeddings (session_id, text_hash, embedding, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("dead", "h", b"\x00" * 8, TestMaintenanceExpire.OLD_MS),
+            )
+        else:
+            ensure_schema_sync(conn)
+
+        fresh_ms = int(time.time() * 1000)
+        for session_id, ts in (("dead", TestMaintenanceExpire.OLD_MS), ("live", fresh_ms)):
+            conn.execute(
+                "INSERT INTO agents (agent_id, session_id, status, registered) VALUES (?, ?, ?, ?)",
+                (f"{session_id}-a1", session_id, "inactive", ts),
+            )
+            conn.execute(
+                "INSERT INTO ui_events (session_id, agent_id, seq, event_type, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, f"{session_id}-a1", 0, "chunk", "{}", ts),
+            )
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def _ui_event_sessions(db_path: Path) -> set[str]:
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return {row[0] for row in conn.execute("SELECT DISTINCT session_id FROM ui_events")}
+        finally:
+            conn.close()
+
+    @pytest.fixture
+    def db(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        db_path = tmp_path / "synth-test.db"
+        monkeypatch.setenv("SYNTH_DB_PATH", str(db_path))
+        self._seed(db_path)
+        return db_path
+
+    def test_previews_by_default_and_ignores_yes(self, db: Path) -> None:
+        """The default invocation, with or without --yes, must delete nothing."""
+        from typer.testing import CliRunner
+
+        from synth_acp.cli import app
+
+        runner = CliRunner()
+        for args in (["maintenance", "expire"], ["maintenance", "expire", "--yes"]):
+            result = runner.invoke(app, args)
+            assert result.exit_code == 0
+            assert "Would delete" in result.output
+            assert self._ui_event_sessions(db) == {"dead", "live"}
+
+    def test_execute_interactive_prompts_before_deleting(
+        self, db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The prompt must be real: confirming deletes, declining does not."""
+        from typer.testing import CliRunner
+
+        import synth_acp.cli as cli_module
+        from synth_acp.cli import app
+
+        monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
+        runner = CliRunner()
+
+        declined = runner.invoke(app, ["maintenance", "expire", "--execute"], input="n\n")
+        assert declined.exit_code == 0
+        assert self._ui_event_sessions(db) == {"dead", "live"}
+
+        confirmed = runner.invoke(app, ["maintenance", "expire", "--execute"], input="y\n")
+        assert confirmed.exit_code == 0
+        assert "Permanently delete 1 session(s)?" in confirmed.output
+        assert self._ui_event_sessions(db) == {"live"}
+
+    def test_execute_interactive_with_yes_deletes_without_prompting(
+        self, db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--yes must not block on a prompt."""
+        from typer.testing import CliRunner
+
+        import synth_acp.cli as cli_module
+        from synth_acp.cli import app
+
+        monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
+        result = CliRunner().invoke(app, ["maintenance", "expire", "--execute", "--yes"])
+
+        assert result.exit_code == 0
+        assert "Permanently delete" not in result.output
+        assert self._ui_event_sessions(db) == {"live"}
+
+    def test_execute_non_tty_without_yes_refuses(
+        self, db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A piped or scheduled invocation must not be able to delete."""
+        from typer.testing import CliRunner
+
+        import synth_acp.cli as cli_module
+        from synth_acp.cli import app
+
+        monkeypatch.setattr(cli_module, "_is_interactive", lambda: False)
+        result = CliRunner().invoke(app, ["maintenance", "expire", "--execute"])
+
+        assert result.exit_code != 0
+        assert self._ui_event_sessions(db) == {"dead", "live"}
+
+    def test_execute_non_tty_with_yes_deletes(
+        self, db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deliberate two-flag automation path must work."""
+        from typer.testing import CliRunner
+
+        import synth_acp.cli as cli_module
+        from synth_acp.cli import app
+
+        monkeypatch.setattr(cli_module, "_is_interactive", lambda: False)
+        result = CliRunner().invoke(app, ["maintenance", "expire", "--execute", "--yes"])
+
+        assert result.exit_code == 0
+        assert "Deleted" in result.output
+        assert self._ui_event_sessions(db) == {"live"}
+
+    @pytest.mark.parametrize("bad_days", ["0", "-1"])
+    def test_invalid_days_rejected_before_database_opened(
+        self, db: Path, monkeypatch: pytest.MonkeyPatch, bad_days: str
+    ) -> None:
+        """days < 1 must be rejected by typer before any connection exists."""
+        from unittest.mock import MagicMock
+
+        from typer.testing import CliRunner
+
+        import synth_acp.cli as cli_module
+        from synth_acp.cli import app
+
+        connect = MagicMock()
+        monkeypatch.setattr(cli_module.sqlite3, "connect", connect)
+        monkeypatch.setattr(cli_module, "_is_interactive", lambda: False)
+
+        result = CliRunner().invoke(
+            app, ["maintenance", "expire", "--days", bad_days, "--execute", "--yes"]
+        )
+
+        assert result.exit_code != 0
+        connect.assert_not_called()
+
+    def test_exits_zero_on_empty_report(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing to expire is success, not failure."""
+        import sqlite3
+
+        from typer.testing import CliRunner
+
+        from synth_acp.cli import app
+        from synth_acp.db import ensure_schema_sync
+
+        db_path = tmp_path / "empty.db"
+        conn = sqlite3.connect(str(db_path))
+        ensure_schema_sync(conn)
+        conn.close()
+        monkeypatch.setenv("SYNTH_DB_PATH", str(db_path))
+
+        result = CliRunner().invoke(app, ["maintenance", "expire"])
+
+        assert result.exit_code == 0
+        assert "sessions:       0" in result.output
+
+    def test_exits_nonzero_on_unreadable_database(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A corrupt database must not be reported as a successful retention run."""
+        from typer.testing import CliRunner
+
+        from synth_acp.cli import app
+
+        db_path = tmp_path / "corrupt.db"
+        db_path.write_bytes(b"this is not a database")
+        monkeypatch.setenv("SYNTH_DB_PATH", str(db_path))
+
+        result = CliRunner().invoke(app, ["maintenance", "expire"])
+
+        assert result.exit_code != 0
+        assert "Retention failed" in result.output
+
+    def test_preview_on_legacy_embeddings_schema_deletes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A preview must not run the migration that DROPs legacy session_embeddings."""
+        import sqlite3
+
+        from typer.testing import CliRunner
+
+        from synth_acp.cli import app
+
+        db_path = tmp_path / "legacy.db"
+        monkeypatch.setenv("SYNTH_DB_PATH", str(db_path))
+        self._seed(db_path, legacy_embeddings=True)
+
+        result = CliRunner().invoke(app, ["maintenance", "expire"])
+
+        assert result.exit_code == 0
+        conn = sqlite3.connect(str(db_path))
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM session_embeddings").fetchone()[0] == 1
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(session_embeddings)")}
+        finally:
+            conn.close()
+        assert cols == {"session_id", "text_hash", "embedding", "created_at"}
+
+    def test_db_path_prefers_env_over_home_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without the override the path is home-relative; home is redirected so
+        this test cannot even name the developer's real database."""
+        from synth_acp.cli import _maintenance_db_path
+
+        monkeypatch.setenv("SYNTH_DB_PATH", str(tmp_path / "explicit.db"))
+        assert _maintenance_db_path() == tmp_path / "explicit.db"
+
+        monkeypatch.delenv("SYNTH_DB_PATH")
+        monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+        assert _maintenance_db_path() == tmp_path / ".synth" / "synth.db"
+
+    def test_missing_database_is_not_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A preview must not create the database file it was asked to inspect."""
+        from typer.testing import CliRunner
+
+        from synth_acp.cli import app
+
+        db_path = tmp_path / "absent.db"
+        monkeypatch.setenv("SYNTH_DB_PATH", str(db_path))
+
+        result = CliRunner().invoke(app, ["maintenance", "expire"])
+
+        assert result.exit_code == 0
+        assert not db_path.exists()
+
+
+class TestHarnessEnvWiring:
+    """harness_env must survive the trip from config file to resolved SessionConfig.
+
+    The silent failure these guard: dropping the ``harness_env=`` keyword at either
+    SettingsConfig construction site leaves every policy behind while the config file
+    still parses and every pure-function test still passes. The harness then launches
+    with the trimmed environment and misbehaves rather than erroring, which is the
+    original defect.
+    """
+
+    def test_global_only_policy_reaches_the_transient_config(self) -> None:
+        global_cfg = GlobalConfig(
+            default_harness="claude",
+            harness_env={"claude": HarnessEnvConfig(env={"CLAUDE_CODE_USE_BEDROCK": "1"})},
+        )
+        config, _agent = _build_transient_config("claude", None, None, global_cfg)
+        assert config.settings.harness_env["claude"].env == {"CLAUDE_CODE_USE_BEDROCK": "1"}
+
+    def test_global_policy_survives_a_project_config_that_sets_none(self) -> None:
+        """A .synth.json with no harness_env must not erase the global block."""
+        global_cfg = GlobalConfig(
+            harness_env={"claude": HarnessEnvConfig(env={"CLAUDE_CODE_USE_BEDROCK": "1"})}
+        )
+        raw = RawSessionConfig(project="p")
+        resolved = _apply_global_settings(raw, global_cfg)
+        assert resolved.settings.harness_env["claude"].env == {"CLAUDE_CODE_USE_BEDROCK": "1"}
+
+    def test_project_policy_merges_over_global_per_variable(self) -> None:
+        global_cfg = GlobalConfig(
+            harness_env={
+                "claude": HarnessEnvConfig(
+                    env={"CLAUDE_CODE_USE_BEDROCK": "1"}, inherit=["AWS_*"]
+                )
+            }
+        )
+        raw = RawSessionConfig.model_validate(
+            {"project": "p", "settings": {"harness_env": {"claude": {"env": {"ANTHROPIC_MODEL": "opus"}}}}}
+        )
+        resolved = _apply_global_settings(raw, global_cfg)
+        policy = resolved.settings.harness_env["claude"]
+        assert policy.env == {"CLAUDE_CODE_USE_BEDROCK": "1", "ANTHROPIC_MODEL": "opus"}
+        assert policy.inherit == ["AWS_*"]
+
+
+class TestDetectRequiresTheSpawnedProgram:
+    """Auto-detect must not offer a harness whose adaptor is absent.
+
+    Offering it produces exactly the hang this work removes: the user picks claude,
+    synth spawns a program that is not there, and nothing says so.
+    """
+
+    def _registry(self, monkeypatch: pytest.MonkeyPatch) -> HarnessEntry:
+        entry = HarnessEntry(
+            identity="split", name="Split", short_name="split",
+            binary_names=["split-tool"], run_cmd="split-adaptor",
+            install_hint="npm install -g split-adaptor",
+        )
+        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda: [entry])
+        return entry
+
+    def test_skipped_when_only_the_harness_tool_is_present(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        entry = self._registry(monkeypatch)
+        monkeypatch.setattr(
+            "shutil.which", lambda b: "/usr/bin/split-tool" if b == "split-tool" else None
+        )
+        assert _detect_installed_harnesses() == []
+        assert entry.run_cmd == "split-adaptor"
+
+    def test_offered_when_both_are_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        entry = self._registry(monkeypatch)
+        monkeypatch.setattr("shutil.which", lambda b: f"/usr/bin/{b}")
+        assert _detect_installed_harnesses() == [(entry, "/usr/bin/split-tool")]

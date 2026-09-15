@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+import importlib
+import inspect
+import pathlib
 from unittest.mock import AsyncMock, MagicMock
 
 from textual.containers import VerticalScroll
@@ -12,8 +16,7 @@ from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.widgets.conversation import ConversationFeed
-from synth_acp.ui.widgets.diff_view import DiffView
-from synth_acp.ui.widgets.tool_call import ToolCallBlock, _extract_raw_output_text
+from synth_acp.ui.widgets.tool_call import DiffState, ToolCallBlock, _extract_raw_output_text
 
 
 def _make_config() -> SessionConfig:
@@ -70,23 +73,6 @@ class TestToolCallBlockContent:
             ri = block.query_one("#tc-raw-input")
             assert "$ ls" in ri.content.plain
 
-    async def test_update_content_when_diffs_appended_mounts_diff_views(self) -> None:
-        """Calling update_content with diffs twice mounts DiffViews from both calls."""
-        app = SynthApp(_make_broker(), _make_config())
-        async with app.run_test(headless=True, size=(120, 40)):
-            feed = await _get_feed(app)
-            await feed.add_tool_call(
-                "tc3", "Edit", "edit", "in_progress",
-                diffs=[ToolCallDiff("a.py", "old", "new")],
-            )
-            block = app.query_one("#tool-tc3", ToolCallBlock)
-            await feed.add_tool_call(
-                "tc3", "Edit", "edit", "in_progress",
-                diffs=[ToolCallDiff("b.py", "x", "y")],
-            )
-            diff_views = block.query(DiffView)
-            assert len(diff_views) == 2
-
     async def test_update_content_when_locations_already_rendered_does_not_duplicate(self) -> None:
         """Second update_content with locations is a no-op when already rendered."""
         app = SynthApp(_make_broker(), _make_config())
@@ -130,6 +116,107 @@ class TestToolCallBlockContent:
         assert "hello world" in text
 
 
+
+
+class TestDiffWorkState:
+    """The single-flight diff work state that the feed's executor drains."""
+
+    @staticmethod
+    def _block() -> ToolCallBlock:
+        return ToolCallBlock("tc", "Edit", "edit", "in_progress")
+
+    def test_schedule_diffs_is_single_flight(self) -> None:
+        """Redelivery must not duplicate work; a distinct diff must always enqueue.
+
+        Silent failure: duplicate queued work runs the ~186ms highlight twice and mounts
+        two identical DiffViews, which reads as a rendering quirk.
+        """
+        block = self._block()
+        diff = ToolCallDiff("a.py", "old", "new")
+
+        for state in (DiffState.QUEUED, DiffState.RENDERING, DiffState.RENDERED):
+            block._diff_states.clear()
+            block.schedule_diffs([diff])
+            record = next(iter(block._diff_states.values()))
+            record.state = state
+
+            block.schedule_diffs([diff])
+
+            assert len(block._diff_states) == 1
+            assert record.state is state
+
+        block.schedule_diffs([ToolCallDiff("a.py", "old", "different")])
+        assert len(block._diff_states) == 2
+
+    def test_failed_diff_retries_once_then_stops(self) -> None:
+        """A failed diff gets exactly one retry.
+
+        Silent failure: unbounded retry burns the highlight cost on every subsequent
+        update for a diff that can never render.
+        """
+        block = self._block()
+        diff = ToolCallDiff("a.py", "old", "new")
+        block.schedule_diffs([diff])
+        record = next(iter(block._diff_states.values()))
+
+        record.state = DiffState.FAILED
+        record.attempts = 1
+        block.schedule_diffs([diff])
+        assert record.state is DiffState.QUEUED
+
+        record.state = DiffState.FAILED
+        record.attempts = 2
+        block.schedule_diffs([diff])
+        assert record.state is DiffState.FAILED
+
+    def test_release_claim_only_affects_rendering_records(self) -> None:
+        """Release returns a claim for redelivery, and leaves other states alone.
+
+        Silent failure: a key left RENDERING after a cancelled worker can never be
+        reclaimed, because redelivery of a RENDERING key is a no-op — the diff silently
+        never renders and nothing reports an error.
+        """
+        block = self._block()
+        block.schedule_diffs([ToolCallDiff("a.py", "old", "new")])
+        key, record = block.claim_next_diff()  # type: ignore[misc]
+
+        block.release_claim(key)
+        assert record.state is DiffState.QUEUED
+
+        for state in (DiffState.RENDERED, DiffState.FAILED):
+            record.state = state
+            block.release_claim(key)
+            assert record.state is state
+
+    def test_entry_paths_never_prepare(self) -> None:
+        """No synchronous entry path may construct or prepare a DiffView.
+
+        Silent failure: reinstating `await prepare()` on the pump path restores the 186ms
+        stall while every behavioural test still passes, because the diff still appears.
+        Covers ConversationFeed.add_tool_call too — that is the FIRST-event path the phase
+        evidence identifies as unprepared today.
+        """
+        targets = {
+            "synth_acp.ui.widgets.tool_call": {"compose", "update_content"},
+            "synth_acp.ui.widgets.conversation": {"add_tool_call"},
+        }
+        checked: set[str] = set()
+        for module_name, names in targets.items():
+            module = importlib.import_module(module_name)
+            tree = ast.parse(pathlib.Path(inspect.getfile(module)).read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.name not in names:
+                    continue
+                checked.add(node.name)
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call):
+                        name = getattr(inner.func, "attr", None) or getattr(inner.func, "id", None)
+                        assert name != "prepare", f"{node.name} awaits prepare()"
+                        assert name != "DiffView", f"{node.name} constructs a DiffView"
+
+        assert checked == {"compose", "update_content", "add_tool_call"}
 
 
 class TestToolCallBlockNested:
@@ -181,6 +268,6 @@ class TestToolCallBlockNested:
             assert parent_block._nested_section is not None
             preview = parent_block._nested_section.query_one("#es-preview", Static)
             assert "2 tool calls" in str(preview.content)
-            from synth_acp.ui.widgets.gradient_bar import ActivityBar
-            bar = parent_block._nested_section.query_one(".es-activity", ActivityBar)
-            assert bar.active is False
+            # `_activity_bar` is authoritative and cleared synchronously; the DOM removal
+            # it schedules settles a frame later.
+            assert parent_block._nested_section._activity_bar is None

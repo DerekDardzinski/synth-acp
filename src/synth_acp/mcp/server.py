@@ -14,8 +14,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from synth_acp.db import ensure_schema_sync
-from synth_acp.models.visibility import get_visible_agents
+from synth_acp.db import configure_connection, ensure_schema_sync
+from synth_acp.models.visibility import get_resurrectable_agents, get_visible_agents
 
 type NotifyFn = Callable[[], Awaitable[None]]
 
@@ -47,7 +47,7 @@ def create_mcp_server(
 
         def _run() -> Any:
             with closing(sqlite3.connect(db_path)) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
+                configure_connection(conn)
                 if do_init:
                     ensure_schema_sync(conn)
                 return fn(conn)
@@ -142,7 +142,9 @@ def create_mcp_server(
             agent_id: Name for the new agent. Must be unique within the session:
                 launching with the id of any existing agent — including a terminated
                 one — is rejected ("Agent already exists"). To bring a terminated
-                agent back, use resurrect_agent, not launch_agent.
+                agent back, use resurrect_agent. An id is also reused when an agent
+                hands itself off, but only through the handoff tool, which the agent
+                calls on itself; launch_agent can never take over an existing id.
             harness: Runtime to use: 'kiro', 'claude', 'opencode', etc.
             message: Initial prompt sent to the agent once it becomes idle. Include
                 explicit instructions to report back using send_message. Example:
@@ -221,7 +223,8 @@ def create_mcp_server(
     async def terminate_agent(target_agent_id: str) -> str:
         """Terminate a child agent you previously launched. Its id stays reserved
         for the session; bring the agent back later with resurrect_agent
-        (launch_agent cannot reuse the id).
+        (launch_agent cannot reuse the id). The one other way an id changes hands is
+        the handoff tool, which an agent calls on itself.
 
         Args:
             target_agent_id: ID of the child agent to terminate.
@@ -247,9 +250,21 @@ def create_mcp_server(
     async def resurrect_agent(target_agent_id: str) -> str:
         """Resurrect a previously terminated agent, restoring its conversation history.
 
-        This is the only way to bring back a terminated agent — launch_agent rejects
-        a reused id. Resurrection restores the agent with its prior conversation
-        history intact.
+        Use this for an agent that was terminated — launch_agent rejects a reused id.
+        Resurrection restores the agent with its prior conversation history intact.
+
+        You may resurrect two kinds of agent: one you LAUNCHED, and any past self that
+        handed off to the id you now hold. Call list_agents to see both — every entry
+        whose status is not "active" is one you are authorized to bring back.
+
+        To wake the past self that handed off to you, pass the "retired" entry whose
+        lineage_of is your own id and whose generations_back is 1. Larger
+        generations_back values are earlier selves, and you can wake those too. Do not
+        pass your own bare id; a retired self is always the suffixed
+        ``<original-id>.h<8 hex>`` form.
+
+        A resurrected predecessor runs alongside you and reclaims nothing — see the
+        handoff tool for what that means.
 
         Args:
             target_agent_id: ID of the terminated agent to resurrect.
@@ -290,35 +305,159 @@ def create_mcp_server(
         return json.dumps({"ok": True, "agent_id": target_agent_id})
 
     @mcp.tool()
+    async def handoff(handoff_message: str) -> str:
+        """Hand your work to a fresh instance of YOURSELF, keeping your agent id.
+
+        Call this when your context window is filling up. Synth stops you, starts a brand
+        new session that takes over your agent_id, and gives it your handoff message as
+        its opening prompt. From every other agent's point of view nothing happened: your
+        parent and your children keep addressing the same id and are NOT notified.
+
+        THE HANDOFF MESSAGE IS THE ONLY THING YOUR SUCCESSOR INHERITS. It starts with an
+        empty transcript and cannot see your conversation, your tool output, or anything
+        you were told. Write it as a complete briefing: what the task is, what you have
+        already done, what you learned that is not obvious from the code, what is left,
+        and anything you were about to do next.
+
+        You are retired under a suffixed id (``<your-id>.h<8 hex>``) which keeps your full
+        transcript. YOUR SUCCESSOR CAN BRING YOU BACK: whoever holds your id may call
+        resurrect_agent on you, so the fresh session can wake you to ask what you meant.
+        It finds you in list_agents as a "retired" entry with generations_back 1.
+
+        A resurrected predecessor runs ALONGSIDE the successor that replaced it. It keeps
+        its transcript and its own id, and it reclaims nothing: the children it launched
+        stay with the successor, and the successor is neither paused nor notified. The two
+        can message each other. Wake a predecessor to ask it questions, not to resume its
+        work — two live agents prompted on one task duplicate it.
+
+        Args:
+            handoff_message: The complete briefing for your successor.
+
+        Returns:
+            {"accepted": true, "command_id": int} as soon as the request is durably
+            recorded. This reports ACCEPTANCE, not completion: carrying out the handoff
+            kills the process group this tool call is running in, so no completion
+            response could reach you. Do not wait for one, and do not call this twice.
+        """
+        def _sync(conn: sqlite3.Connection) -> int:
+            _ensure_registered(conn)
+            now = int(time.time() * 1000)
+            payload = json.dumps(
+                {"agent_id": _caller_id, "handoff_message": handoff_message}
+            )
+            cursor = conn.execute(
+                "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) VALUES (?, ?, 'handoff', ?, 'pending', ?)",
+                (session_id, _caller_id, payload, now),
+            )
+            conn.commit()
+            assert cursor.lastrowid is not None
+            return cursor.lastrowid
+
+        cmd_id = await _db_op(_sync)
+        await notify()
+        return json.dumps({"accepted": True, "command_id": cmd_id})
+
+    @mcp.tool()
     async def list_agents() -> str:
-        """List all agents visible to you in this session.
+        """List the agents visible to you, plus the ones you could bring back.
 
         Returns:
             JSON array of agent objects, each with: agent_id (str), status (str),
-            parent (str|null — the agent that launched it), task (str|null), and
-            is_self (bool). Only agents currently visible to you are included.
+            parent (str|null — the agent that launched it), task (str|null),
+            is_self (bool), resurrectable (bool), lineage_of (str|null) and
+            generations_back (int|null).
+
+            status is "active" for a live agent, "retired" for a past self that handed
+            off, and "terminated" for an agent that was terminated.
+
+            resurrectable says whether YOU may pass this agent to resurrect_agent. It is
+            not implied by status: an inactive agent can be visible to you because it is
+            your parent while still being outside your authority to revive, so check this
+            field rather than assuming every non-active entry is revivable.
+
+            lineage_of names the id whose lineage an entry belongs to, and is set on any
+            agent that once handed off — including one you have already resurrected, which
+            is active again but still a past self of that id. It is not always you: you
+            also see the retired predecessors of agents you launched.
+
+            generations_back is set only on "retired" entries, because it orders revival
+            candidates. Within one lineage_of, 1 is the direct predecessor and 2 is the one
+            before it. A resurrected predecessor keeps its lineage_of but reports
+            generations_back null, since it is no longer a candidate.
+
+            Entries are ordered: yourself, then live agents, then inactive ones most
+            recently retired first.
         """
         def _sync(conn: sqlite3.Connection) -> str:
             _ensure_registered(conn)
             visible = get_visible_agents(conn, agent_id, session_id, communication_mode)
             all_ids = [*visible, agent_id]
             rows = conn.execute(
-                "SELECT agent_id, status, parent, task FROM agents WHERE session_id = ? AND agent_id IN ({})".format(
+                "SELECT agent_id, status, parent, task, retired_from FROM agents "
+                "WHERE session_id = ? AND agent_id IN ({})".format(
                     ",".join("?" * len(all_ids))
                 ),
                 (session_id, *all_ids),
             ).fetchall()
-            agents = [
-                {
-                    "agent_id": r[0],
-                    "status": r[1],
-                    "parent": r[2],
-                    "task": r[3],
-                    "is_self": r[0] == agent_id,
+
+            def entry(
+                aid: str,
+                status: str,
+                parent: str | None,
+                task: str | None,
+                retired_from: str | None,
+            ) -> dict:
+                # LOCAL visibility adds `parent` with no status filter, so a row from the
+                # visible set is not necessarily active and gets the same three-way
+                # mapping as a resurrectable one.
+                if status == "active":
+                    shown = "active"
+                else:
+                    shown = "retired" if retired_from else "terminated"
+                return {
+                    "agent_id": aid,
+                    "status": shown,
+                    "parent": parent,
+                    "task": task,
+                    "is_self": aid == agent_id,
+                    # False by default.  A row arriving through the visible set has not
+                    # been authorization-checked, and LOCAL adds `parent` with no status
+                    # filter, so an inactive parent outside this caller's authority lands
+                    # here.  Only the resurrectable pass below may set this true.
+                    "resurrectable": False,
+                    "lineage_of": retired_from,
+                    "generations_back": None,
                 }
-                for r in rows
-            ]
-            return json.dumps(agents)
+
+            by_id: dict[str, dict] = {
+                r[0]: entry(r[0], r[1], r[2], r[3], r[4]) for r in rows
+            }
+            live = sorted(by_id.values(), key=lambda a: (not a["is_self"], a["agent_id"]))
+
+            # get_resurrectable_agents already returns newest-retired first, so the
+            # counter below assigns generations_back in retirement order.  It is scoped
+            # per lineage because one caller can see predecessors of several lineages:
+            # its own, and those of the agents it launched.
+            seen_per_lineage: dict[str, int] = {}
+            dead = []
+            for aid, parent, task, retired_from, _retired_at in get_resurrectable_agents(
+                conn, agent_id, session_id
+            ):
+                row = entry(aid, "inactive", parent, task, retired_from)
+                row["resurrectable"] = True
+                if retired_from:
+                    n = seen_per_lineage.get(retired_from, 0) + 1
+                    seen_per_lineage[retired_from] = n
+                    row["generations_back"] = n
+                # An inactive agent reachable BOTH as a visible parent and as a
+                # resurrectable row is one agent, not two.  Updating the existing dict in
+                # place keeps its position in `live`, which holds the same objects.
+                existing = by_id.get(aid)
+                if existing is not None:
+                    existing.update(row)
+                    continue
+                dead.append(row)
+            return json.dumps([*live, *dead])
 
         return await _db_op(_sync)
 

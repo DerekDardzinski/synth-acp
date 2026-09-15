@@ -71,10 +71,14 @@ Created automatically on first run. Stores personal defaults:
   "default_agent_mode": null,
   "communication_mode": "LOCAL",
   "auto_approve_tools": ["synth-mcp"],
+  "messages_interrupt": true,
+  "handoff_nudge": true,
+  "handoff_nudge_threshold": 0.5,
   "hooks": {
     "on_agent_startup": { "active": true },
     "on_agent_join": { "active": false, "recipients": "parent", "template": "Agent \"{agent_id}\" is now active. Task: \"{task}\".", "kind": "system" },
-    "on_agent_exit": { "active": false, "recipients": "parent", "template": "Agent \"{agent_id}\" has exited.", "kind": "system" }
+    "on_agent_exit": { "active": false, "recipients": "parent", "template": "Agent \"{agent_id}\" has exited.", "kind": "system" },
+    "on_mcp_message": { "active": true, "template": "[{message_type} from {from_agent}]: ", "system_template": "[System notification — no action required]: " }
   }
 }
 ```
@@ -89,7 +93,7 @@ synth config set auto_approve_tools "synth-mcp/send_message,synth-mcp/list_agent
 synth config path                    # Print config file path
 ```
 
-Settable keys: `default_harness`, `default_agent_id`, `default_agent_mode`, `communication_mode`, `auto_approve_tools`. Hooks are edited directly in the JSON file.
+Settable keys: `default_harness`, `default_agent_id`, `default_agent_mode`, `communication_mode`, `auto_approve_tools`, `messages_interrupt`, `handoff_nudge`, `handoff_nudge_threshold`, `handoff_nudge_template`. Hooks are edited directly in the JSON file.
 
 ## Startup Context (`~/.synth/context.md`)
 
@@ -134,6 +138,87 @@ When `.synth.json` exists, its settings override global config. Fields not set i
 |-------|---------------|-------------|
 | `communication_mode` | `"LOCAL"` | `MESH` (all agents visible) or `LOCAL` (family only) |
 | `auto_approve_tools` | `["synth-mcp"]` | Tool name patterns to auto-approve without prompting |
+| `messages_interrupt` | `true` | Deliver inter-agent messages into a running turn instead of waiting for it to end. Kiro only; other harnesses always wait for the turn to end |
+| `handoff_nudge` | `true` | Send an agent a one-time message suggesting it call `handoff` once its context window passes `handoff_nudge_threshold` |
+| `handoff_nudge_threshold` | `0.5` | Fraction of the context window that triggers the nudge. Must be greater than 0 and at most 1 |
+| `handoff_nudge_template` | see below | Nudge body. Slots: `{agent_id}`, `{used}`, `{nudge_threshold}`. `{used}` and `{nudge_threshold}` render as whole percents (e.g. `62%`) |
+| `harness_env` | `{}` | Per-harness environment policy, keyed by harness short name. See [Harness Environment](#harness-environment) |
+
+### Harness Environment
+
+Agent subprocesses inherit your environment. The ACP SDK trims it to six variables
+(`HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER`), which silently drops anything an
+internally-configured harness needs, so synth forwards the parent environment instead
+and subtracts a small denylist.
+
+This applies to **every** harness, not only claude. A harness is a program you already
+run interactively in this same shell, so handing it a smaller environment than a direct
+invocation gets is a difference you did not ask for and cannot see.
+
+Set `harness_env` in `~/.synth/config.json` at the top level, or in `.synth.json` under
+`settings`. Keys are harness short names (`claude`, `kiro`, `opencode`, `gemini`):
+
+```json
+{
+  "harness_env": {
+    "claude": {
+      "env": { "CLAUDE_CODE_USE_BEDROCK": "1", "MCP_SERVER_CONNECTION_BATCH_SIZE": "10" },
+      "inherit": "all"
+    }
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `env` | `{}` | Literal name/value pairs set on the subprocess. Applied last, so an explicit setting beats an inherited one of the same name |
+| `inherit` | `"all"` | `"all"` forwards the whole parent environment minus the denylist. A list forwards the names and glob patterns it contains, and nothing else |
+
+Two knobs rather than one because they do different jobs. `env` sets a value that is not
+in your shell to begin with. `inherit` forwards one that is, without you having to write
+a rotating or machine-specific value (a credential, a session path) into a config file.
+
+**Always dropped from the inherited set**, whatever `inherit` says: names beginning
+`npm_config_`, `npm_package_`, `npm_lifecycle_`, `npm_command`, `npm_execpath`,
+`npm_node_execpath`, `init_cwd`, `brazil_`, `envroot`, `canonical_envroot`, plus
+`LD_LIBRARY_PATH`, plus any value that begins `()` (an exported shell function).
+The prefixes are narrow on purpose: a broad `npm_` match would also take `NPM_TOKEN`
+and `NPM_AUTH_TOKEN`, which is what a private registry needs, turning an install into a
+silent 401. A name you set explicitly in `env` is honored even if a prefix denies it.
+
+Project `harness_env` merges over global **per variable**, so a project overriding one
+value does not drop the rest of that harness's block. Two `inherit` lists concatenate,
+so a project can widen; a list facing `"all"` replaces it, so a project can narrow to
+the strict posture.
+
+**Security note.** `inherit: "all"` means the agent subprocess sees every variable in
+your shell, including secrets. This matches synth's stated trust model: agents already
+run with your full OS privileges, so withholding a variable from an agent that can read
+the file it came from buys nothing. On a shared host, in CI, or with an agent you trust
+less, set `inherit` to an explicit list.
+
+`inherit` cannot be used to withhold `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM` or
+`USER`. The ACP SDK adds those six unconditionally and a harness needs them to run at
+all, so `inherit: []` yields a child with exactly those six, not an empty environment.
+
+### Context-Window Nudge
+
+When an agent's context window passes `handoff_nudge_threshold`, synth sends that agent
+one message suggesting it call the `handoff` MCP tool and continue in a fresh session.
+The nudge fires at most once per agent per synth run. An agent that hands off gets a
+successor with an empty context, and the successor is nudgeable again in its turn.
+
+The nudge is delivered as an ordinary inter-agent message from the sender `synth`, so it
+appears in the conversation transcript exactly like any other message — mid-turn on Kiro
+(where in-turn steering is supported), or at the next idle point on other harnesses. It is
+a suggestion: the agent decides whether to act on it.
+
+Usage data comes from whatever the harness reports. Claude Code reports token counts.
+Kiro CLI reports a percentage over a proprietary notification and reports no token
+counts, so the usage bar and this threshold are accurate to one percent for Kiro agents.
+Harnesses that report no usage at all never trigger the nudge.
+
+Set `handoff_nudge` to `false` to disable it.
 
 ### Lifecycle Hooks
 
@@ -165,6 +250,18 @@ Fires when a dynamically launched agent is registered. Sends a templated message
 #### `on_agent_exit`
 
 Fires when an agent is terminated. Same fields as `on_agent_join`.
+
+#### `on_mcp_message`
+
+Fires when an MCP-delivered inter-agent message reaches a recipient. Prefixes the message body with sender attribution so the recipient knows who sent it and whom to reply to. The body is always appended verbatim — there is no `{body}` slot.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `active` | `true` | Whether to prefix delivered messages (active by default so attribution works without migration) |
+| `template` | `"[{message_type} from {from_agent}]: "` | Prefix for `chat`/`request`/`response` messages |
+| `system_template` | `"[System notification — no action required]: "` | Prefix for `system` messages (join/exit notifications) |
+
+**Allowed template slots:** `{from_agent}`, `{to_agent}`, `{kind}`, `{message_type}`. `message_type` maps `chat` → `Message`, `request` → `Request`, `response` → `Response`. Messages with `kind: "system"` use `system_template`; all other kinds use `template`. Both templates are validated at config load time — an invalid template (unknown slot, format spec, conversion, attribute/index access, or malformed braces) fails loudly rather than silently.
 
 ## Config Resolution
 
@@ -256,8 +353,9 @@ Agents communicate via a bundled MCP server (`synth-mcp`) injected into every ag
 | `terminate_agent` | Terminate a child agent you previously launched |
 | `resurrect_agent` | Resurrect a previously terminated agent |
 | `get_my_context` | Get your identity, parent, task, and communication rules |
+| `handoff` | Retire yourself and hand your work to a fresh session that keeps your agent id |
 
-Messages are delivered to idle agents between turns. Message kinds (`chat`, `request`, `response`) are formatted distinctly on delivery so agents can distinguish requests from responses.
+Messages are delivered to idle agents between turns. MCP-delivered inter-agent messages are prefixed with sender attribution via the configurable `on_mcp_message` hook (active by default), so recipients can see who sent a message and whom to reply to; `system` messages (join/exit notifications) use a no-action wrapper instead. Message bodies are always preserved unchanged.
 
 ## Key Bindings
 
@@ -271,6 +369,13 @@ Messages are delivered to idle agents between turns. Message kinds (`chat`, `req
 | `q` | Quit |
 
 ## Development
+
+The repo pins CPython 3.12 via `.python-version`, so `uv sync` creates a 3.12
+virtualenv. `requires-python` stays `>=3.12` — synth runs on newer interpreters — but
+development and performance work should use the pinned version. CPython 3.13 replaced
+the three-generation garbage collector with an incremental one, which changes both GC
+pause timings and the generation numbers reported to `gc.callbacks`, so an unpinned
+checkout produces performance numbers that cannot be compared against another.
 
 ```bash
 uv sync                                          # Install dependencies

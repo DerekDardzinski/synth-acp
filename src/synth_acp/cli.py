@@ -7,12 +7,20 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import sys
 import threading
+from contextlib import closing
 from pathlib import Path
 
 import typer
 
+from synth_acp.db import (
+    RETENTION_DAYS,
+    ExpiryReport,
+    configure_connection,
+    expire_old_sessions_sync,
+)
 from synth_acp.discovery import discover_agents
 from synth_acp.harnesses import load_harness_registry
 from synth_acp.models.agent import AgentConfig
@@ -31,7 +39,9 @@ from synth_acp.models.config import (
     find_config,
     load_config,
     load_global_config,
+    merge_harness_env,
     save_global_config,
+    validate_handoff_nudge_template,
 )
 
 log = logging.getLogger(__name__)
@@ -57,6 +67,10 @@ SETTABLE_KEYS: dict[str, str] = {
     "default_agent_mode": "Default agent mode (e.g. code, plan, chat)",
     "communication_mode": "Agent visibility mode (MESH or LOCAL)",
     "auto_approve_tools": "Comma-separated tool patterns to auto-approve",
+    "messages_interrupt": "Deliver inter-agent messages into a running turn (true or false)",
+    "handoff_nudge": "Nudge an agent to consider handoff when its context fills (true or false)",
+    "handoff_nudge_threshold": "Context-window fraction that triggers the nudge (0 < x <= 1)",
+    "handoff_nudge_template": "Nudge body. Slots: {agent_id}, {used}, {nudge_threshold}",
 }
 
 config_app = typer.Typer()
@@ -82,11 +96,17 @@ def config_list() -> None:
             display = ", ".join(val) if val else "(empty)"
         else:
             display = str(val)
+            # Only the nudge template is prose long enough to flood the terminal;
+            # every other scalar is shown in full so it can be copied exactly.
+            if key == "handoff_nudge_template" and len(display) > 60:
+                display = display[:57] + "..."
+
         print(f"  {key}: {display}  — {desc}")
     print("\nHooks:")
     print(f"  on_agent_startup: active={cfg.hooks.on_agent_startup.active}")
     print(f"  on_agent_join: active={cfg.hooks.on_agent_join.active}")
     print(f"  on_agent_exit: active={cfg.hooks.on_agent_exit.active}")
+    print(f"  on_mcp_message: active={cfg.hooks.on_mcp_message.active}")
 
 
 @config_app.command("set")
@@ -103,7 +123,7 @@ def config_set(
     ensure_synth_dir()
     cfg = load_global_config()
 
-    new_value: str | list[str] | CommunicationMode | None
+    new_value: str | list[str] | CommunicationMode | bool | float | None
     if key in ("default_harness", "default_agent_id", "default_agent_mode"):
         new_value = None if value in ("none", "null", "") else value
     elif key == "communication_mode":
@@ -113,6 +133,37 @@ def config_set(
             valid_modes = ", ".join(m.value for m in CommunicationMode)
             print(f"Invalid communication_mode '{value}'. Valid: {valid_modes}", file=sys.stderr)
             raise typer.Exit(1) from None
+    elif key in ("messages_interrupt", "handoff_nudge"):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            new_value = True
+        elif lowered in ("false", "0", "no", "off"):
+            new_value = False
+        else:
+            print(f"Invalid {key} '{value}'. Valid: true, false", file=sys.stderr)
+            raise typer.Exit(1)
+    elif key == "handoff_nudge_threshold":
+        try:
+            parsed = float(value)
+        except ValueError:
+            print(
+                f"Invalid handoff_nudge_threshold '{value}'. Expected a number.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1) from None
+        if not 0.0 < parsed <= 1.0:
+            print(
+                f"Invalid handoff_nudge_threshold '{value}'. Must be > 0 and <= 1.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        new_value = parsed
+    elif key == "handoff_nudge_template":
+        try:
+            new_value = validate_handoff_nudge_template(value)
+        except ValueError as e:
+            print(f"Invalid handoff_nudge_template: {e}", file=sys.stderr)
+            raise typer.Exit(1) from None
     else:  # auto_approve_tools
         new_value = [item.strip() for item in value.split(",")]
 
@@ -120,6 +171,109 @@ def config_set(
     save_global_config(updated)
     display = new_value if new_value is not None else "(cleared)"
     print(f"Set {key} = {display}")
+
+
+# ------------------------------------------------------------------
+# Maintenance
+# ------------------------------------------------------------------
+
+maintenance_app = typer.Typer()
+app.add_typer(maintenance_app, name="maintenance")
+
+
+def _maintenance_db_path() -> Path:
+    """Resolve the session database path, honouring SYNTH_DB_PATH."""
+    override = os.environ.get("SYNTH_DB_PATH", "")
+    if override:
+        return Path(override)
+    return Path.home() / ".synth" / "synth.db"
+
+
+def _is_interactive() -> bool:
+    """Whether stdin is a terminal.
+
+    A named seam rather than an inline isatty call: Click's CliRunner replaces
+    sys.stdin for the duration of invoke, so patching sys.stdin.isatty cannot
+    select this branch and the confirmation cases would be untestable.
+    """
+    return sys.stdin.isatty()
+
+
+def _print_expiry_report(report: ExpiryReport, *, label: str) -> None:
+    """Print row counts from an ExpiryReport.
+
+    Row counts only.  SQLite frees pages for reuse on DELETE but does not shrink
+    the file without VACUUM, so there is no bytes-reclaimed figure to report.
+    """
+    print(f"{label} (cutoff: sessions with no activity since epoch {report.cutoff_epoch})")
+    print(f"  sessions:       {report.sessions_expired}")
+    print(f"  ui_events:      {report.ui_events_deleted}")
+    print(f"  messages:       {report.messages_deleted}")
+    print(f"  agent_commands: {report.agent_commands_deleted}")
+    print(f"  embeddings:     {report.embeddings_deleted}")
+    print(f"  agents:         {report.agents_deleted}")
+
+
+@maintenance_app.command("expire")
+def maintenance_expire(
+    days: int = typer.Option(RETENTION_DAYS, min=1, help="Retention window in days. Must be >= 1."),
+    execute: bool = typer.Option(False, "--execute", help="Actually delete. Default is preview."),
+    yes: bool = typer.Option(False, "--yes", help="Skip confirmation. Only meaningful with --execute."),
+) -> None:
+    """Preview or perform session retention. DEFAULT IS PREVIEW.
+
+    A session's age is its last update: the newest row across ui_events,
+    messages, agent_commands and agents.
+
+    Flag interaction, exhaustively:
+      no --execute                   -> preview only, deletes nothing; --yes ignored
+      --execute, TTY                 -> print preview, require interactive typed confirmation
+      --execute, TTY, --yes          -> print preview, delete without prompting
+      --execute, non-TTY, no --yes   -> REFUSE, exit non-zero; a script cannot delete by accident
+      --execute, non-TTY, --yes      -> delete; deliberate automation path requiring two flags
+
+    `days` is validated >= 1 by typer BEFORE the database is opened, so --days 0
+    or a negative value cannot select essentially every session on the only
+    destructive path.
+
+    Prints the ExpiryReport. Exits zero on an empty report, non-zero on failure.
+    """
+    # Refuse before opening the database: a script must not delete by accident.
+    if execute and not yes and not _is_interactive():
+        print(
+            "Refusing to --execute without a terminal. Pass --yes to delete non-interactively.",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+
+    db_path = _maintenance_db_path()
+    if not db_path.exists():
+        print(f"No database at {db_path}; nothing to expire.")
+        return
+
+    try:
+        # ensure_schema_sync is deliberately NOT called: its migration step drops
+        # session_embeddings on the legacy schema, so a preview could destroy
+        # rows.  expire_old_sessions_sync skips tables that do not exist instead.
+        with closing(sqlite3.connect(str(db_path))) as conn:
+            configure_connection(conn)
+            preview = expire_old_sessions_sync(conn, days=days, dry_run=True)
+            _print_expiry_report(preview, label="Would delete")
+
+            if not execute:
+                return
+
+            if not yes and not typer.confirm(
+                f"Permanently delete {preview.sessions_expired} session(s)?"
+            ):
+                print("Aborted; nothing deleted.")
+                return
+
+            deleted = expire_old_sessions_sync(conn, days=days, dry_run=False)
+            _print_expiry_report(deleted, label="Deleted")
+    except sqlite3.Error as exc:
+        print(f"Retention failed: {exc}", file=sys.stderr)
+        raise typer.Exit(1) from exc
 
 
 # ------------------------------------------------------------------
@@ -169,10 +323,16 @@ def _build_transient_config(
     settings = SettingsConfig(
         communication_mode=global_cfg.communication_mode,
         auto_approve_tools=global_cfg.auto_approve_tools,
+        messages_interrupt=global_cfg.messages_interrupt,
+        handoff_nudge=global_cfg.handoff_nudge,
+        handoff_nudge_threshold=global_cfg.handoff_nudge_threshold,
+        handoff_nudge_template=global_cfg.handoff_nudge_template,
+        harness_env=global_cfg.harness_env,
         hooks=HooksConfig(
             on_agent_startup=global_cfg.hooks.on_agent_startup,
             on_agent_join=global_cfg.hooks.on_agent_join,
             on_agent_exit=global_cfg.hooks.on_agent_exit,
+            on_mcp_message=global_cfg.hooks.on_mcp_message,
         ),
     )
     config = SessionConfig(
@@ -202,6 +362,32 @@ def _apply_global_settings(raw: RawSessionConfig, global_cfg: GlobalConfig) -> S
         if raw.settings.auto_approve_tools is not None
         else global_cfg.auto_approve_tools
     )
+    messages_interrupt = (
+        raw.settings.messages_interrupt
+        if raw.settings.messages_interrupt is not None
+        else global_cfg.messages_interrupt
+    )
+
+    handoff_nudge = (
+        raw.settings.handoff_nudge
+        if raw.settings.handoff_nudge is not None
+        else global_cfg.handoff_nudge
+    )
+    handoff_nudge_threshold = (
+        raw.settings.handoff_nudge_threshold
+        if raw.settings.handoff_nudge_threshold is not None
+        else global_cfg.handoff_nudge_threshold
+    )
+    handoff_nudge_template = (
+        raw.settings.handoff_nudge_template
+        if raw.settings.handoff_nudge_template is not None
+        else global_cfg.handoff_nudge_template
+    )
+
+    # Per harness, per variable: a project overriding one variable must not drop the
+    # rest of that harness's block.  See merge_harness_env for why this diverges from
+    # auto_approve_tools, where a project list replaces the global one wholesale.
+    harness_env = merge_harness_env(global_cfg.harness_env, raw.settings.harness_env)
 
     # Hooks merge: project default → use global, otherwise project wins
     on_startup = (
@@ -219,14 +405,27 @@ def _apply_global_settings(raw: RawSessionConfig, global_cfg: GlobalConfig) -> S
         if raw.settings.hooks.on_agent_exit == MessageHook()
         else raw.settings.hooks.on_agent_exit
     )
+    # on_mcp_message: PRESENCE-aware (not value-equality) because the default
+    # active=True collides with an explicit project active=true under equality.
+    on_mcp = (
+        raw.settings.hooks.on_mcp_message
+        if "on_mcp_message" in raw.settings.hooks.model_fields_set
+        else global_cfg.hooks.on_mcp_message
+    )
 
     settings = SettingsConfig(
         communication_mode=comm_mode,
         auto_approve_tools=auto_approve,
+        messages_interrupt=messages_interrupt,
+        handoff_nudge=handoff_nudge,
+        handoff_nudge_threshold=handoff_nudge_threshold,
+        handoff_nudge_template=handoff_nudge_template,
+        harness_env=harness_env,
         hooks=HooksConfig(
             on_agent_startup=on_startup,
             on_agent_join=on_join,
             on_agent_exit=on_exit,
+            on_mcp_message=on_mcp,
         ),
     )
     return SessionConfig(
@@ -461,6 +660,13 @@ def _detect_installed_harnesses() -> list[tuple[HarnessEntry, str]]:
     registry = load_harness_registry()
     installed: list[tuple[HarnessEntry, str]] = []
     for harness in registry:
+        # The program synth actually spawns must resolve, not just the harness's own
+        # tool.  Claude Code's ACP adaptor is a separate npm package, so without this
+        # a user with claude installed and no adaptor is offered a harness that can
+        # only hang.  For every other harness run_cmd names the same program as
+        # binary_names, making this a no-op there.
+        if not shutil.which(harness.run_cmd.split()[0]):
+            continue
         for binary in harness.binary_names:
             path = shutil.which(binary)
             if path:

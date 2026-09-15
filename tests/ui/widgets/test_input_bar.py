@@ -9,7 +9,34 @@ from acp.schema import SessionConfigOptionBoolean, SessionConfigOptionSelect
 
 from synth_acp.models.commands import SetConfigOption
 from synth_acp.ui.file_discovery import FileEntry
+from synth_acp.ui.widgets.gradient_bar import ActivityBar
 from synth_acp.ui.widgets.input_bar import InputBar, PromptTextArea, _PickerLabel, _short_path
+
+
+class TestInputBarActivityBar:
+    async def test_inactive_input_bar_activity_bar_keeps_usage_bar(self) -> None:
+        """An idle InputBar's ActivityBar must still carry its UsageBar.
+
+        Silent failure: applying ExpandableSection's lazy-bar change to the shared
+        ActivityBar blanks the input bar's static context/cost row, which no
+        ExpandableSection test observes.
+        """
+        from textual.app import App, ComposeResult
+
+        from synth_acp.ui.widgets.gradient_bar import ActivityBar, UsageBar
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield InputBar("agent-1", "agent-1", "kiro", cwd=".")
+
+        app = _App()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await pilot.pause()
+            bar = app.query_one(InputBar).query_one(ActivityBar)
+            bar.active = False
+            await pilot.pause()
+
+            assert len(bar.query(UsageBar)) == 1
 
 
 class TestShortPath:
@@ -353,6 +380,10 @@ class TestConfigOptionPickers:
         mock_app = MagicMock()
         mock_app.broker = MagicMock()
         mock_app.broker.handle = AsyncMock()
+        # Close the coroutine the real run_worker would have awaited. Without this the
+        # AsyncMock call object is never consumed and pytest reports an un-awaited-coroutine
+        # RuntimeWarning, which gets attributed to whichever test runs next.
+        mock_app.run_worker = MagicMock(side_effect=lambda coro, **_kw: coro.close())
 
         with patch.object(bar, "query_one", return_value=picker), \
              patch.object(type(bar), "app", new_callable=lambda: property(lambda _: mock_app)), \
@@ -363,3 +394,133 @@ class TestConfigOptionPickers:
         mock_app.broker.handle.assert_called_once_with(
             SetConfigOption(agent_id="test-agent", config_id="effort", value="high")
         )
+
+
+class TestApplyBusyDuringTeardown:
+    """set_busy must not raise when the bar's buttons are gone but the bar remains.
+
+    The three buttons are GRANDCHILDREN, composed inside a Horizontal, so an earlier guard
+    on `self.children` was not sufficient: the bar can hold its direct children while that
+    container's are gone. Tearing a feed down with a deferred input-bar sync queued reaches
+    that state, and query_one then raised NoMatches out of Screen._on_idle -- an UNHANDLED
+    Textual exception rather than a caught one. It surfaced only as a 1-in-4 intermittent
+    failure of an unrelated conversation test, so nothing in the suite named the real cause.
+    """
+
+    async def test_missing_buttons_do_not_raise(self) -> None:
+        from textual.app import App, ComposeResult
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield InputBar("agent-1", "agent-1", "kiro", cwd=".")
+
+        app = _App()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            bar = app.query_one(InputBar)
+            await pilot.pause()
+
+            # Exactly the teardown state: the bar is still mounted and still has direct
+            # children, while the container holding the buttons has lost its own.
+            await bar.query_one("#submit-btn").remove()
+            await pilot.pause()
+            assert bar.is_mounted
+            assert bar.children
+            assert not bar.query("#submit-btn")
+
+            # Would raise NoMatches before the fix.
+            bar.set_busy(True)
+            bar.set_busy(False)
+
+    async def test_a_partial_teardown_leaves_nothing_half_applied(self) -> None:
+        """State is all-or-none: one missing node means nothing is applied.
+
+        The consequence is a MIXED bar rather than a specific pair of buttons. With
+        #drain-btn gone, an assign-as-you-go implementation updates Submit and Cancel
+        consistently and then raises before reaching the ActivityBar, so the buttons say
+        busy while the activity indicator says idle.
+
+        The button assertions are what catch that mutation, since both buttons move before
+        the failing query. The ActivityBar assertion catches nothing on its own and is here
+        to specify the whole contract: every one of the four nodes is unchanged, not just
+        the ones an implementation happens to reach first.
+        """
+        from textual.app import App, ComposeResult
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield InputBar("agent-1", "agent-1", "kiro", cwd=".")
+
+        app = _App()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            bar = app.query_one(InputBar)
+            await pilot.pause()
+            submit_before = bar.query_one("#submit-btn").display
+            cancel_before = bar.query_one("#cancel-btn").display
+
+            # Drop only the LAST node queried, so an implementation that assigned as it
+            # went would already have toggled submit before failing.
+            await bar.query_one("#drain-btn").remove()
+            await pilot.pause()
+
+            activity_before = bar.query_one(ActivityBar).active
+
+            bar.set_busy(True)
+
+            assert bar.query_one("#submit-btn").display == submit_before
+            assert bar.query_one("#cancel-btn").display == cancel_before
+            # The node AFTER the missing one: an assign-as-you-go version never reaches it,
+            # leaving the buttons and the indicator disagreeing.
+            assert bar.query_one(ActivityBar).active == activity_before
+
+    async def test_a_healthy_bar_still_toggles(self) -> None:
+        """The guard must not swallow the normal path."""
+        from textual.app import App, ComposeResult
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield InputBar("agent-1", "agent-1", "kiro", cwd=".")
+
+        app = _App()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            bar = app.query_one(InputBar)
+            await pilot.pause()
+
+            bar.set_busy(True)
+            assert bar.query_one("#cancel-btn").display is True
+            assert bar.query_one("#submit-btn").display is False
+
+            bar.set_busy(False)
+            assert bar.query_one("#cancel-btn").display is False
+            assert bar.query_one("#submit-btn").display is True
+
+    async def test_state_recorded_before_compose_is_applied_on_mount(self) -> None:
+        """A busy/disabled state recorded before this bar composes must reach the widgets.
+
+        This is the contract set_busy's docstring has always claimed and never had. The app
+        syncs an agent's bar as soon as the FEED reports an input_bar, one level above this
+        widget's own children, so set_busy and set_disabled are routinely called first --
+        and on_mount replays them. An is_mounted guard defeated that replay, because
+        is_mounted is False while Textual runs on_mount: MEASURED before the fix, Submit and
+        Cancel were BOTH visible and the prompt was left enabled.
+
+        Nothing in the suite asserted it, which is why a guard that discarded every
+        pre-compose state passed review twice.
+        """
+        from textual.app import App, ComposeResult
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                bar = InputBar("agent-1", "agent-1", "kiro", cwd=".")
+                bar.set_busy(True)
+                bar.set_disabled(True, "waiting")
+                yield bar
+
+        app = _App()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await pilot.pause()
+            bar = app.query_one(InputBar)
+
+            assert bar.query_one("#submit-btn").display is False
+            assert bar.query_one("#cancel-btn").display is True
+            assert bar.query_one(ActivityBar).active is True
+            assert bar.query_one("#prompt-input", PromptTextArea).disabled is True

@@ -48,3 +48,18 @@ class AgentMessage(Vertical, can_focus=False):
             full_content = "".join(self._chunks)
             if full_content:
                 await self._md.update(full_content)
+
+    async def reopen(self) -> None:
+        """Undo finalize() so streaming can resume into this message.
+
+        Obtains a FRESH MarkdownStream over the EXISTING Markdown widget. The stopped
+        stream cannot be reused — ``stop()`` sets a one-way ``_stopped`` latch and a later
+        ``write`` raises. ``Markdown.update`` is NOT called: ``MarkdownStream.write`` goes
+        through ``Markdown.append``, which continues the existing document, so nothing is
+        lost and nothing is re-parsed.
+
+        Idempotent.
+        """
+        if self._stream is not None:
+            return
+        self._stream = Markdown.get_stream(self._md)

@@ -33,6 +33,48 @@ class AgentRegistry:
         self._locks.pop(agent_id, None)
         return self._sessions.pop(agent_id, None)
 
+    def rename(self, old_agent_id: str, new_agent_id: str) -> None:
+        """Move the predecessor's own per-agent entries from old to new.
+
+        SYNCHRONOUS BY CONTRACT.  Contains no await and must never gain one: being
+        synchronous is what makes the re-key atomic under asyncio, because without a
+        yield point no other coroutine can observe a partially re-keyed registry.
+
+        Moves the KEY old_agent_id to new_agent_id in _sessions, _parents, _harnesses,
+        _initial_messages and _usage.  The _usage value is a frozen event and is rebuilt
+        with model_copy(update=...), not mutated.
+
+        Does NOT rewrite any _parents VALUE.  A value is a live parent pointer: a child
+        whose parent is old_agent_id must keep pointing at old_agent_id, because that id
+        now denotes the successor and agents.parent in SQLite still says so.  Rewriting
+        it would desynchronize the two stores and break terminate authorization.
+
+        Does NOT move _locks.  The lock belongs to the ID, since every call site keys
+        agent_lock() on an id.  Leaving _locks[old_agent_id] in place means the successor
+        inherits it and any coroutine already parked on it wakes up holding the correct
+        lock for whatever that id now denotes.  Moving or popping it would silently
+        destroy mutual exclusion, which is also why this method must never call
+        unregister().
+
+        Leaves _sessions[old_agent_id] ABSENT.  The caller binds the successor's session
+        there in the same synchronous block.
+
+        Args:
+            old_agent_id: Current id.  Entries are moved, not copied.
+            new_agent_id: Destination id.  Must not already be present.
+        """
+        if old_agent_id in self._sessions:
+            self._sessions[new_agent_id] = self._sessions.pop(old_agent_id)
+        if old_agent_id in self._parents:
+            self._parents[new_agent_id] = self._parents.pop(old_agent_id)
+        if old_agent_id in self._harnesses:
+            self._harnesses[new_agent_id] = self._harnesses.pop(old_agent_id)
+        if old_agent_id in self._initial_messages:
+            self._initial_messages[new_agent_id] = self._initial_messages.pop(old_agent_id)
+        if old_agent_id in self._usage:
+            usage = self._usage.pop(old_agent_id)
+            self._usage[new_agent_id] = usage.model_copy(update={"agent_id": new_agent_id})
+
     def agent_lock(self, agent_id: str) -> asyncio.Lock:
         """Return the per-agent serialization lock. Creates on first access.
 

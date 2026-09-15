@@ -24,22 +24,26 @@ class ThoughtBlock(Vertical, can_focus=False):
         self._chunks: list[str] = []
         self._stream: MarkdownStream | None = None
         self._preview_timer: asyncio.TimerHandle | None = None
+        self._streaming_collapsed: bool = False
+        # Held directly rather than queried, matching AgentMessage. `AwaitMount` resolves
+        # when THIS widget has composed, but its ExpandableSection composes its own body a
+        # step later, so a DOM query for the Markdown can race and raise NoMatches on the
+        # first chunk under a heavy event backlog.
+        self._md = Markdown("", open_links=False)
+        self._expandable = ExpandableSection(self._md, start_expanded=True)
 
     def compose(self) -> ComposeResult:
         """Yield CopyButton + ExpandableSection(Markdown, start_expanded=True)."""
         yield CopyButton(lambda: "".join(self._chunks))
-        yield ExpandableSection(
-            Markdown("", open_links=False),
-            start_expanded=True,
-        )
+        yield self._expandable
 
     @property
     def _section(self) -> ExpandableSection:
-        return self.query_one(ExpandableSection)
+        return self._expandable
 
     @property
     def _markdown(self) -> Markdown:
-        return self.query_one(Markdown)
+        return self._md
 
     async def append_chunk(self, chunk: str) -> None:
         """Append a streaming thought chunk. Updates preview (debounced ~200ms)."""
@@ -49,7 +53,10 @@ class ThoughtBlock(Vertical, can_focus=False):
         if self._stream is None:
             self._stream = Markdown.get_stream(self._markdown)
         await self._stream.write(chunk)
-        # Debounce preview update
+        self._schedule_preview()
+
+    def _schedule_preview(self) -> None:
+        """(Re)arm the debounced preview update, replacing any pending one."""
         if self._preview_timer is not None:
             self._preview_timer.cancel()
         loop = asyncio.get_event_loop()
@@ -76,5 +83,25 @@ class ThoughtBlock(Vertical, can_focus=False):
             self._preview_timer.cancel()
             self._preview_timer = None
         self._update_preview()
+        # Remembered so reopen() restores the state actually held while streaming rather
+        # than forcing a thought the user collapsed back open.
+        self._streaming_collapsed = self._section.collapsed
         self._section.collapsed = True
         self._section.set_activity(False)
+
+    async def reopen(self) -> None:
+        """Undo finalize() so reasoning streaming can resume.
+
+        Restores everything finalize stopped: a FRESH MarkdownStream over the existing
+        Markdown widget, the expanded/collapsed state held while streaming, the activity
+        indicator, and preview timing. ``Markdown.update`` is NOT called — the stream
+        appends to the existing document.
+
+        Idempotent.
+        """
+        if self._stream is not None:
+            return
+        self._stream = Markdown.get_stream(self._markdown)
+        self._section.collapsed = self._streaming_collapsed
+        self._section.set_activity(True)
+        self._schedule_preview()

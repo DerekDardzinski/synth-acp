@@ -7,6 +7,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from synth_acp.db import configure_connection
 from synth_acp.models.permissions import PermissionDecision, PermissionRule
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ class PermissionEngine:
         db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         conn = sqlite3.connect(str(db_path))
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
+            configure_connection(conn)
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS rules ("
                 "agent_id TEXT, tool_kind TEXT, session_id TEXT, decision TEXT, "
@@ -67,6 +68,7 @@ class PermissionEngine:
     def _persist_sync(self, rule: PermissionRule) -> None:
         conn = sqlite3.connect(str(self._db_path))
         try:
+            configure_connection(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO rules (agent_id, tool_kind, session_id, decision) "
                 "VALUES (?, ?, ?, ?)",

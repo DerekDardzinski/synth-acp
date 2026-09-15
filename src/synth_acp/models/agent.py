@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def css_id(agent_id: str) -> str:
@@ -137,3 +137,22 @@ class AgentConfig(BaseModel, frozen=True):
     def display_name(self) -> str:
         """Human-readable display name shown to other agents."""
         return self.agent_id
+
+
+class HandoffResult(BaseModel):
+    """Outcome of a handoff, sufficient to report truthfully without inspecting state.
+
+    A handoff has TWO independent outcomes, which is why this is not a bare string: the
+    rename can commit and the successor can still fail to start.  A caller must be able
+    to distinguish them, because the retired agent is resurrectable in both cases but
+    only one of them is a success.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    retired_agent_id: str
+    """The predecessor's new suffixed id.  Always populated once the rename committed."""
+    successor_started: bool
+    """True only if the successor's session was created AND its first prompt submitted."""
+    error: str | None
+    """Human-readable failure reason when successor_started is False; None otherwise."""

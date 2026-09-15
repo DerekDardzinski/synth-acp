@@ -15,6 +15,9 @@ from textual.style import Style
 from textual.visual import RenderOptions, Visual
 from textual.widget import Widget
 
+_ANIMATION_INTERVAL = 1 / 15
+"""Seconds between gradient animation frames (15Hz)."""
+
 
 class GradientBarVisual(Visual):
 
@@ -156,18 +159,32 @@ class GradientBar(Widget):
     """An animated gradient line that reacts to theme changes."""
 
     def on_mount(self) -> None:
-        self.auto_refresh = 1 / 15
         self._gradient = self._build_gradient()
         self._visual = GradientBarVisual(self._gradient)
         self.app.theme_changed_signal.subscribe(self, self._on_theme_changed)
+        # Arm only if actually displayed. Textual posts events.Hide ONLY to widgets that
+        # were in the compositor map on a PREVIOUS frame, so a bar that is display:none
+        # from its FIRST layout never receives Hide — an unconditional timer here runs
+        # forever, and every tick forces a full compositor map rebuild.
+        self._set_animating(self.display)
+
+    def _set_animating(self, animating: bool) -> None:
+        """Set or clear the animation timer.
+
+        The single assignment point for ``auto_refresh`` on this widget.
+
+        Args:
+            animating: True to run the 15Hz refresh timer, False to stop it.
+        """
+        self.auto_refresh = _ANIMATION_INTERVAL if animating else None
 
     def on_show(self) -> None:
         """Resume animation timer when widget becomes visible."""
-        self.auto_refresh = 1 / 15
+        self._set_animating(True)
 
     def on_hide(self) -> None:
         """Pause animation timer when widget is hidden."""
-        self.auto_refresh = None
+        self._set_animating(False)
 
     def on_unmount(self) -> None:
         self.app.theme_changed_signal.unsubscribe(self)

@@ -12,11 +12,12 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from synth_acp.db import ensure_schema_sync
+from synth_acp.db import configure_connection, ensure_schema_sync
+from synth_acp.models.config import MessageKind, normalize_message_kind
 
 log = logging.getLogger(__name__)
 
-type OnMessageFn = Callable[[str, str, str], Awaitable[None]]
+type OnMessageFn = Callable[[str, str, str, MessageKind], Awaitable[None]]
 type CommandFn = Callable[[list[tuple[int, str, str, str]]], Awaitable[None]]
 
 
@@ -87,7 +88,7 @@ class MessageBus:
 
         def _run() -> Any:
             with closing(sqlite3.connect(db_path)) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
+                configure_connection(conn)
                 return fn(conn)
 
         return await asyncio.to_thread(_run)
@@ -150,9 +151,9 @@ class MessageBus:
         """Fetch pending messages from DB, hand to broker, mark delivered."""
         session_id = self._session_id
 
-        def _fetch(conn: sqlite3.Connection) -> list[tuple[int, str, str, str]]:
+        def _fetch(conn: sqlite3.Connection) -> list[tuple[int, str, str, str, str]]:
             return conn.execute(
-                "SELECT id, from_agent, to_agent, body FROM messages "
+                "SELECT id, from_agent, to_agent, body, kind FROM messages "
                 "WHERE status = 'pending' AND session_id = ? ORDER BY created_at",
                 (session_id,),
             ).fetchall()
@@ -161,9 +162,9 @@ class MessageBus:
         if not rows:
             return
 
-        for msg_id, from_agent, to_agent, body in rows:
+        for msg_id, from_agent, to_agent, body, raw_kind in rows:
             try:
-                await self._on_message(to_agent, body, from_agent)
+                await self._on_message(to_agent, body, from_agent, normalize_message_kind(raw_kind))
             except Exception:
                 log.debug("Failed to deliver message %d to %s", msg_id, to_agent, exc_info=True)
                 continue

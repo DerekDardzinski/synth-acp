@@ -140,6 +140,18 @@ class HookFired(BrokerEvent):
     hook_name: str
 
 
+class MessageSteered(BrokerEvent):
+    """An inter-agent message was injected into the agent's running turn.
+
+    A steered message sends no prompt, so no UserPromptSubmitted is emitted for
+    it. This event is the only record that it was delivered, and the UI renders
+    it inside the turn it arrived in.
+    """
+
+    from_agent: str | None
+    text: str
+
+
 class QueueItemSnapshot(BaseModel, frozen=True):
     """Serializable snapshot of a single queued prompt item."""
 
@@ -258,6 +270,39 @@ class UserPromptSubmitted(BrokerEvent):
     text: str
 
 
+class AgentHandedOff(BrokerEvent):
+    """An agent was retired and a successor took over its id.
+
+    Emitted AFTER the database transaction has committed and after all broker-layer
+    in-memory state has been re-keyed, and BEFORE the successor's session is started.
+    A consumer can therefore rely on the successor's AgentStateChanged(INITIALIZING)
+    arriving strictly after this event.  Both are non-chunk events delivered through the
+    awaited FIFO put on broker._event_queue, so the relative order is guaranteed; the
+    put_nowait drop path applies only to MessageChunkReceived and cannot reorder these.
+
+    A consumer must NOT assume the predecessor's UI state still exists when this
+    arrives.  The predecessor's AgentStateChanged(TERMINATED) is emitted EARLIER, during
+    task cancellation, and still carries the ORIGINAL id, so a consumer that tears down
+    per-agent state on TERMINATED has already done so.  Rebuild from the journal
+    instead: the predecessor's ui_events rows have moved, so load_journal(retired_agent_id)
+    returns its full transcript and load_journal(agent_id) correctly returns nothing.
+
+    NOT journaled.  Do not add it to broker._JOURNALABLE: on a session restore the
+    predecessor is 'inactive' and is not restored at all, while the successor is 'active'
+    and restored by the normal path, so no consumer needs to replay this.
+    """
+
+    agent_id: str
+    """The ORIGINAL id.  After this event it denotes the SUCCESSOR."""
+    retired_agent_id: str
+    """The predecessor's new suffixed id.  It owns all history authored before the
+    handoff, is status 'inactive', and is resurrectable."""
+    parent: str | None
+    """Unchanged by the handoff.  Predecessor and successor share this parent."""
+    task: str
+    """Copied from the predecessor to the successor."""
+
+
 type AgentEvent = (
     AgentStateChanged | MessageChunkReceived | ToolCallUpdated | TurnComplete
     | AgentThoughtReceived | PlanReceived | AvailableCommandsReceived | TerminalCreated
@@ -271,7 +316,8 @@ type ConfigEvent = (
 type SystemEvent = (
     BrokerError | PermissionRequested | PermissionAutoResolved
     | UsageUpdated | HookFired | QueueUpdated
-    | SessionRestoreComplete | UserPromptSubmitted
+    | SessionRestoreComplete | UserPromptSubmitted | MessageSteered
+    | AgentHandedOff
 )
 
 type BrokerEventUnion = AgentEvent | ConfigEvent | SystemEvent

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from textual.app import ComposeResult
@@ -12,6 +13,8 @@ from textual.widget import Widget
 from textual.widgets import Static
 
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
+
+log = logging.getLogger(__name__)
 
 
 class _ToggleLabel(Static, can_focus=False):
@@ -106,26 +109,27 @@ class ExpandableSection(Vertical, can_focus=False):
         self._content_children = children
         self._toggle_position = toggle_position
         self._max_content_height = max_content_height
+        self._activity_bar: ActivityBar | None = None
         self.collapsed = not start_expanded
 
     def compose(self) -> ComposeResult:
-        """Compose header, activity bar, and scrollable body."""
+        """Compose header and scrollable body.
+
+        The ActivityBar is NOT composed here — ``set_activity`` mounts one on demand and
+        removes it again, so an idle section holds no gradient timer.
+        """
         header = _Header(
             _ToggleLabel("▶ Expand", id="es-toggle"),
             Static("", id="es-preview"),
             classes="es-header",
         )
-        activity = ActivityBar(classes="es-activity")
-        activity.active = False
         body = VerticalScroll(*self._content_children, classes="es-body")
         if self._max_content_height != 20:
             body.styles.max_height = self._max_content_height
         if self._toggle_position == "top":
             yield header
             yield body
-            yield activity
         else:
-            yield activity
             yield body
             yield header
 
@@ -173,8 +177,45 @@ class ExpandableSection(Vertical, can_focus=False):
         self.query_one("#es-preview", Static).update(text)
 
     def set_activity(self, active: bool) -> None:
-        """Set activity state: active=True shows animated gradient bar, False hides it."""
-        self.query_one(".es-activity", ActivityBar).active = active
+        """Show or hide the streaming activity indicator. SYNCHRONOUS.
+
+        On True an ActivityBar is mounted; on False the mounted one is removed. Removal,
+        not hiding, reclaims the widgets and guarantees no orphaned animation timer.
+
+        ``_activity_bar`` is the authoritative state and is assigned BEFORE the unawaited
+        mount and cleared BEFORE the unawaited remove, so two activations in one frame
+        cannot schedule duplicate bars. The DOM settles a frame later.
+
+        Idempotent in both directions. A mount failure resets the slot and is logged
+        rather than propagated: the callers are App message-pump paths with no local guard.
+
+        Args:
+            active: True to show the animated gradient bar, False to remove it.
+        """
+        if active:
+            if self._activity_bar is not None:
+                return
+            bar = ActivityBar(classes="es-activity")
+            self._activity_bar = bar
+            try:
+                # Anchored on the body widget, never on an index and never on an
+                # ActivityBar: Textual marks a removed widget for pruning synchronously
+                # but takes it out of the NodeList later, so a rapid True->False->True
+                # could otherwise anchor against a dying bar.
+                body = self.query_one(".es-body", VerticalScroll)
+                if self._toggle_position == "top":
+                    self.mount(bar, after=body)
+                else:
+                    self.mount(bar, before=body)
+            except Exception:
+                self._activity_bar = None
+                log.warning("Failed to mount activity bar", exc_info=True)
+        else:
+            bar = self._activity_bar
+            if bar is None:
+                return
+            self._activity_bar = None
+            bar.remove()
 
     def toggle(self) -> None:
         """Flip collapsed state programmatically."""

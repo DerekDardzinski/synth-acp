@@ -61,6 +61,14 @@ packages = ["src/synth_acp"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The full-fixture performance gates replay a 21-agent journal three times each and cost
+# minutes, which is too slow to pay on every run. They are deselected by default and run
+# explicitly with `uv run pytest -m perf` (or via SYNTH_PERF_REPS=1 for a quick single-rep
+# pass while iterating).
+addopts = "-m 'not perf'"
+markers = [
+    "perf: full-fixture performance gate; minutes to run, deselected by default",
+]
 
 [tool.ruff]
 line-length = 100

@@ -13,12 +13,14 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
+from pydantic import BaseModel, ConfigDict
+
 from synth_acp.broker.lifecycle import AgentLifecycle
 from synth_acp.broker.message_bus import MessageBus
 from synth_acp.broker.permissions import PermissionEngine
 from synth_acp.broker.prompt_queue import PromptQueue, QueuedItem
 from synth_acp.broker.registry import AgentRegistry
-from synth_acp.db import ensure_schema_sync
+from synth_acp.db import AgentRenameResult, configure_connection, ensure_schema_sync
 from synth_acp.discovery import DiscoveredAgent
 from synth_acp.models.agent import AgentConfig, AgentMode, AgentModel, AgentState
 from synth_acp.models.commands import (
@@ -40,13 +42,19 @@ from synth_acp.models.commands import (
     SetConfigOption,
     TerminateAgent,
 )
-from synth_acp.models.config import SessionConfig
+from synth_acp.models.config import (
+    MessageKind,
+    SessionConfig,
+    format_handoff_nudge,
+    format_mcp_message,
+)
 from synth_acp.models.events import (
     AgentStateChanged,
     AgentThoughtReceived,
     BrokerError,
     BrokerEvent,
     MessageChunkReceived,
+    MessageSteered,
     PermissionAutoResolved,
     PermissionRequested,
     QueueItemSnapshot,
@@ -54,11 +62,22 @@ from synth_acp.models.events import (
     ToolCallUpdated,
     TurnComplete,
     UsageUpdated,
-    UserPromptSubmitted,
 )
 from synth_acp.models.permissions import PermissionDecision, PermissionRule
 
 log = logging.getLogger(__name__)
+
+
+class ChunkLossStats(BaseModel):
+    """Cumulative live-UI chunk drop counters for the session."""
+
+    model_config = ConfigDict(frozen=True)
+
+    dropped_total: int
+    dropped_by_agent: dict[str, int]
+    warned_agents: frozenset[str]
+    armed_agents: frozenset[str]
+    last_drop_at: float | None
 
 
 class ACPBroker:
@@ -96,7 +115,20 @@ class ACPBroker:
         self._turn_buffer_tool_index: dict[str, dict[str, int]] = {}
         self._pending_flushes: set[asyncio.Task] = set()
         self._prompt_queue = PromptQueue()
+        self._chunk_drops: dict[str, int] = {}  # agent_id → dropped chunk count
+        self._drop_armed: dict[str, bool] = {}  # agent_id → warning pending
+        self._warned_agents: set[str] = set()
+        # Agents already nudged to consider handoff. One nudge per agent per
+        # process: PREDECESSOR-OWNED, so apply_handoff_rekey moves it.
+        self._nudged_agents: set[str] = set()
+        self._last_drop_at: float | None = None
         self._is_composing: Callable[[str], bool] = lambda _: False
+        # One serialized tail for every agent command, so nothing can overtake an
+        # active handoff. Created lazily: __init__ may run off the event loop.
+        self._command_queue: (
+            asyncio.Queue[tuple[list[tuple[int, str, str, str]], asyncio.Event] | None] | None
+        ) = None
+        self._command_tail_task: asyncio.Task[None] | None = None
 
     @property
     def session_id(self) -> str:
@@ -164,14 +196,26 @@ class ACPBroker:
     # ------------------------------------------------------------------
 
     async def submit_prompt(
-        self, agent_id: str, text: str, source: str = "user", from_agent: str | None = None
+        self,
+        agent_id: str,
+        text: str,
+        source: str = "user",
+        from_agent: str | None = None,
+        *,
+        steerable: bool = False,
     ) -> None:
         """Single entry point for all message submission (user and MCP).
 
         Delivery rules checked at decision time (no stale flags):
         - User message: deliver directly if IDLE (queue items wait)
         - MCP message: deliver if IDLE + queue empty + user not composing
+        - Steerable MCP message on a not-IDLE agent: inject into the running turn
         - Otherwise: enqueue, attempt drain
+
+        ``steerable`` defaults False so every existing caller keeps today's
+        behavior. Only ``_on_mcp_message`` passes True — the dynamic-child
+        startup path calls ``submit_prompt(source="mcp")`` directly, bypassing
+        that seam, so a child's launch prompt is never steered.
         """
         lifecycle = await self._ensure_lifecycle()
         session = self._registry.get_session(agent_id)
@@ -180,25 +224,106 @@ class ACPBroker:
         if source == "user" and idle:
             # User submit always delivers directly — their explicit action
             # takes priority. Queued MCP messages wait until next IDLE.
-            await self._sink(UserPromptSubmitted(agent_id=agent_id, text=text))
-            await lifecycle.prompt(agent_id, text)
-            return
-
-        if source != "user":
-            # MCP: deliver if IDLE + queue empty + not composing
-            empty = self._prompt_queue.is_empty(agent_id)
-            if idle and empty and not self._is_composing(agent_id):
-                await self._sink(UserPromptSubmitted(agent_id=agent_id, text=text))
-                await lifecycle.prompt(agent_id, text)
+            # prompt() announces the prompt itself and returns False if it refused it,
+            # in which case fall through and queue the text rather than lose it.
+            if await lifecycle.prompt(agent_id, text):
                 return
 
+        elif source != "user":
+            # MCP: deliver if IDLE + queue empty + not composing
+            empty = self._prompt_queue.is_empty(agent_id)
+            if idle and empty and not self._is_composing(agent_id) and (
+                await lifecycle.prompt(agent_id, text)
+            ):
+                return
+
+        if steerable and not idle and await self._try_steer(agent_id, text, from_agent):
+            # An accepted steer is the delivery of record. Enqueueing the same
+            # text as well would deliver it twice, because Kiro holds a steer
+            # sent to an idle session and rides it along with the next prompt.
+            return
+
         # Enqueue and attempt immediate drain
-        item = QueuedItem(text=text, source=source, from_agent=from_agent)  # type: ignore[arg-type]
+        item = QueuedItem(
+            text=text,
+            source=source,  # type: ignore[arg-type]
+            from_agent=from_agent,
+            steerable=steerable,
+        )
         self._prompt_queue.enqueue(agent_id, item)
         drained = await self._try_drain(agent_id)
         if not drained:
             # Item is sitting in queue — notify UI
             await self._emit_queue_state(agent_id)
+
+    def _steer_eligible(self, agent_id: str, kind: MessageKind) -> bool:
+        """Whether this message may be steered into a running turn.
+
+        False for ``kind == "system"`` unconditionally (join/exit notifications
+        are explicitly "no action required"), false when the resolved
+        ``messages_interrupt`` setting is false, and false when the agent's
+        harness declares no steer protocol.
+        """
+        if kind == "system":
+            return False
+        if not self._config.settings.messages_interrupt:
+            return False
+        session = self._registry.get_session(agent_id)
+        return session is not None and session.steer_protocol is not None
+
+    async def _try_steer(self, agent_id: str, text: str, from_agent: str | None) -> bool:
+        """Attempt in-turn delivery. Returns True if the message was delivered.
+
+        Builds the payload from any already-queued items that are themselves
+        steerable, PLUS ``text``, so a steer that follows a previously failed one
+        carries the backlog. A queued user prompt or system notification is never
+        included: those classes are prohibited from being steered, and being
+        queued does not make them eligible. On success the included items are
+        consumed and the steered event is emitted. On failure the queue is
+        restored and the caller enqueues normally.
+
+        Holds ``self._registry.agent_lock(agent_id)`` across the whole attempt.
+        Without it an IDLE transition can drain the queue between building the
+        payload and consuming it, delivering the same text twice — the repo's
+        documented read-await-mutate hazard. The pending items are popped BEFORE
+        the call rather than after, so anything enqueued while the steer is in
+        flight stays queued instead of being consumed unsent.
+        """
+        async with self._registry.agent_lock(agent_id):
+            session = self._registry.get_session(agent_id)
+            if session is None or session.state == AgentState.IDLE:
+                return False
+            if self._first_prompt_reserved(agent_id):
+                # Refused before anything is popped, so the caller's normal enqueue path
+                # preserves the text. Rechecked HERE rather than at entry because a steer
+                # that passed an entry check before the reservation existed is already
+                # parked on this lock -- and session.steer needs only a session id, which
+                # a successor has while it is still INITIALIZING, so it would inject text
+                # ahead of the reserved first prompt.
+                return False
+            pending = self._prompt_queue.pop_steerable(agent_id)
+            payload = self._format_steer_text([i.text for i in pending] + [text])
+            if not await session.steer(payload):
+                self._prompt_queue.requeue_front(agent_id, pending)
+                return False
+        await self._sink(MessageSteered(agent_id=agent_id, from_agent=from_agent, text=payload))
+        if pending:
+            await self._emit_queue_state(agent_id)
+        return True
+
+    def _format_steer_text(self, bodies: list[str]) -> str:
+        """Join message bodies for one steer call.
+
+        A single body is sent verbatim — a lone ``# Message 1`` header would be
+        noise. Several are joined as ``# Message 1``, ``# Message 2`` sections in
+        queue order. Bodies are already attribution-signed by
+        ``format_mcp_message`` and are inserted unchanged: no preamble and no
+        stop directive, so the default wording stays passive and a user who wants
+        stop-on-message behavior edits the ``on_mcp_message`` template.
+        """
+        if len(bodies) == 1:
+            return bodies[0]
+        return "\n\n".join(f"# Message {n}\n\n{body}" for n, body in enumerate(bodies, start=1))
 
     async def _try_drain(self, agent_id: str) -> bool:
         """Attempt to drain the front of the queue to the agent.
@@ -221,8 +346,9 @@ class ACPBroker:
         item = self._prompt_queue.pop(agent_id)
         if not item:
             return False
-        await self._sink(UserPromptSubmitted(agent_id=agent_id, text=item.text))
-        await lifecycle.prompt(agent_id, item.text)
+        if not await lifecycle.prompt(agent_id, item.text, first_prompt=item.first_prompt):
+            self._restore_refused_item(agent_id, item)
+            return False
         await self._emit_queue_state(agent_id)
         return True
 
@@ -240,10 +366,35 @@ class ACPBroker:
         item = self._prompt_queue.pop(agent_id)
         if not item:
             return False
-        await self._sink(UserPromptSubmitted(agent_id=agent_id, text=item.text))
-        await lifecycle.prompt(agent_id, item.text)
+        if not await lifecycle.prompt(agent_id, item.text, first_prompt=item.first_prompt):
+            self._restore_refused_item(agent_id, item)
+            return False
         await self._emit_queue_state(agent_id)
         return True
+
+    def _restore_refused_item(self, agent_id: str, item: QueuedItem) -> None:
+        """Put a popped item back after ``prompt`` refused it, at the right position.
+
+        Both drains check ``state == IDLE`` on entry and then await before ``prompt``
+        re-checks under the lock, so a refusal is reachable and a popped item would
+        otherwise be silently lost.
+
+        WHERE it goes back matters, and it depends on whether a reservation is pending.
+
+        A reserved first prompt always returns to the FRONT: it must stay first.
+
+        Anything else returns to the front too -- preserving the user's queue order --
+        EXCEPT while a reservation is pending, when it must go to the END instead. Ahead
+        of a reserved prompt it would LIVELOCK: popped and refused on every drain, with
+        the handoff message never delivered. Sending it to the back unconditionally was
+        the earlier behavior and silently reordered the queue on every refusal, which is
+        reachable without any handoff because both drains check IDLE, then await, and
+        ``prompt`` re-checks under the lock.
+        """
+        if item.first_prompt or not self._first_prompt_reserved(agent_id):
+            self._prompt_queue.requeue_front(agent_id, [item])
+        else:
+            self._prompt_queue.enqueue(agent_id, item)
 
     async def _emit_queue_state(self, agent_id: str) -> None:
         """Emit a QueueUpdated event with current queue snapshot."""
@@ -347,7 +498,7 @@ class ACPBroker:
             conn = sqlite3.connect(str(self._db_path))
             conn.row_factory = sqlite3.Row
             try:
-                conn.execute("PRAGMA journal_mode=WAL")
+                configure_connection(conn)
                 return conn.execute(
                     "SELECT agent_id, acp_session_id, harness, agent_mode, cwd, parent "
                     "FROM agents WHERE session_id = ? AND status IN ('restorable', 'active') "
@@ -365,7 +516,7 @@ class ACPBroker:
         def _agents_with_history() -> set[str]:
             conn = sqlite3.connect(str(self._db_path))
             try:
-                conn.execute("PRAGMA journal_mode=WAL")
+                configure_connection(conn)
                 return {
                     r[0]
                     for r in conn.execute(
@@ -401,7 +552,7 @@ class ACPBroker:
             def _query_journal_seq() -> list[tuple]:
                 conn = sqlite3.connect(str(self._db_path))
                 try:
-                    conn.execute("PRAGMA journal_mode=WAL")
+                    configure_connection(conn)
                     return conn.execute(
                         "SELECT agent_id, MAX(seq) FROM ui_events "
                         "WHERE session_id = ? GROUP BY agent_id",
@@ -422,7 +573,7 @@ class ACPBroker:
             conn = sqlite3.connect(str(db_path))
             conn.row_factory = sqlite3.Row
             try:
-                conn.execute("PRAGMA journal_mode=WAL")
+                configure_connection(conn)
                 # Get sessions that have at least one restorable/active agent
                 sessions = conn.execute(
                     "SELECT session_id, MAX(registered) as last_active, "
@@ -575,15 +726,29 @@ class ACPBroker:
             self._permission_counter[aid] = (1, total + 1)
         elif isinstance(event, UsageUpdated):
             self._registry.update_usage(event)
+            await self._maybe_nudge_handoff(event)
 
         if isinstance(event, AgentStateChanged) and event.new_state == AgentState.TERMINATED:
             self._cleanup_agent_state(event.agent_id)
 
         if isinstance(event, MessageChunkReceived):
+            # NOTHING ON THIS PATH MAY AWAIT: Queue.put fast-paths to
+            # put_nowait when not full, so an awaited put here could let a new
+            # producer overtake one parked in _putters, and out-of-order output
+            # is worse than dropping.  No backpressure, and no sequence
+            # stamping — a counter allocated here is tautologically monotonic
+            # and could not detect upstream reordering anyway.
             try:
                 self._event_queue.put_nowait(event)
             except asyncio.QueueFull:
-                log.debug("Event queue full, dropping chunk for %s", event.agent_id)
+                # Live-UI loss only: _buffer_journal_event below still runs, so
+                # the text survives and reappears on restore.  ACCEPTED
+                # RESIDUAL: a drop that arms after the final awaited event for
+                # this agent has no later trigger, so no warning is surfaced.
+                # The counters are the authoritative mechanism.
+                self.record_chunk_drop(event.agent_id)
+            else:
+                self.try_deliver_drop_warning(event.agent_id)
         elif self._shutting_down:
             try:
                 self._event_queue.put_nowait(event)
@@ -591,6 +756,7 @@ class ACPBroker:
                 pass
         else:
             await self._event_queue.put(event)
+            await self.deliver_drop_warning_after_awaited_event(event.agent_id)
 
         # Journal UI-visible events for session restore.
         self._buffer_journal_event(event)
@@ -602,8 +768,308 @@ class ACPBroker:
             await self._try_drain(event.agent_id)
 
     # ------------------------------------------------------------------
+    # Live-UI chunk loss
+    # ------------------------------------------------------------------
+
+    def record_chunk_drop(self, agent_id: str) -> None:
+        """Count a chunk dropped from the live UI queue.
+
+        Synchronous and never awaits — an await here would let a later chunk
+        overtake an earlier one.  Attempts NO delivery: this runs only after
+        the chunk's ``put_nowait`` already raised ``QueueFull``, so the queue
+        is provably full.  Arms a per-agent warning flag via a plain dict
+        mutation, which cannot yield, so concurrent ``_sink`` calls cannot both
+        arm it.  The chunk is still journaled by the caller, so this is
+        live-UI loss only.
+
+        Args:
+            agent_id: Agent whose chunk was dropped.
+        """
+        self._chunk_drops[agent_id] = self._chunk_drops.get(agent_id, 0) + 1
+        self._last_drop_at = time.time()
+        if agent_id not in self._warned_agents:
+            self._drop_armed[agent_id] = True
+
+    def try_deliver_drop_warning(self, agent_id: str) -> None:
+        """Best-effort delivery immediately after a successful chunk enqueue.
+
+        Synchronous.  Runs after the chunk's ``put_nowait`` — the first state
+        in which capacity can exist — so the warning can never sit ahead of a
+        chunk.  Attempts one ``put_nowait`` and re-arms on ``QueueFull``.
+
+        Args:
+            agent_id: Agent to warn about.
+        """
+        if not self._claim_drop_warning(agent_id):
+            return
+        try:
+            self._event_queue.put_nowait(self._drop_warning_event(agent_id))
+        except asyncio.QueueFull:
+            self._drop_armed[agent_id] = True
+        else:
+            self._warned_agents.add(agent_id)
+
+    async def deliver_drop_warning_after_awaited_event(self, agent_id: str) -> None:
+        """Best-effort delivery of any armed warning after an awaited enqueue.
+
+        Called after ANY non-chunk awaited enqueue for ``agent_id`` —
+        ``TurnComplete``, ``AgentStateChanged``, ``UsageUpdated``,
+        ``BrokerError`` — never on the chunk path.  Awaits ``put``, which is
+        safe here: awaiting suspends only the producing coroutine and the loop
+        keeps servicing the UI.
+
+        Delivery is BEST-EFFORT because of CAUSALITY, not capacity: a drop that
+        arms AFTER the final awaited event for an agent has no later trigger.
+        Counters remain authoritative.  Shares one claim-and-clear with
+        :meth:`try_deliver_drop_warning`, and marks the agent warned before the
+        await, so at most one warning is delivered per agent per session.
+
+        Args:
+            agent_id: Agent to warn about.
+        """
+        if not self._claim_drop_warning(agent_id):
+            return
+        self._warned_agents.add(agent_id)
+        await self._event_queue.put(self._drop_warning_event(agent_id))
+
+    def _claim_drop_warning(self, agent_id: str) -> bool:
+        """Claim and clear the armed flag for one agent.
+
+        A dict ``pop`` cannot yield, so two concurrent ``_sink`` calls for the
+        same agent cannot both win the claim.
+
+        Args:
+            agent_id: Agent whose flag to claim.
+
+        Returns:
+            True if this caller won the claim and should attempt delivery.
+        """
+        return self._drop_armed.pop(agent_id, False)
+
+    def _drop_warning_event(self, agent_id: str) -> BrokerError:
+        """Build the chunk-loss warning event.
+
+        Args:
+            agent_id: Agent whose chunks were dropped.
+
+        Returns:
+            A warning-severity BrokerError naming the drop count so far.
+        """
+        dropped = self._chunk_drops.get(agent_id, 0)
+        return BrokerError(
+            agent_id=agent_id,
+            message=(
+                f"Dropped {dropped} streamed chunk(s) from the live view for "
+                f"{agent_id} — the text is preserved in the session journal."
+            ),
+            severity="warning",
+        )
+
+    def chunk_loss_stats(self) -> ChunkLossStats:
+        """Return cumulative live-UI chunk drop counters.
+
+        Returns:
+            Counters for the whole session; they are not reset when an agent
+            terminates, since they are the record a caller relies on.
+        """
+        return ChunkLossStats(
+            dropped_total=sum(self._chunk_drops.values()),
+            dropped_by_agent=dict(self._chunk_drops),
+            warned_agents=frozenset(self._warned_agents),
+            armed_agents=frozenset(self._drop_armed),
+            last_drop_at=self._last_drop_at,
+        )
+
+    # ------------------------------------------------------------------
+    # Agent handoff — broker-owned state
+    # ------------------------------------------------------------------
+
+    def handoff_in_flight(self, agent_id: str) -> bool:
+        """Whether a handoff for *agent_id* has started and not yet finished.
+
+        True from before the predecessor is killed until the successor is started or the
+        attempt fails, so it is the only predicate available while the predecessor's
+        terminal event is being handled.  ``_first_prompt_reserved`` is not usable then:
+        the reservation is installed after the kill.
+
+        Args:
+            agent_id: The id being handed off, which the successor takes over.
+
+        Returns:
+            True while a handoff for that id is in flight.
+        """
+        return (
+            self._lifecycle is not None and agent_id in self._lifecycle._active_handoffs
+        )
+
+    def _first_prompt_reserved(self, agent_id: str) -> bool:
+        """Whether a successor's reserved opening prompt is still undelivered."""
+        return (
+            self._lifecycle is not None
+            and agent_id in self._lifecycle._reserved_first_prompt
+        )
+
+    async def drain_agent_journal(self, agent_id: str) -> None:
+        """Land every pending journal write for this agent before its rows are moved.
+
+        Awaits any in-flight flush task for this agent, then flushes whatever is still
+        sitting in its turn buffer.  A flush that lands after the rename's UPDATE writes
+        rows under the OLD id that the UPDATE has already passed, so those events would
+        silently belong to the wrong agent.
+
+        Task names are matched EXACTLY, never by prefix: agents ``x`` and ``x-2`` both
+        produce names starting with ``journal-flush-x``, so a prefix test would await an
+        unrelated agent's flush.
+        """
+        names = {f"journal-flush-{agent_id}", f"journal-flush-final-{agent_id}"}
+        inflight = [t for t in self._pending_flushes if t.get_name() in names]
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+
+        buffered = self._turn_buffer.pop(agent_id, None)
+        self._turn_buffer_tool_index.pop(agent_id, None)
+        if buffered:
+            await self._flush_turn_buffer(agent_id, buffered)
+
+    def apply_handoff_rekey(self, result: AgentRenameResult) -> None:
+        """Re-key every broker-owned per-agent container for a committed rename.
+
+        SYNCHRONOUS BY CONTRACT and must never gain an await: with no yield point, no
+        other coroutine can observe a partially re-keyed process.
+
+        Applies the same three rules as the SQL side.  Predecessor-owned state MOVES to
+        the retired id.  Recipient state STAYS at the original id so the successor
+        receives it -- the prompt queue's keys and the registry's locks are both keyed by
+        recipient id, and moving either strands work or destroys mutual exclusion.
+        Authored VALUES move even where their key does not.  The predecessor's pending
+        permissions are CLEARED rather than moved, because a dead agent can never answer
+        them.
+        """
+        old, new = result.old_agent_id, result.new_agent_id
+
+        session = self._registry.get_session(old)
+        self._registry.rename(old, new)
+        if session is not None:
+            session.rename(new)
+        # The successor inherits the predecessor's parent and harness at the ORIGINAL id.
+        self._registry.set_parent(old, result.parent)
+        self._registry.set_harness(old, result.harness)
+
+        # The predecessor's ui_events rows moved with it, so its seq counter follows.
+        # Leaving the original key ABSENT is what starts the successor's journal at 0.
+        if old in self._journal_seq:
+            self._journal_seq[new] = self._journal_seq.pop(old)
+
+        # Drained in drain_agent_journal, so expected empty; popped regardless so nothing
+        # is ever left under the original key for the successor to inherit.
+        buffered = self._turn_buffer.pop(old, None)
+        tool_index = self._turn_buffer_tool_index.pop(old, None)
+        if buffered:
+            self._turn_buffer[new] = buffered
+        if tool_index:
+            self._turn_buffer_tool_index[new] = tool_index
+
+        # Predecessor-owned diagnostics.
+        if old in self._chunk_drops:
+            self._chunk_drops[new] = self._chunk_drops.pop(old)
+        if old in self._drop_armed:
+            self._drop_armed[new] = self._drop_armed.pop(old)
+        if old in self._warned_agents:
+            self._warned_agents.discard(old)
+            self._warned_agents.add(new)
+        # A nudge is a fact about the conversation that just filled up, so it
+        # follows the predecessor.  Leaving it at the original id would mute the
+        # successor -- which starts empty and will fill up in its turn -- for the
+        # whole life of the process, silently.
+        if old in self._nudged_agents:
+            self._nudged_agents.discard(old)
+            self._nudged_agents.add(new)
+
+        # AUTHORED VALUE whose KEY must not move: the queue is keyed by recipient.
+        self._prompt_queue.rename_author(old, new)
+
+        # Already run once from _sink on the predecessor's TERMINATED event, and
+        # idempotent. Reused rather than duplicated.
+        self._cleanup_agent_state(old)
+
+    def seed_first_prompt(self, agent_id: str, text: str, from_agent: str) -> None:
+        """Place the successor's reserved opening prompt at the FRONT of its queue.
+
+        Synchronous and lock-free by design, so a handoff can call it while still holding
+        the agent lock: going through ``submit_prompt`` would reach ``lifecycle.prompt``
+        or ``_try_steer``, and both acquire that same non-reentrant lock.
+
+        FRONT, not append. The queue key stays at the original id, so anything the
+        successor INHERITED is already sitting there and an appended item would be
+        delivered second -- the successor would open on a message it has no context for.
+
+        ``from_agent`` is the RETIRED id: the predecessor wrote this text and the
+        predecessor is now that id. Attributing it to the original id would credit the
+        successor with writing its own briefing.
+        """
+        self._prompt_queue.requeue_front(
+            agent_id,
+            [
+                QueuedItem(
+                    text=text,
+                    source="mcp",
+                    from_agent=from_agent,
+                    steerable=False,
+                    first_prompt=True,
+                )
+            ],
+        )
+
+    # ------------------------------------------------------------------
     # Agent state cleanup
     # ------------------------------------------------------------------
+
+    async def _maybe_nudge_handoff(self, event: UsageUpdated) -> None:
+        """Post a one-time handoff nudge if this agent's context crossed the threshold.
+
+        THE CLAIM IS SYNCHRONOUS AND MUST STAY THAT WAY.  ``set.add`` cannot yield,
+        so the membership test and the claim together are atomic against every
+        other coroutine, and two ``_sink`` calls for the same agent -- Kiro reports
+        usage several times per turn -- cannot both win.  Claiming after the DB
+        write would let both through and deliver the nudge twice.
+
+        ``event.size`` is a denominator, not a token budget: Kiro reports a
+        percentage and ``ACPSession.ext_notification`` encodes it as
+        ``size=100``, while Claude's own ``usage_update`` carries real token
+        counts.  Comparing the ratio works for both without either harness being
+        named here.  ``size == 0`` means the harness reported no usable figure.
+
+        The nudge is deliberately NOT ``kind="system"``: system messages are
+        blocked from in-turn steering and framed "no action required", and this
+        one wants to reach an agent mid-turn and be acted on.
+        """
+        settings = self._config.settings
+        if not settings.handoff_nudge or event.size <= 0:
+            return
+        if event.used / event.size < settings.handoff_nudge_threshold:
+            return
+        agent_id = event.agent_id
+        if agent_id in self._nudged_agents:
+            return
+        self._nudged_agents.add(agent_id)  # claim, before any await
+
+        body = format_handoff_nudge(
+            settings.handoff_nudge_template,
+            agent_id=agent_id,
+            used_fraction=event.used / event.size,
+            threshold=settings.handoff_nudge_threshold,
+        )
+        try:
+            lifecycle = await self._ensure_lifecycle()
+            await lifecycle.send_notification(agent_id, body)
+        except Exception:
+            # Release the claim so a later report can retry: a nudge that was
+            # claimed but never written would silence the agent permanently.
+            self._nudged_agents.discard(agent_id)
+            log.warning("Failed to post handoff nudge for %s", agent_id, exc_info=True)
+            return
+        if self._message_bus:
+            self._message_bus.wake(agent_id)
 
     def _cleanup_agent_state(self, agent_id: str) -> None:
         """Remove accumulated per-agent state for a terminated agent."""
@@ -626,6 +1092,7 @@ class ACPBroker:
         "HookFired",
         "PlanReceived",
         "UserPromptSubmitted",
+        "MessageSteered",
     })
 
     def _buffer_journal_event(self, event: BrokerEvent) -> None:
@@ -674,9 +1141,15 @@ class ACPBroker:
             if existing_pos is not None:
                 prev_seq, prev_event = buf[existing_pos]
                 assert isinstance(prev_event, ToolCallUpdated)
+                # Read field values via getattr, not model_dump(): model_copy
+                # does not validate, so dumped values would leave dataclass
+                # fields (locations, diffs) holding plain dicts and trip
+                # pydantic serializer warnings at journal-flush time.
                 merged = prev_event.model_copy(update={
-                    k: v for k, v in event.model_dump().items()
-                    if k != "tool_call_id" and v not in (None, "", [])
+                    k: v
+                    for k in type(event).model_fields
+                    if k != "tool_call_id"
+                    and (v := getattr(event, k)) not in (None, "", [])
                     and not (k == "kind" and v == "other")
                 })
                 buf[existing_pos] = (prev_seq, merged)
@@ -760,7 +1233,7 @@ class ACPBroker:
             def _query() -> list[tuple[str, str]]:
                 conn = sqlite3.connect(str(self._db_path))
                 try:
-                    conn.execute("PRAGMA journal_mode=WAL")
+                    configure_connection(conn)
                     return conn.execute(
                         "SELECT event_type, payload FROM ui_events "
                         "WHERE session_id = ? AND agent_id = ? ORDER BY seq",
@@ -944,6 +1417,7 @@ class ACPBroker:
             await self._message_bus.start()
             lifecycle.set_message_bus(self._message_bus.socket_path)
             lifecycle.set_submit_prompt(self.submit_prompt)
+            lifecycle.set_handoff_state(self)
         finally:
             self._message_bus_starting = False
 
@@ -952,24 +1426,127 @@ class ACPBroker:
     # ------------------------------------------------------------------
 
     async def _process_commands(self, commands: list[tuple[int, str, str, str]]) -> None:
-        lifecycle = await self._ensure_lifecycle()
-        for cmd_id, from_agent, command, payload in commands:
-            try:
-                data = json.loads(payload)
-                if command == "launch":
-                    await lifecycle.handle_launch_command(cmd_id, from_agent, data)
-                elif command == "terminate":
-                    await lifecycle.handle_terminate_command(cmd_id, from_agent, data)
-                elif command == "resurrect":
-                    await lifecycle.handle_resurrect_command(cmd_id, from_agent, data)
-                else:
-                    await lifecycle.update_command_status(cmd_id, "rejected", f"Unknown command: {command}")
-            except Exception as exc:
-                await lifecycle.update_command_status(cmd_id, "rejected", str(exc))
+        """Hand a claimed batch to the serialized command tail and await its completion.
 
-    async def _on_mcp_message(self, to_agent: str, body: str, from_agent: str) -> None:
-        """Callback from message bus — an inter-agent message was found in DB."""
-        await self.submit_prompt(to_agent, body, source="mcp", from_agent=from_agent)
+        FIFO across the whole session is the property being protected. A batch like
+        [handoff(from A), launch-child(from A)] must run in that order, or the launch races
+        the identity transition and sees a half-transitioned agent. Dispatching the handoff
+        as a bare task and returning would also strand the already-claimed remainder of the
+        batch in 'processing'.
+
+        So every command type is appended, in claimed order, to ONE queue drained by ONE
+        long-lived owned task that handles a single command at a time, and this method
+        awaits a per-batch completion signal. Existing callers therefore still observe
+        settled rows when it returns. If the poll task is cancelled this await raises, but
+        the tail is a separate owned task and keeps going -- which is precisely the
+        property being bought, since a handoff must not be torn apart between its
+        committed rename and its in-memory re-key.
+        """
+        self._ensure_command_tail()
+        assert self._command_queue is not None
+        settled = asyncio.Event()
+        self._command_queue.put_nowait((commands, settled))
+        await settled.wait()
+
+    def _ensure_command_tail(self) -> None:
+        """Start the command tail, or restart it if it has exited.
+
+        A STRONG reference is kept: the event loop holds only weak references to tasks, so
+        an unreferenced task can be collected mid-flight. Restarting a task that is already
+        done also means a tail that died cannot leave a later batch waiting forever on an
+        event nobody will set.
+
+        Created lazily rather than in _start_message_bus because broker tests drive
+        _process_commands directly, without a bus.
+        """
+        if self._command_queue is None:
+            self._command_queue = asyncio.Queue()
+        if self._command_tail_task is None or self._command_tail_task.done():
+            self._command_tail_task = asyncio.create_task(
+                self._run_command_tail(), name="command-tail"
+            )
+
+            def _on_done(t: asyncio.Task[None]) -> None:
+                if not t.cancelled() and (exc := t.exception()):
+                    log.error("command tail raised", exc_info=exc)
+
+            self._command_tail_task.add_done_callback(_on_done)
+
+    async def _run_command_tail(self) -> None:
+        """Drain the command queue, one command at a time, until the stop sentinel."""
+        assert self._command_queue is not None
+        while True:
+            item = await self._command_queue.get()
+            if item is None:
+                return
+            commands, settled = item
+            try:
+                for cmd_id, from_agent, command, payload in commands:
+                    await self._dispatch_command(cmd_id, from_agent, command, payload)
+            finally:
+                # Always, even if the tail is cancelled mid-batch: a caller parked on this
+                # event must never be left waiting.
+                settled.set()
+
+    async def _dispatch_command(
+        self, cmd_id: int, from_agent: str, command: str, payload: str
+    ) -> None:
+        lifecycle = await self._ensure_lifecycle()
+        try:
+            data = json.loads(payload)
+            if command == "launch":
+                await lifecycle.handle_launch_command(cmd_id, from_agent, data)
+            elif command == "terminate":
+                await lifecycle.handle_terminate_command(cmd_id, from_agent, data)
+            elif command == "resurrect":
+                await lifecycle.handle_resurrect_command(cmd_id, from_agent, data)
+            elif command == "handoff":
+                await lifecycle.handle_handoff_command(cmd_id, from_agent, data)
+            else:
+                await lifecycle.update_command_status(cmd_id, "rejected", f"Unknown command: {command}")
+        except Exception as exc:
+            # Settling on failure is what keeps a row from being stranded in 'processing'
+            # until the next process start requeues it.
+            await lifecycle.update_command_status(cmd_id, "rejected", str(exc))
+
+    async def _stop_command_tail(self) -> None:
+        """Stop the tail WITHOUT cancelling the command it is running.
+
+        A sentinel, never task.cancel(). AgentLifecycle.shutdown deliberately does not
+        cancel a handoff whose bounded wait expired, so cancelling the tail dispatching it
+        would reintroduce exactly the partial-state failure that decision avoids. The tail
+        exits once the command in flight has finished; a command that never finishes
+        outlives the process the same way the expired bounded wait does.
+        """
+        if self._command_tail_task is None or self._command_queue is None:
+            return
+        self._command_queue.put_nowait(None)
+        _, unfinished = await asyncio.wait([self._command_tail_task], timeout=2.0)
+        if unfinished:
+            log.warning("Command tail still busy at shutdown; not cancelling it")
+
+    async def _on_mcp_message(
+        self, to_agent: str, body: str, from_agent: str, kind: MessageKind
+    ) -> None:
+        """Callback from message bus — an inter-agent message was found in DB.
+
+        Formats the recipient envelope ONCE here (the sole MCP delivery seam) so
+        direct-deliver and both drain paths inherit already-signed text. Formatting
+        is bound to this callback, NOT to ``source`` — the dynamic-child startup
+        path submits ``source="mcp"`` directly via ``submit_prompt`` and must stay
+        untransformed.
+        """
+        hook = self._config.settings.hooks.on_mcp_message
+        text = format_mcp_message(
+            hook, from_agent=from_agent, to_agent=to_agent, body=body, kind=kind
+        )
+        await self.submit_prompt(
+            to_agent,
+            text,
+            source="mcp",
+            from_agent=from_agent,
+            steerable=self._steer_eligible(to_agent, kind),
+        )
 
     # ------------------------------------------------------------------
     # Event stream
@@ -1004,6 +1581,13 @@ class ACPBroker:
                     await self._message_bus.stop()
             except Exception:
                 log.debug("MessageBus stop error", exc_info=True)
+
+            # After the bus, so no new batch can be claimed while the sentinel is in
+            # flight, and before the final flush.
+            try:
+                await self._stop_command_tail()
+            except Exception:
+                log.debug("Command tail stop error", exc_info=True)
 
             try:
                 await self._flush_turn_buffer_all()

@@ -28,3 +28,16 @@ class TestToolCallUpdatedParentField:
             parent_tool_call_id="parent-tc-1",
         )
         assert evt.parent_tool_call_id == "parent-tc-1"
+
+
+class TestAgentHandedOffUnion:
+    def test_agent_handed_off_is_in_the_system_event_union(self) -> None:
+        """The union is the declared broker-to-frontend surface. An event class left out
+        of it is invisible to every consumer that switches on that type, and nothing
+        else in the suite would notice the omission.
+        """
+        from typing import get_args
+
+        from synth_acp.models.events import AgentHandedOff, SystemEvent
+
+        assert AgentHandedOff in get_args(SystemEvent.__value__)

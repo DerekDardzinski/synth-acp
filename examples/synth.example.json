@@ -1,6 +1,5 @@
 {
   "project": "my-project",
-
   "settings": {
     "communication_mode": "MESH",
     "auto_approve_tools": [
@@ -8,24 +7,37 @@
       "synth-mcp/launch_agent",
       "synth-mcp/list_agents"
     ],
-
+    "handoff_nudge": true,
+    "handoff_nudge_threshold": 0.5,
+    "harness_env": {
+      "claude": {
+        "env": {
+          "CLAUDE_CODE_USE_BEDROCK": "1",
+          "MCP_SERVER_CONNECTION_BATCH_SIZE": "10"
+        },
+        "inherit": "all"
+      }
+    },
     "hooks": {
       "on_agent_startup": {
         "active": true
       },
-
       "on_agent_join": {
         "active": true,
         "recipients": "parent",
         "template": "Agent \"{agent_id}\" is now active. Task: \"{task}\".",
         "kind": "system"
       },
-
       "on_agent_exit": {
         "active": true,
         "recipients": "parent",
         "template": "Agent \"{agent_id}\" has left the session.",
         "kind": "system"
+      },
+      "on_mcp_message": {
+        "active": true,
+        "template": "[{message_type} from {from_agent}]: ",
+        "system_template": "[System notification \u2014 no action required]: "
       }
     }
   }

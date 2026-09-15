@@ -91,7 +91,7 @@ src/synth_acp/
 
 ### Key Dependencies
 
-- `agent-client-protocol==0.9.0` — ACP Python SDK (Pydantic models, `spawn_agent_process`, `SessionAccumulator`)
+- `agent-client-protocol==0.9.0` — ACP Python SDK (Pydantic models, `spawn_agent_process`)
 - `mcp>=1.0.0,<2` — MCP server via `mcp.server.fastmcp.FastMCP` (agent-to-agent messaging)
 - `textual[syntax]>=8.2.1` — TUI framework with syntax highlighting
 - `textual-speedups>=0.2.1` — Cython-accelerated Textual internals
@@ -111,7 +111,14 @@ Optional (`pip install synth-acp[search]`):
 ### Harness-Specific Notes
 
 **Claude Code** (`claude.toml`):
-- Uses `npx @agentclientprotocol/claude-agent-acp` binary
+- Runs the `claude-agent-acp` binary directly, resolved from PATH. Install it with
+  `npm install -g @agentclientprotocol/claude-agent-acp`. No `npx`: a package manager
+  in the spawn path resolves over the network on every launch and, with an unreachable
+  registry, was measured hanging with no output at all, which synth could only show as
+  a permanent INITIALIZING
+- `install_hint` in the TOML names that install command, reported when the adaptor is
+  absent from PATH. Auto-detect also skips a harness whose `run_cmd` program is missing,
+  so claude is not offered on a machine that has Claude Code but not the adaptor
 - `agent_mode_target = "meta_agent"` — passes `agent_mode` as `_meta.claudeCode.options.agent`
 - `executable_env_var = "CLAUDE_CODE_EXECUTABLE"` — injects detected binary path
 - `clear_env_vars = ["CLAUDECODE"]` — clears stale env vars in subprocess
@@ -178,8 +185,11 @@ The CI workflow verifies this before publishing.
 - **File structure**: Test files mirror the source tree. `src/synth_acp/acp/session.py` →
   `tests/acp/test_session.py`. One test file per source module — don't split a module's
   tests across multiple files. Use test classes within the file to organize by feature.
-  A test file may only import from one source module — crossing into another module's
-  territory is a structure violation.
+  A UNIT test file may only import from one source module — crossing into another module's
+  territory is a structure violation. An INTEGRATION test that DRIVES one layer and ASSERTS
+  on another is permitted, and belongs in the mirrored file of the module under ASSERTION:
+  a test that drives an `ACPSession` and asserts on the rows the broker journals is a
+  broker test.
 - **Async**: `pytest-asyncio` with `asyncio_mode = "auto"`. All async tests are plain
   `async def` — no decorator needed.
 - **Fixtures**: Shared helpers used across 3+ test files belong in `tests/conftest.py`,
@@ -265,7 +275,7 @@ No DB close is needed because no persistent connection exists.
 - Google-style docstrings.
 - Pydantic v2 `BaseModel` with `frozen=True` for all cross-layer types.
 - Use the `agent-client-protocol` SDK's Pydantic models directly (e.g. `McpServerStdio`, `EnvVariable`) — don't hand-build dicts for ACP payloads.
-- `SessionAccumulator` from `acp.contrib` is the canonical source of per-agent conversation history. Don't reimplement tool call tracking.
+- Render agent output incrementally from the raw `session/update` notification stream. Synth deliberately does NOT use `SessionAccumulator`: its `apply()` deep-copies the entire accumulated history into a validated snapshot on every notification (166.7 ms per notification at real scale) that nothing reads, and it retains every chunk for the agent's whole lifetime. `ACPSession.session_update` dispatches straight to a `BrokerEvent`.
 
 ## Async Concurrency Rules
 
