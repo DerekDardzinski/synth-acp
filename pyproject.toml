@@ -59,6 +59,9 @@ build-backend = "hatchling.build"
 packages = ["src/synth_acp"]
 
 [tool.pytest.ini_options]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.beads"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 # The full-fixture performance gates replay a 21-agent journal three times each and cost
