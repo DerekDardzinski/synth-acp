@@ -52,14 +52,16 @@ Repository = "https://github.com/DerekDardzinski/synth-acp"
 Issues = "https://github.com/DerekDardzinski/synth-acp/issues"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/synth_acp"]
+core-metadata-version = "2.5"
 
 [tool.hatch.build.targets.sdist]
 exclude = ["/.beads"]
+core-metadata-version = "2.5"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
