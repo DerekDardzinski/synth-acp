@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from rich.highlighter import ReprHighlighter
+from rich.highlighter import JSONHighlighter, ReprHighlighter
 from rich.text import Text
 from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
@@ -25,6 +26,30 @@ from synth_acp.ui.widgets.diff_view import DiffView
 from synth_acp.ui.widgets.expandable_section import ExpandableSection
 
 _HIGHLIGHTER = ReprHighlighter()
+_JSON_HIGHLIGHTER = JSONHighlighter()
+
+
+def _highlight_output(text: str) -> Content:
+    """Render tool output verbatim with Rich highlighting.
+
+    Keeps the output's own ANSI colors and line breaks. Text that parses as JSON gets
+    the JSON highlighter (keys, strings, numbers); anything else gets the repr
+    highlighter (numbers, paths, URLs, booleans).
+
+    Args:
+        text: Raw tool output.
+
+    Returns:
+        Highlighted Content.
+    """
+    rich_text = Text.from_ansi(text)
+    try:
+        json.loads(text)
+    except ValueError:
+        _HIGHLIGHTER.highlight(rich_text)
+    else:
+        _JSON_HIGHLIGHTER.highlight(rich_text)
+    return Content.from_rich_text(rich_text)
 
 MAX_DIFF_ATTEMPTS = 2
 """Render attempts allowed per diff before it is abandoned permanently."""
@@ -230,15 +255,24 @@ class ToolCallBlock(Vertical, can_focus=False):
         content = highlight(f"$ {cmd}", language="bash")
         return [Label(content, id="tc-raw-input")]
 
-    def _text_widgets(self, text_content: str | None) -> list[Markdown]:
-        """Build text content widget if applicable."""
+    def _text_widgets(self, text_content: str | None) -> list[Markdown | VerticalScroll]:
+        """Build text content widget if applicable.
+
+        ``think`` content is agent prose (subagent replies), so it renders as Markdown.
+        ``other`` content is tool output (mostly MCP: JSON, diffs, plain listings), which
+        Markdown mangles by joining lines and reading ``---``/``#`` as syntax, so it renders
+        verbatim with Rich highlighting, like shell output.
+        """
         if not text_content or self._text_rendered:
             return []
         if self._kind not in {"think", "other"}:
             return []
         self._text_rendered = True
         self._copyable_parts.append(text_content)
-        return [Markdown(text_content, id="tc-text", open_links=False)]
+        if self._kind == "think":
+            return [Markdown(text_content, id="tc-text", open_links=False)]
+        label = Label(_highlight_output(text_content), id="tc-text-output-label")
+        return [VerticalScroll(label, id="tc-text-output")]
 
     @staticmethod
     def _diff_key(diff: ToolCallDiff) -> DiffKey:
@@ -330,10 +364,7 @@ class ToolCallBlock(Vertical, can_focus=False):
         self._copyable_parts.append(text)
         widgets: list[Rule | VerticalScroll] = []
         widgets.append(Rule(line_style="dashed", id="tc-output-sep"))
-        rich_text = Text.from_ansi(text)
-        _HIGHLIGHTER.highlight(rich_text)
-        content = Content.from_rich_text(rich_text)
-        label = Label(content, id="tc-raw-output-label")
+        label = Label(_highlight_output(text), id="tc-raw-output-label")
         widgets.append(VerticalScroll(label, id="tc-raw-output"))
         exit_status = _extract_exit_status(raw_output)
         if exit_status is not None:

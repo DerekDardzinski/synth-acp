@@ -9,7 +9,7 @@ import pathlib
 from unittest.mock import AsyncMock, MagicMock
 
 from textual.containers import VerticalScroll
-from textual.widgets import Static
+from textual.widgets import Label, Markdown, Static
 
 from synth_acp.models.agent import AgentConfig
 from synth_acp.models.config import SessionConfig
@@ -114,6 +114,49 @@ class TestToolCallBlockContent:
         text = _extract_raw_output_text(raw)
         assert text is not None
         assert "hello world" in text
+
+    async def test_other_kind_text_renders_verbatim_not_as_markdown(self) -> None:
+        """MCP tool output keeps its line breaks and Markdown-like syntax as literal text.
+
+        Markdown would join the single-newline lines into one paragraph and turn
+        ``---`` into a horizontal rule, which is what made diffs and listings unreadable.
+        """
+        output = "--- a/f.py\n+++ b/f.py\n# not a heading\nline one\nline two"
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)):
+            feed = await _get_feed(app)
+            await feed.add_tool_call(
+                "tc7", "@trails/show", "other", "completed", text_content=output,
+            )
+            block = app.query_one("#tool-tc7", ToolCallBlock)
+            assert len(block.query("#tc-text")) == 0
+            label = block.query_one("#tc-text-output-label", Label)
+            assert label.content.plain == output
+
+    async def test_other_kind_json_text_gets_json_highlighting(self) -> None:
+        """JSON output is highlighted as JSON: keys and string values get distinct styles."""
+        output = '{"id": "abc", "count": 3}'
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)):
+            feed = await _get_feed(app)
+            await feed.add_tool_call(
+                "tc8", "@trails/search", "other", "completed", text_content=output,
+            )
+            label = app.query_one("#tool-tc8 #tc-text-output-label", Label)
+            styled = {output[s.start : s.end] for s in label.content.spans}
+            assert {'"id"', '"abc"', "3"} <= styled
+
+    async def test_think_kind_text_still_renders_markdown(self) -> None:
+        """Subagent prose (think kind) keeps Markdown rendering."""
+        app = SynthApp(_make_broker(), _make_config())
+        async with app.run_test(headless=True, size=(120, 40)):
+            feed = await _get_feed(app)
+            await feed.add_tool_call(
+                "tc9", "Task", "think", "completed", text_content="**done**",
+            )
+            block = app.query_one("#tool-tc9", ToolCallBlock)
+            assert isinstance(block.query_one("#tc-text"), Markdown)
+            assert len(block.query("#tc-text-output")) == 0
 
 
 

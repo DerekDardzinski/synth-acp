@@ -159,6 +159,8 @@ ToolCallBlock.tool-permission {
 #tc-raw-input { background: $background; padding: 0 1; }
 #tc-raw-output { background: $background; padding: 0 1; height: auto; max-height: 20; overflow-x: hidden; scrollbar-size-vertical: 1; }
 #tc-raw-output-label { width: 1fr; }
+#tc-text-output { background: $background; padding: 0 1; height: auto; max-height: 20; overflow-x: hidden; scrollbar-size-vertical: 1; }
+#tc-text-output-label { width: 1fr; }
 #tc-text { padding-left: 2; }
 
 /* ── Diff view ── */
