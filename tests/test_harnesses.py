@@ -78,7 +78,7 @@ class TestLoadHarnessRegistry:
             "claude",
             None,
         )
-        assert by_short_name["opencode"].extension == "standard"
+        assert by_short_name["opencode"].extension == "opencode"
         assert by_short_name["gemini"].extension == "standard"
 
     def test_v3_variant_resolves(self) -> None:

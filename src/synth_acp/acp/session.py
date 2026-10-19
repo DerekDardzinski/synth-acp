@@ -516,6 +516,64 @@ class ACPSession:
                 )
             )
 
+    async def _apply_agent_mode_option(self, conn: Any) -> None:
+        """Select agent_mode through the native ``mode``-category config option.
+
+        Only for an engine whose ``profile_switch`` is ``"config_option"`` (OpenCode),
+        which advertises its agents as that option's values and no legacy ``modes``.
+        Called after ``_capture_config_options`` on launch and restore, before IDLE.  A
+        value the option does not offer, or a failed switch, is reported as one warning
+        and the session stays usable in its current mode.
+        """
+        if self._agent_mode is None or self.capabilities.profile_switch != "config_option":
+            return
+        opt = next(
+            (
+                o
+                for o in self._config_options
+                if isinstance(o, SessionConfigOptionSelect) and o.category == "mode"
+            ),
+            None,
+        )
+        if opt is None or self._agent_mode not in (_allowed_values(opt) or frozenset()):
+            current = f"'{opt.current_value}'" if opt is not None else "its default"
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=(
+                        f"Agent profile '{self._agent_mode}' is not offered by the agent; "
+                        f"running as {current}"
+                    ),
+                    severity="warning",
+                )
+            )
+            return
+        if opt.current_value == self._agent_mode:
+            return
+        try:
+            resp = await self._handshake(
+                conn.set_config_option(opt.id, self._session_id, self._agent_mode),
+                "session/set_config_option",
+            )
+        except HandshakeTimeoutError:
+            # Re-raised so run()'s handler reports it and the process group is killed;
+            # the broad handler below must not present a stalled agent as usable.
+            raise
+        except Exception as exc:
+            log.warning("Applying agent_mode failed for %s: %s", self.agent_id, exc)
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=f"Failed to set {opt.id}={self._agent_mode}: {exc}",
+                    severity="warning",
+                )
+            )
+            return
+        self._config_options = list(resp.config_options)
+        await self._event_sink(
+            ConfigOptionsReceived(agent_id=self.agent_id, config_options=self._config_options)
+        )
+
     async def _handshake(self, awaitable: Awaitable[_T], step: str) -> _T:
         """Await one request to the agent under ``_HANDSHAKE_TIMEOUT``.
 
@@ -705,6 +763,7 @@ class ACPSession:
                         )
 
                 await self._capture_config_options(session)
+                await self._apply_agent_mode_option(conn)
                 await self._sm.transition(AgentState.IDLE)
                 await proc.wait()
         except HandshakeTimeoutError as e:
@@ -930,6 +989,7 @@ class ACPSession:
                     )
 
                 await self._capture_config_options(session)
+                await self._apply_agent_mode_option(conn)
                 await self._sm.transition(AgentState.IDLE)
                 await proc.wait()
         except HandshakeTimeoutError as e:

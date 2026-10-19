@@ -71,6 +71,7 @@ from synth_acp.models.events import (
 )
 from synth_acp.models.extensions import (
     ContextUsage,
+    ExtensionCapabilities,
     ProfileUnavailable,
     SteerOutcome,
     UpdateHints,
@@ -3610,3 +3611,157 @@ class TestRestoreOrder:
             if isinstance(e, BrokerError) and e.severity == "warning" and "starting fresh" in e.message
         ]
         assert len(warnings) == 1
+
+
+class _ConfigOptionProfileExtension(AcpExtension):
+    """An engine that takes agent_mode only through its mode config option (OpenCode)."""
+
+    name = "test-config-option-profile"
+    capabilities = ExtensionCapabilities(profile_switch="config_option")
+
+
+class TestAgentModeViaConfigOption:
+    """profile_switch 'config_option': agent_mode applied through the mode config option."""
+
+    @staticmethod
+    def _options(mode: str) -> list[Any]:
+        from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+
+        return [
+            SessionConfigOptionSelect(
+                id="model",
+                name="Model",
+                category="model",
+                type="select",
+                current_value="m1",
+                options=[SessionConfigSelectOption(name="M1", value="m1")],
+            ),
+            SessionConfigOptionSelect(
+                id="mode",
+                name="Session Mode",
+                category="mode",
+                type="select",
+                current_value=mode,
+                options=[
+                    SessionConfigSelectOption(name="build", value="build"),
+                    SessionConfigSelectOption(name="plan", value="plan"),
+                ],
+            ),
+        ]
+
+    def _conn(self, *, current: str, resume: bool = False) -> Any:
+        from acp.schema import InitializeResponse
+
+        caps = {"sessionCapabilities": {"resume": {}}} if resume else {}
+        conn = AsyncMock()
+        conn.initialize.return_value = InitializeResponse.model_validate(
+            {"protocolVersion": 1, "agentCapabilities": caps}
+        )
+        resp = MagicMock(
+            session_id="sess-new", modes=None, models=None, config_options=self._options(current)
+        )
+        conn.new_session.return_value = resp
+        conn.resume_session.return_value = resp
+        conn.set_config_option.return_value = MagicMock(config_options=self._options("plan"))
+        return conn
+
+    @staticmethod
+    async def _start(
+        events: list[BrokerEvent], conn: Any, agent_mode: str, *, restore: bool = False
+    ) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="fake",
+            args=[],
+            cwd="/work",
+            event_sink=sink,
+            agent_mode=agent_mode,
+            extension=_ConfigOptionProfileExtension(),
+        )
+        proc = MagicMock(returncode=0)
+        proc.wait = AsyncMock(return_value=0)
+
+        @asynccontextmanager
+        async def fake_spawn(*_a: Any, **_kw: Any) -> Any:
+            yield conn, proc, _StderrTail()
+
+        with patch("synth_acp.acp.session._spawn_isolated_agent", fake_spawn):
+            if restore:
+                await session.run_restored("sess-saved")
+            else:
+                await session.run()
+        return session
+
+    @staticmethod
+    def _last_mode(events: list[BrokerEvent]) -> str:
+        from synth_acp.models.events import ConfigOptionsReceived
+
+        last = [e for e in events if isinstance(e, ConfigOptionsReceived)][-1]
+        return str(next(o.current_value for o in last.config_options if o.id == "mode"))
+
+    @staticmethod
+    def _reached_idle(events: list[BrokerEvent]) -> bool:
+        return any(
+            isinstance(e, AgentStateChanged) and e.new_state == AgentState.IDLE for e in events
+        )
+
+    async def test_launch_selects_agent_mode_through_the_mode_option(self) -> None:
+        """Silent failure: `--agent-mode plan` on OpenCode runs as build, because the
+        engine advertises no legacy modes and set_session_mode is never reached."""
+        events: list[BrokerEvent] = []
+        conn = self._conn(current="build")
+        await self._start(events, conn, "plan")
+
+        conn.set_config_option.assert_awaited_once_with("mode", "sess-new", "plan")
+        conn.set_session_mode.assert_not_awaited()
+        assert self._last_mode(events) == "plan"
+
+    async def test_restore_reselects_agent_mode_when_the_engine_reset_it(self) -> None:
+        """Silent failure: a resumed OpenCode session comes back in build mode."""
+        events: list[BrokerEvent] = []
+        conn = self._conn(current="build", resume=True)
+        await self._start(events, conn, "plan", restore=True)
+
+        conn.new_session.assert_not_awaited()
+        conn.set_config_option.assert_awaited_once_with("mode", "sess-saved", "plan")
+        assert self._last_mode(events) == "plan"
+
+    async def test_restore_already_in_agent_mode_sends_no_switch(self) -> None:
+        """Silent failure: every restore re-sends the mode, a needless config request
+        on a session OpenCode already resumed in the right agent."""
+        events: list[BrokerEvent] = []
+        conn = self._conn(current="plan", resume=True)
+        await self._start(events, conn, "plan", restore=True)
+
+        conn.set_config_option.assert_not_awaited()
+        assert self._last_mode(events) == "plan"
+
+    async def test_unoffered_agent_mode_warns_once_and_sends_nothing(self) -> None:
+        """Silent failure: an unknown profile is dropped with only a log line, or is
+        sent and leaves the engine in an undefined mode."""
+        events: list[BrokerEvent] = []
+        conn = self._conn(current="build")
+        await self._start(events, conn, "reviewer")
+
+        conn.set_config_option.assert_not_awaited()
+        warnings = [e.message for e in events if isinstance(e, BrokerError)]
+        assert warnings == [
+            "Agent profile 'reviewer' is not offered by the agent; running as 'build'"
+        ]
+        assert self._reached_idle(events)
+
+    async def test_failed_switch_warns_and_the_session_still_starts(self) -> None:
+        """Silent failure: one rejected switch kills an otherwise usable agent."""
+        events: list[BrokerEvent] = []
+        conn = self._conn(current="build")
+        conn.set_config_option.side_effect = RequestError(-32602, "Invalid params")
+        await self._start(events, conn, "plan")
+
+        warnings = [e.message for e in events if isinstance(e, BrokerError)]
+        assert len(warnings) == 1
+        assert warnings[0].startswith("Failed to set mode=plan:")
+        assert self._last_mode(events) == "build"
+        assert self._reached_idle(events)

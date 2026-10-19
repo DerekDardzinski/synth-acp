@@ -3,3 +3,4 @@ name = "OpenCode"
 short_name = "opencode"
 binary_names = ["opencode"]
 run_cmd = "opencode acp"
+extension = "opencode"

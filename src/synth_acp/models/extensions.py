@@ -20,14 +20,17 @@ class ExtensionCapabilities(BaseModel, frozen=True):
         profile_switch: How agent_mode is changed: ``"mode"`` in place via
             set_session_mode (Kiro), or ``"handoff"`` by an agent-written handoff to a
             fresh session started as the new profile (Claude, whose main-thread agent is
-            fixed at session creation).
+            fixed at session creation), or ``"config_option"`` through the native
+            ``mode``-category config option, which ACPSession also uses to apply
+            agent_mode after session creation and restore (OpenCode, which advertises
+            its agents only as that option's values, with no legacy ``modes``).
         reload_after_mode_switch: A mode switch drops MCP servers, so reload them via
             load_session (Kiro v2).
         no_replay_load: ``session_meta("load")`` suppresses the agent's history replay.
     """
 
     steer: bool = False
-    profile_switch: Literal["mode", "handoff"] = "mode"
+    profile_switch: Literal["mode", "handoff", "config_option"] = "mode"
     reload_after_mode_switch: bool = False
     no_replay_load: bool = False
 

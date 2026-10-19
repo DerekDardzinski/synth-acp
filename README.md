@@ -291,7 +291,7 @@ The `--agent-mode` flag has different semantics per harness:
 | Kiro | Agent config name. v2 engine: passed as the `--agent` CLI flag + `set_session_mode`. v3 engine: passed as `_meta.kiro.modeId` on session creation + `set_session_mode` (v3 rejects `--agent`) | `plan`, `code-planner` |
 | Claude Code | Agent name (passed by the `claude` extension as `_meta.claudeCode.options.extraArgs.agent`, which the adaptor turns into the Claude CLI's `--agent` flag; the agent picker switches agents by handoff, see below) | `local-SHScienceAgentKit-all:code-planner` |
 | Codex | Codex mode id, applied with `set_session_mode` | `read-only`, `workspace-write`, `agent`, `agent-full-access` |
-| OpenCode | Not supported | — |
+| OpenCode | OpenCode primary agent id (built-in `build`, `plan`, or a custom agent from OpenCode's config), applied with `set_config_option` on the `mode` option after the session starts | `plan`, `review` |
 | Gemini CLI | Not supported | — |
 
 For Claude Code, plugin agents require the full qualified name: `<plugin-name>:<agent-name>`. User/project agents (in `~/.claude/agents/` or `.claude/agents/`) use just the agent name.
@@ -330,7 +330,7 @@ Synth dynamically renders configuration pickers based on what the harness advert
 | Kiro (v3 engine) | Whatever v3 advertises: Mode, Model, Effort, and v3's own options (e.g. thinking, autopilot) |
 | Claude Code | Mode (permission), Model, Effort |
 | Codex | Mode, Collaboration mode, Model, Reasoning effort |
-| OpenCode | None |
+| OpenCode | Model, Effort, Mode (primary agents) |
 | Gemini CLI | None |
 
 Only options in the ACP-reserved categories (`mode`, `model`, `thought_level`) and the agent-profile picker appear inline. Any other option the harness returns, such as Kiro v3's Autopilot or Memory reflection, sits behind a `⋯ N more` label that opens a modal.
@@ -391,6 +391,21 @@ npm install -g @agentclientprotocol/codex-acp
   copies of each.
 - Restore uses `session/resume`, which keeps the conversation. Codex resets mode, model
   and reasoning effort on resume; synth re-applies `agent_mode` but not picker changes.
+
+### OpenCode
+
+The `opencode` harness runs `opencode acp` (verified on OpenCode 2.0.28).
+
+- `agent_mode` is an OpenCode primary agent: `build` (default), `plan`, or a custom agent
+  defined in OpenCode's config files or `agent/*.md` files. synth lists them for the launch
+  picker by reading the same files OpenCode reads; agents added by organization config or
+  plugins appear only in the live Mode picker.
+- An `agent_mode` that OpenCode does not offer produces one warning, and the agent keeps its
+  current agent: OpenCode's default on launch, the resumed session's agent on restore.
+- **No in-turn steering**: OpenCode's ACP mode refuses a second prompt while a turn runs, so
+  synth does not offer Steer for OpenCode agents; prompts and inter-agent messages sent while
+  the agent is busy are queued for the next turn.
+- Restore uses `session/resume`, which keeps the conversation; synth re-applies `agent_mode`.
 
 ### Session Restore
 

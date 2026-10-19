@@ -53,7 +53,8 @@ src/synth_acp/
 │       ├── claude.py   # ClaudeExtension — claudeCode _meta, handoff to switch agent, discovery
 │       ├── codex.py    # CodexExtension — _session/steering, threadStatus → TurnActivity, MCP identity
 │       ├── kiro_v2.py  # KiroV2Extension — kiro.dev/metadata usage, session/steer, discovery
-│       └── kiro_v3.py  # KiroV3Extension — _meta.kiro modeId/noReplay, context_usage, shell_type
+│       ├── kiro_v3.py  # KiroV3Extension — _meta.kiro modeId/noReplay, context_usage, shell_type
+│       └── opencode.py # OpenCodeExtension — agent_mode via mode config option, offline agent discovery
 ├── broker/
 │   ├── broker.py       # ACPBroker — thin coordinator, event sink, command dispatch
 │   ├── lifecycle.py    # AgentLifecycle — launch, terminate, prompt, hooks
@@ -207,8 +208,34 @@ Optional (`pip install synth-acp[search]`):
 - Global `~/.codex` MCP servers load in every session
 
 **OpenCode** (`opencode.toml`):
-- `run_cmd = "opencode acp"` — simple ACP mode
-- No agent_mode support
+- `run_cmd = "opencode acp"`, `extension = "opencode"`. Verified on OpenCode 2.0.28 (product v2;
+  the wire is ACP protocol v1, standard methods only)
+- Returns native `configOptions` only (model, effort = `thought_level`, mode); no legacy `modes`
+  or `models`, and session/new ignores `_meta`
+- `OpenCodeExtension.capabilities.profile_switch = "config_option"`: ACPSession applies
+  `agent_mode` after session/new and after restore with `set_config_option` on the
+  `mode`-category option (`_apply_agent_mode_option`), only when the current value differs; a
+  value the option does not offer is one BrokerError warning and the session runs in its current mode
+- Mode values are OpenCode primary agents: built-ins `build`, `plan`, plus custom agents.
+  `discover_profiles` reads them offline in OpenCode's order: global dir (`$OPENCODE_CONFIG_DIR`, else
+  `$XDG_CONFIG_HOME|~/.config` + `/opencode`) json, jsonc, then `{agent,agents}/**/*.md` and
+  `{mode,modes}/*.md`; `$OPENCODE_CONFIG`; `opencode.json[c]` from filesystem root down to cwd;
+  each `.opencode` dir on that path; `$OPENCODE_CONFIG_CONTENT`. Later wins; `disabled`/`disable`
+  removes; subagent or hidden agents are not selectable; `default_agent` goes first in
+  `discover_profiles` (`discovery.discover_agents` re-sorts by source and name for the picker); markdown
+  frontmatter is retried with unquoted-colon values as block scalars and empty files are skipped, as
+  OpenCode's `ConfigMarkdown.parse` does. Organization
+  (wellknown) config and plugin-added agents are not visible offline
+- No steering: a second session/prompt during a turn is rejected (-32603 "Session already has an
+  active ACP prompt") and no steer method exists over ACP, so messages queue until the turn ends.
+  Each `opencode acp` runs its own private server (random port, password in its env only); do not
+  build on the background `opencode service`
+- Not handled (no current need): the `opencode/child-session-updates` opt-in (without it child
+  updates are projected into the parent stream with `_meta["opencode/child-session"]` and toolCallIds
+  prefixed `<childId>:`), `_meta["opencode/retry"]` and `_meta["opencode/compaction"]` markers on
+  `session_info_update`, and MCP permission identity (default permissions never ask for MCP tools,
+  and Code Mode wraps MCP calls in an `execute` tool)
+- Restore: `session/resume` (advertised), zero replay; resume requires the session's original cwd
 
 **Gemini CLI** (`gemini.toml`):
 - `run_cmd = "gemini --experimental-acp"` — experimental ACP flag

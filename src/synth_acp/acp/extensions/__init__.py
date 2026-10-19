@@ -12,6 +12,7 @@ from synth_acp.acp.extensions.claude import ClaudeExtension
 from synth_acp.acp.extensions.codex import CodexExtension
 from synth_acp.acp.extensions.kiro_v2 import KiroV2Extension
 from synth_acp.acp.extensions.kiro_v3 import KiroV3Extension
+from synth_acp.acp.extensions.opencode import OpenCodeExtension
 
 __all__ = [
     "AcpExtension",
@@ -57,3 +58,4 @@ register_extension(ClaudeExtension)
 register_extension(CodexExtension)
 register_extension(KiroV2Extension)
 register_extension(KiroV3Extension)
+register_extension(OpenCodeExtension)
