@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import sys
 import threading
+from collections.abc import Mapping
 from contextlib import closing
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from synth_acp.db import (
     expire_old_sessions_sync,
 )
 from synth_acp.discovery import discover_agents
-from synth_acp.harnesses import load_harness_registry
+from synth_acp.harnesses import UnknownHarnessVariantError, load_harness_registry
 from synth_acp.models.agent import AgentConfig
 from synth_acp.models.config import (
     GLOBAL_CONFIG_PATH,
@@ -42,6 +43,7 @@ from synth_acp.models.config import (
     merge_harness_env,
     save_global_config,
     validate_handoff_nudge_template,
+    validate_handoff_switch_template,
 )
 
 log = logging.getLogger(__name__)
@@ -71,6 +73,9 @@ SETTABLE_KEYS: dict[str, str] = {
     "handoff_nudge": "Nudge an agent to consider handoff when its context fills (true or false)",
     "handoff_nudge_threshold": "Context-window fraction that triggers the nudge (0 < x <= 1)",
     "handoff_nudge_template": "Nudge body. Slots: {agent_id}, {used}, {nudge_threshold}",
+    "handoff_switch_template": (
+        "Profile-switch request body. Slots: {agent_id}, {agent_mode}, {profile}, {instructions}"
+    ),
 }
 
 config_app = typer.Typer()
@@ -96,9 +101,9 @@ def config_list() -> None:
             display = ", ".join(val) if val else "(empty)"
         else:
             display = str(val)
-            # Only the nudge template is prose long enough to flood the terminal;
+            # Only the two templates are prose long enough to flood the terminal;
             # every other scalar is shown in full so it can be copied exactly.
-            if key == "handoff_nudge_template" and len(display) > 60:
+            if key in ("handoff_nudge_template", "handoff_switch_template") and len(display) > 60:
                 display = display[:57] + "..."
 
         print(f"  {key}: {display}  — {desc}")
@@ -163,6 +168,12 @@ def config_set(
             new_value = validate_handoff_nudge_template(value)
         except ValueError as e:
             print(f"Invalid handoff_nudge_template: {e}", file=sys.stderr)
+            raise typer.Exit(1) from None
+    elif key == "handoff_switch_template":
+        try:
+            new_value = validate_handoff_switch_template(value)
+        except ValueError as e:
+            print(f"Invalid handoff_switch_template: {e}", file=sys.stderr)
             raise typer.Exit(1) from None
     else:  # auto_approve_tools
         new_value = [item.strip() for item in value.split(",")]
@@ -281,6 +292,22 @@ def maintenance_expire(
 # ------------------------------------------------------------------
 
 
+def _load_registry(variants: Mapping[str, str]) -> list[HarnessEntry]:
+    """Load the harness registry for ``variants``, exiting 1 on an unknown variant.
+
+    Args:
+        variants: The ``harness_variant`` setting to resolve engine variants with.
+
+    Raises:
+        typer.Exit: A variant name is not declared by its harness; the message is printed.
+    """
+    try:
+        return load_harness_registry(variants)
+    except UnknownHarnessVariantError as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1) from None
+
+
 def _build_transient_config(
     harness_name: str, agent_id: str | None, agent_mode: str | None,
     global_cfg: GlobalConfig,
@@ -299,7 +326,7 @@ def _build_transient_config(
     Raises:
         typer.Exit: If the harness is not found.
     """
-    registry = load_harness_registry()
+    registry = _load_registry(global_cfg.harness_variant)
     harness = next((h for h in registry if h.short_name == harness_name), None)
     if not harness:
         known = ", ".join(sorted(h.short_name for h in registry))
@@ -327,7 +354,9 @@ def _build_transient_config(
         handoff_nudge=global_cfg.handoff_nudge,
         handoff_nudge_threshold=global_cfg.handoff_nudge_threshold,
         handoff_nudge_template=global_cfg.handoff_nudge_template,
+        handoff_switch_template=global_cfg.handoff_switch_template,
         harness_env=global_cfg.harness_env,
+        harness_variant=global_cfg.harness_variant,
         hooks=HooksConfig(
             on_agent_startup=global_cfg.hooks.on_agent_startup,
             on_agent_join=global_cfg.hooks.on_agent_join,
@@ -383,11 +412,19 @@ def _apply_global_settings(raw: RawSessionConfig, global_cfg: GlobalConfig) -> S
         if raw.settings.handoff_nudge_template is not None
         else global_cfg.handoff_nudge_template
     )
+    handoff_switch_template = (
+        raw.settings.handoff_switch_template
+        if raw.settings.handoff_switch_template is not None
+        else global_cfg.handoff_switch_template
+    )
 
     # Per harness, per variable: a project overriding one variable must not drop the
     # rest of that harness's block.  See merge_harness_env for why this diverges from
     # auto_approve_tools, where a project list replaces the global one wholesale.
     harness_env = merge_harness_env(global_cfg.harness_env, raw.settings.harness_env)
+    # Per harness: a project choosing one harness's engine keeps the global choice for
+    # every other harness.
+    harness_variant = {**global_cfg.harness_variant, **raw.settings.harness_variant}
 
     # Hooks merge: project default → use global, otherwise project wins
     on_startup = (
@@ -420,7 +457,9 @@ def _apply_global_settings(raw: RawSessionConfig, global_cfg: GlobalConfig) -> S
         handoff_nudge=handoff_nudge,
         handoff_nudge_threshold=handoff_nudge_threshold,
         handoff_nudge_template=handoff_nudge_template,
+        handoff_switch_template=handoff_switch_template,
         harness_env=harness_env,
+        harness_variant=harness_variant,
         hooks=HooksConfig(
             on_agent_startup=on_startup,
             on_agent_join=on_join,
@@ -498,7 +537,7 @@ def _resolve_agent(
         )
 
     # Try auto-detect
-    installed = _detect_installed_harnesses()
+    installed = _detect_installed_harnesses(global_cfg.harness_variant)
     if len(installed) == 1:
         entry, _ = installed[0]
         print(
@@ -524,7 +563,7 @@ def _resolve_agent(
         )
         raise typer.Exit(1)
 
-    registry = load_harness_registry()
+    registry = _load_registry(global_cfg.harness_variant)
     print("No ACP harnesses found in PATH.", file=sys.stderr)
     print("Install one of:", file=sys.stderr)
     for h in registry:
@@ -590,7 +629,7 @@ def _resolve_config(
         )
 
     # 5. Auto-detect installed harnesses
-    installed = _detect_installed_harnesses()
+    installed = _detect_installed_harnesses(global_cfg.harness_variant)
     if len(installed) == 1:
         entry, _ = installed[0]
         print(
@@ -611,7 +650,7 @@ def _resolve_config(
         raise typer.Exit(1)
 
     # No harnesses found
-    registry = load_harness_registry()
+    registry = _load_registry(global_cfg.harness_variant)
     print("No ACP harnesses found in PATH.", file=sys.stderr)
     print("Install one of:", file=sys.stderr)
     for h in registry:
@@ -621,7 +660,8 @@ def _resolve_config(
 
 def _resolve_harness_for_discovery(harness: str | None) -> HarnessEntry:
     """Resolve a HarnessEntry for discovery flags (--list-agents, --select-agent)."""
-    registry = load_harness_registry()
+    global_cfg = load_global_config()
+    registry = _load_registry(global_cfg.harness_variant)
 
     if harness:
         entry = next((h for h in registry if h.short_name == harness), None)
@@ -631,13 +671,12 @@ def _resolve_harness_for_discovery(harness: str | None) -> HarnessEntry:
             raise typer.Exit(1)
         return entry
 
-    global_cfg = load_global_config()
     if global_cfg.default_harness:
         entry = next((h for h in registry if h.short_name == global_cfg.default_harness), None)
         if entry:
             return entry
 
-    installed = _detect_installed_harnesses()
+    installed = _detect_installed_harnesses(global_cfg.harness_variant)
     if len(installed) == 1:
         return installed[0][0]
 
@@ -651,13 +690,18 @@ def _resolve_harness_for_discovery(harness: str | None) -> HarnessEntry:
     raise typer.Exit(1)
 
 
-def _detect_installed_harnesses() -> list[tuple[HarnessEntry, str]]:
+def _detect_installed_harnesses(
+    variants: Mapping[str, str] | None = None,
+) -> list[tuple[HarnessEntry, str]]:
     """Probe PATH for installed ACP harness binaries.
+
+    Args:
+        variants: The ``harness_variant`` setting; selects each harness's run_cmd.
 
     Returns:
         List of (HarnessEntry, binary_path) pairs for each harness found.
     """
-    registry = load_harness_registry()
+    registry = _load_registry(variants or {})
     installed: list[tuple[HarnessEntry, str]] = []
     for harness in registry:
         # The program synth actually spawns must resolve, not just the harness's own
@@ -814,6 +858,9 @@ def cli(
         agent_mode = _handle_select_agent(harness)
 
     resolved_config, initial_agent = _resolve_config(harness, agent_id, agent_mode, config)
+    # The merged setting (a .synth.json may override the global one) is validated here,
+    # so an unknown variant exits with its message before the TUI starts.
+    _load_registry(resolved_config.settings.harness_variant)
     _run_tui(resolved_config, initial_agent, style=style, restore=restore)
 
 

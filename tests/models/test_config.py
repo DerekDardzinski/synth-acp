@@ -401,6 +401,59 @@ class TestHandoffNudgeConfig:
         ) == "[Notification from synth]: body"
 
 
+class TestHandoffSwitchConfig:
+    """The profile-switch request template: its slot set and how it renders."""
+
+    def test_switch_template_rejects_unknown_slot_at_load(self):
+        """A bad template must fail at config load, not when the user picks an agent."""
+        from pydantic import ValidationError
+
+        from synth_acp.models.config import GlobalConfig, RawSettingsConfig
+
+        with pytest.raises(ValidationError):
+            GlobalConfig(handoff_switch_template="{used}")
+        with pytest.raises(ValidationError):
+            RawSettingsConfig(handoff_switch_template="{used}")
+
+    def test_instructions_slot_renders_empty_or_header_plus_verbatim_text(self):
+        """No header for no instructions, and the user's braces and newlines survive."""
+        from synth_acp.models.config import format_handoff_switch
+
+        def render(instructions: str | None) -> str:
+            return format_handoff_switch(
+                "A{instructions}B", agent_id="a1", agent_mode="m", instructions=instructions
+            )
+
+        assert render(None) == "AB"
+        assert render("") == "AB"
+        assert render("keep {x}\nline2") == (
+            "A\n\nThe user's instructions for this handoff:\nkeep {x}\nline2B"
+        )
+
+    def test_default_template_names_the_argument_the_agent_must_pass(self):
+        """The agent copies agent_mode="..." from this text into its handoff call."""
+        from synth_acp.models.config import DEFAULT_HANDOFF_SWITCH_TEMPLATE, format_handoff_switch
+
+        rendered = format_handoff_switch(
+            DEFAULT_HANDOFF_SWITCH_TEMPLATE, agent_id="a1", agent_mode="probe-heron", instructions=None
+        )
+        assert 'agent_mode="probe-heron"' in rendered
+        assert rendered.endswith("not obvious from the code.")
+
+    def test_default_agent_target_is_named_and_passed_as_empty_string(self):
+        """'' is the harness default agent. Silent failure: the agent is told to switch to
+        profile "" and omits the argument, which keeps its current profile instead."""
+        from synth_acp.models.config import DEFAULT_HANDOFF_SWITCH_TEMPLATE, format_handoff_switch
+
+        rendered = format_handoff_switch(
+            DEFAULT_HANDOFF_SWITCH_TEMPLATE, agent_id="a1", agent_mode="", instructions=None
+        )
+        assert rendered.startswith(
+            'The user asked to switch you to the default agent. Call the handoff tool now '
+            'with agent_mode=""'
+        )
+
+
 _CLAUDE = HarnessEntry(
     identity="claude",
     name="Claude Code",

@@ -27,21 +27,28 @@ Layers 1 and 2 have zero Textual imports. The frontend communicates with the bro
 src/synth_acp/
 ├── cli.py              # typer CLI, entry point
 ├── db.py               # Shared SQLite schema and helpers
-├── discovery.py        # Filesystem-based agent discovery for harnesses
+├── discovery.py        # Agent discovery: dispatches to the harness extension's discover_profiles
 ├── embeddings.py       # Standalone embedding module for semantic session search
-├── harnesses.py        # Harness registry loader (TOML → HarnessEntry)
+├── harnesses.py        # Harness registry loader (TOML + harness_variant → HarnessEntry)
 ├── data/
 │   └── harnesses/      # Harness TOML definitions (kiro.toml, claude.toml, opencode.toml, gemini.toml)
 ├── models/
-│   ├── agent.py        # AgentState enum, AgentConfig
+│   ├── agent.py        # AgentState enum, AgentConfig, DiscoveredAgent
 │   ├── config.py       # SessionConfig, HooksConfig (parsed from .synth.json)
+│   ├── extensions.py   # ExtensionCapabilities, signals, UpdateHints, SteerOutcome (extension → synth)
 │   ├── events.py       # BrokerEvent and subclasses (broker → frontend)
 │   ├── commands.py     # BrokerCommand and subclasses (frontend → broker)
 │   ├── visibility.py   # Agent visibility rules (MESH/LOCAL)
 │   └── permissions.py  # PermissionRule, PermissionDecision
 ├── acp/
-│   ├── session.py      # ACPSession — wraps acp SDK Client interface
-│   └── state_machine.py # AgentStateMachine — typed state transitions
+│   ├── session.py      # ACPSession — wraps acp SDK Client interface; standard ACP for every harness
+│   ├── state_machine.py # AgentStateMachine — typed state transitions
+│   └── extensions/     # Per-engine proprietary protocol, one stateless AcpExtension each
+│       ├── __init__.py # Explicit registry: get_extension, register_extension
+│       ├── base.py     # AcpExtension — plain standard ACP (the "standard" extension)
+│       ├── claude.py   # ClaudeExtension — claudeCode _meta, handoff to switch agent, discovery
+│       ├── kiro_v2.py  # KiroV2Extension — kiro.dev/metadata usage, session/steer, discovery
+│       └── kiro_v3.py  # KiroV3Extension — _meta.kiro modeId/noReplay, context_usage, shell_type
 ├── broker/
 │   ├── broker.py       # ACPBroker — thin coordinator, event sink, command dispatch
 │   ├── lifecycle.py    # AgentLifecycle — launch, terminate, prompt, hooks
@@ -115,7 +122,19 @@ Optional (`pip install synth-acp[search]`):
 - `install_hint` in the TOML names that install command, reported when the adaptor is
   absent from PATH. Auto-detect also skips a harness whose `run_cmd` program is missing,
   so claude is not offered on a machine that has Claude Code but not the adaptor
-- `agent_mode_target = "meta_agent"` — passes `agent_mode` as `_meta.claudeCode.options.agent`
+- `extension = "claude"` — `ClaudeExtension` passes `agent_mode` as `_meta.claudeCode.options.extraArgs.agent`
+  on every session op (the adaptor passes it to the Claude CLI as `--agent`). Never `options.agent`:
+  claude-agent-acp >= 0.77.0 deletes it, and sessions created on those versions with it ran as the
+  default agent. Verified on 0.70.0 and 0.81.2, including `<plugin>:<agent>` names
+- `ClaudeExtension.check_profile` warns (one BrokerError, launch continues) when `agent_mode` matches
+  no discovered agent, because the adaptor accepts unknown names silently
+- The CLI fixes the agent at session creation: resume and fork keep it, so restore cannot change a
+  session's agent. `profile_switch = "handoff"` makes the picker send `RequestProfileSwitch`: the broker
+  asks the agent (template `handoff_switch_template`) to call the `handoff` MCP tool with `agent_mode`,
+  and the successor starts as that agent with the user's instructions appended verbatim. The switch is
+  pending until the handoff, and is dropped with a warning when the agent's turn ends without one
+- ACPSession logs `InitializeResponse.agentInfo` name and version at INFO for every harness, so a
+  selection regression can be traced to an adaptor bump
 - `executable_env_var = "CLAUDE_CODE_EXECUTABLE"` — injects detected binary path
 - `clear_env_vars = ["CLAUDECODE"]` — clears stale env vars in subprocess
 - Returns `config_options` with mode (permission), model, and effort (model-dependent)
@@ -123,10 +142,32 @@ Optional (`pip install synth-acp[search]`):
 - Agent names for plugins: `<plugin-name>:<agent-name>` (e.g., `local-SHScienceAgentKit-all:code-planner`)
 
 **Kiro** (`kiro.toml`):
-- `mode_arg = "--agent"` — passes `agent_mode` as CLI flag
-- Returns `modes` (all agents) + `models`, NO `config_options`
+- `default_variant = "v2"`; `[variants.v2]` has `run_cmd = "kiro-cli acp"`, `mode_arg = "--agent"`
+  (passes `agent_mode` as CLI flag) and `extension = "kiro_v2"`. Pick a variant with the
+  `harness_variant` setting
+- `KiroV2Extension`: in-turn steering via `session/steer` (`capabilities.steer`), context usage
+  from `kiro.dev/metadata`, and an MCP reload via `session/load` after a mode switch
+  (`reload_after_mode_switch`)
+- v2 returns `modes` (all agents) + `models`, NO `config_options`
 - Synth synthesizes `config_options` from legacy modes/models
-- `set_session_mode()` / `set_session_model()` used (no `set_config_option` endpoint)
+- v2: `set_session_mode()` / `set_session_model()` used (no `set_config_option` endpoint)
+- `[variants.v3]` has `run_cmd = "kiro-cli acp --agent-engine=v3 --auth-method=cli"`, no
+  `mode_arg` (v3 exits 2 on `--agent`) and `extension = "kiro_v3"`. Enable with
+  `{"harness_variant": {"kiro": "v3"}}`
+- `KiroV3Extension`: answers the `_kiro/terminal/shell_type` request (v3 session/new fails
+  without it), sends `agent_mode` as `_meta.kiro.modeId` on session/new and
+  `_meta.kiro.noReplay` on session/load (`no_replay_load`), reads `_meta.kiro.replay` and
+  `context_usage` session_info_updates, maps `_kiro/customAgent/not_found` / `config_error`
+  to a warning, and maps steer `queued: false` to `dropped` so the broker queues the message.
+  No MCP reload after a mode switch (v3 keeps the servers)
+- v3 rejects profiles that use `allowedTools` / `toolsSettings` (reason `cli_only_agent`,
+  all SHScienceAgentKit profiles) and falls back to mode `vibe`; synth shows a warning
+- v3 returns native `configOptions` and no `models`; `session/set_model` fails (-32603), so
+  only the native `set_config_option` path is used
+- Restore: `session/resume` when advertised (Claude), else `session/load` with the
+  extension's load `_meta`. `agents.harness_variant` in synth.db records the variant that
+  created each session; restore starts fresh with a warning when it differs from the
+  configured variant (existing kiro rows are backfilled as `v2`)
 
 **OpenCode** (`opencode.toml`):
 - `run_cmd = "opencode acp"` — simple ACP mode

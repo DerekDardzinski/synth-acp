@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
-    from synth_acp.discovery import DiscoveredAgent
+    from synth_acp.models.agent import DiscoveredAgent
 
 log = logging.getLogger(__name__)
 
@@ -241,6 +241,7 @@ def normalize_message_kind(raw: str) -> MessageKind:
 
 _ALLOWED_SLOTS = frozenset({"from_agent", "to_agent", "kind", "message_type"})
 _NUDGE_SLOTS = frozenset({"agent_id", "used", "nudge_threshold"})
+_SWITCH_SLOTS = frozenset({"agent_id", "agent_mode", "profile", "instructions"})
 
 
 def _validate_template(v: str, allowed: frozenset[str], label: str) -> str:
@@ -319,6 +320,20 @@ def validate_handoff_nudge_template(v: str) -> str:
     return _validate_template(v, _NUDGE_SLOTS, "handoff_nudge_template")
 
 
+DEFAULT_HANDOFF_SWITCH_TEMPLATE = (
+    'The user asked to switch you to {profile}. Call the handoff tool now with '
+    'agent_mode="{agent_mode}" (omitting agent_mode keeps your current profile and does '
+    "not switch). Write handoff_message as a briefing for that agent: "
+    "the goal, what is done, what is left, and anything it must know that is not obvious "
+    "from the code.{instructions}"
+)
+
+
+def validate_handoff_switch_template(v: str) -> str:
+    """Validate a profile-switch request template. Raises ValueError on a bad template."""
+    return _validate_template(v, _SWITCH_SLOTS, "handoff_switch_template")
+
+
 class HooksConfig(BaseModel, frozen=True):
     """Lifecycle hooks for agent events."""
 
@@ -376,13 +391,20 @@ class GlobalConfig(BaseModel, frozen=True):
     handoff_nudge: bool = True
     handoff_nudge_threshold: float = Field(default=0.5, gt=0.0, le=1.0)
     handoff_nudge_template: str = DEFAULT_HANDOFF_NUDGE_TEMPLATE
+    handoff_switch_template: str = DEFAULT_HANDOFF_SWITCH_TEMPLATE
     harness_env: dict[str, HarnessEnvConfig] = {}
+    harness_variant: dict[str, str] = {}
     hooks: GlobalHooksConfig = GlobalHooksConfig()
 
     @field_validator("handoff_nudge_template")
     @classmethod
     def _check_nudge_template(cls, v: str) -> str:
         return validate_handoff_nudge_template(v)
+
+    @field_validator("handoff_switch_template")
+    @classmethod
+    def _check_switch_template(cls, v: str) -> str:
+        return validate_handoff_switch_template(v)
 
 
 class SettingsConfig(BaseModel, frozen=True):
@@ -394,13 +416,20 @@ class SettingsConfig(BaseModel, frozen=True):
     handoff_nudge: bool = True
     handoff_nudge_threshold: float = Field(default=0.5, gt=0.0, le=1.0)
     handoff_nudge_template: str = DEFAULT_HANDOFF_NUDGE_TEMPLATE
+    handoff_switch_template: str = DEFAULT_HANDOFF_SWITCH_TEMPLATE
     harness_env: dict[str, HarnessEnvConfig] = {}
+    harness_variant: dict[str, str] = {}
     hooks: HooksConfig = HooksConfig()
 
     @field_validator("handoff_nudge_template")
     @classmethod
     def _check_nudge_template(cls, v: str) -> str:
         return validate_handoff_nudge_template(v)
+
+    @field_validator("handoff_switch_template")
+    @classmethod
+    def _check_switch_template(cls, v: str) -> str:
+        return validate_handoff_switch_template(v)
 
 
 class RawSettingsConfig(BaseModel, frozen=True):
@@ -412,13 +441,20 @@ class RawSettingsConfig(BaseModel, frozen=True):
     handoff_nudge: bool | None = None
     handoff_nudge_threshold: float | None = Field(default=None, gt=0.0, le=1.0)
     handoff_nudge_template: str | None = None
+    handoff_switch_template: str | None = None
     harness_env: dict[str, HarnessEnvConfig] = {}
+    harness_variant: dict[str, str] = {}
     hooks: HooksConfig = HooksConfig()
 
     @field_validator("handoff_nudge_template")
     @classmethod
     def _check_nudge_template(cls, v: str | None) -> str | None:
         return v if v is None else validate_handoff_nudge_template(v)
+
+    @field_validator("handoff_switch_template")
+    @classmethod
+    def _check_switch_template(cls, v: str | None) -> str | None:
+        return v if v is None else validate_handoff_switch_template(v)
 
 
 class HarnessEntry(BaseModel, frozen=True):
@@ -444,13 +480,10 @@ class HarnessEntry(BaseModel, frozen=True):
             so a user can have the harness installed and still be unable to launch
             it.  Leave None where the two are the same program, since the existing
             "no harnesses found" message already names it.
-        steer_protocol: Wire protocol for in-turn steering, or None when the
-            harness does not support it. A ``Literal`` rather than a free-form
-            method string: Claude's steering takes a different payload shape
-            (``prompt`` as an array of content blocks, versus Kiro's ``message``
-            string), so a bare method name would let someone enable Claude by
-            adding a string and get a silent ``-32602``. Adding a harness must
-            require adding a variant here.
+        extension: Registered ACP extension name (``synth_acp.acp.extensions``) that
+            carries the harness's proprietary behavior; ``"standard"`` for none.
+        variant: Engine variant this entry was resolved to, from the TOML's
+            ``[variants.<name>]`` tables; None for a TOML without variants.
     """
 
     identity: str
@@ -461,9 +494,9 @@ class HarnessEntry(BaseModel, frozen=True):
     mode_arg: str | None = None
     executable_env_var: str | None = None
     clear_env_vars: list[str] = []
-    agent_mode_target: Literal["acp_mode", "meta_agent"] | None = None
-    steer_protocol: Literal["kiro"] | None = None
     install_hint: str | None = None
+    extension: str = "standard"
+    variant: str | None = None
 
 
 class RawSessionConfig(BaseModel, frozen=True):
@@ -709,6 +742,34 @@ def format_handoff_nudge(
             "agent_id": agent_id,
             "used": format_percent(used_fraction),
             "nudge_threshold": format_percent(threshold),
+        },
+    )
+
+
+def format_handoff_switch(
+    template: str, *, agent_id: str, agent_mode: str, instructions: str | None
+) -> str:
+    """Render the body of the message that asks an agent to hand off to another profile.
+
+    ``{profile}`` names the target for a reader: ``the agent profile "<agent_mode>"``, or
+    ``the default agent`` when agent_mode is "" (the harness's own default, selected by
+    passing agent_mode="" to handoff).  ``{instructions}`` renders as "" when there are
+    none (None or ""), otherwise as a header followed by the user's text verbatim. Slot values are not re-parsed by
+    ``format_map``, so braces in the user's text survive.
+
+    Raises:
+        Never for a template that passed ``validate_handoff_switch_template``.
+    """
+    rendered_instructions = (
+        f"\n\nThe user's instructions for this handoff:\n{instructions}" if instructions else ""
+    )
+    return render_template(
+        template,
+        {
+            "agent_id": agent_id,
+            "agent_mode": agent_mode,
+            "profile": f'the agent profile "{agent_mode}"' if agent_mode else "the default agent",
+            "instructions": rendered_instructions,
         },
     )
 

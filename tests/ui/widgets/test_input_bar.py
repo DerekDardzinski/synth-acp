@@ -524,3 +524,210 @@ class TestApplyBusyDuringTeardown:
             assert bar.query_one("#cancel-btn").display is True
             assert bar.query_one(ActivityBar).active is True
             assert bar.query_one("#prompt-input", PromptTextArea).disabled is True
+
+
+def _handoff_app():
+    """A SynthApp over a mock broker whose agent switches profile by handoff."""
+    from unittest.mock import AsyncMock
+
+    from synth_acp.models.agent import AgentConfig
+    from synth_acp.models.config import SessionConfig
+    from synth_acp.models.extensions import ExtensionCapabilities
+    from synth_acp.ui.app import SynthApp
+
+    broker = MagicMock()
+    broker.handle = AsyncMock()
+    broker.shutdown = AsyncMock()
+    broker._initial_agent = AgentConfig(agent_id="agent-1", harness="claude")
+    broker.get_agent_parent = MagicMock(return_value=None)
+    broker.get_agent_harness = MagicMock(return_value="claude")
+    broker.get_agent_cwd = MagicMock(return_value=".")
+    broker.get_agent_display_name = MagicMock(return_value=None)
+    broker.get_usage = MagicMock(return_value=None)
+    broker.pending_profile_switch = MagicMock(return_value=None)
+    broker._registry.get_capabilities = MagicMock(
+        return_value=ExtensionCapabilities(profile_switch="handoff")
+    )
+
+    async def _events():
+        return
+        yield
+
+    broker.events = _events
+    return SynthApp(
+        broker,
+        SessionConfig(project="test"),
+        initial_agent=AgentConfig(agent_id="agent-1", harness="claude"),
+    )
+
+
+def _agent_option() -> SessionConfigOptionSelect:
+    from acp.schema import SessionConfigSelectOption
+
+    return SessionConfigOptionSelect(
+        id="agent",
+        name="Agent",
+        category="agent",
+        type="select",
+        current_value="",
+        options=[
+            SessionConfigSelectOption(value="", name="Default"),
+            SessionConfigSelectOption(value="probe-heron", name="probe-heron"),
+        ],
+    )
+
+
+def _sent(app, cls) -> list:
+    """Commands of type cls the app handed to broker.handle."""
+    return [c.args[0] for c in app.broker.handle.call_args_list if isinstance(c.args[0], cls)]
+
+
+class TestProfileSwitchByHandoff:
+    """A picker pick on a handoff harness is confirmed in a ChoiceBar before anything is sent."""
+
+    async def _pick(self, app, pilot) -> InputBar:
+        """Select the agent, show its picker, and pick probe-heron."""
+        await pilot.pause()
+        bar = app._panels["agent-1"].input_bar
+        bar.update_config_options([_agent_option()])
+        bar._on_picker_selected("picker-agent", "probe-heron")
+        await pilot.pause()
+        return bar
+
+    async def test_pick_mounts_choice_bar_and_keeps_picker(self) -> None:
+        """Silent failure: the picker jumps to an unconfirmed agent, or a command goes out."""
+        from synth_acp.models.commands import RequestProfileSwitch
+        from synth_acp.ui.widgets.choice_bar import ChoiceBar
+
+        app = _handoff_app()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            bar = await self._pick(app, pilot)
+            assert len(bar.query(ChoiceBar)) == 1
+            assert bar.query_one("#picker-agent", _PickerLabel)._current_id == ""
+            assert _sent(app, SetConfigOption) == []
+            assert _sent(app, RequestProfileSwitch) == []
+
+    async def test_hand_off_sends_request_without_instructions(self) -> None:
+        from synth_acp.models.commands import RequestProfileSwitch
+
+        app = _handoff_app()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await self._pick(app, pilot)
+            await pilot.press("h")
+            await pilot.pause(0.6)
+            assert _sent(app, RequestProfileSwitch) == [
+                RequestProfileSwitch(agent_id="agent-1", agent_mode="probe-heron", instructions=None)
+            ]
+
+    async def test_cancel_and_escape_send_nothing(self) -> None:
+        from synth_acp.models.commands import RequestProfileSwitch
+        from synth_acp.ui.widgets.choice_bar import ChoiceBar
+
+        app = _handoff_app()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            bar = await self._pick(app, pilot)
+            await pilot.press("c")
+            await pilot.pause(0.6)
+            bar._on_picker_selected("picker-agent", "probe-heron")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause(0.6)
+            assert len(bar.query(ChoiceBar)) == 0
+            assert _sent(app, RequestProfileSwitch) == []
+
+    async def test_instructions_submit_sends_text_not_prompt(self) -> None:
+        """Silent failure: the instructions go to the agent as an ordinary prompt."""
+        from synth_acp.models.commands import RequestProfileSwitch, SendPrompt
+
+        app = _handoff_app()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await self._pick(app, pilot)
+            await pilot.press("i")
+            await pilot.pause(0.6)
+            # Inserted rather than typed: PromptTextArea._on_key does not await
+            # TextArea._on_key, so typed keys raise an un-awaited-coroutine warning.
+            app._panels["agent-1"].input_bar.query_one(PromptTextArea).insert("keep {x} tests")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert _sent(app, RequestProfileSwitch) == [
+                RequestProfileSwitch(
+                    agent_id="agent-1", agent_mode="probe-heron", instructions="keep {x} tests"
+                )
+            ]
+            assert _sent(app, SendPrompt) == []
+
+    async def test_instructions_bang_text_is_not_a_shell_command(self) -> None:
+        from synth_acp.models.commands import RequestProfileSwitch
+
+        app = _handoff_app()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await self._pick(app, pilot)
+            await pilot.press("i")
+            await pilot.pause(0.6)
+            feed = app._panels["agent-1"]
+            with patch.object(feed, "run_shell_command") as shell:
+                feed.input_bar.query_one(PromptTextArea).insert("!ls")
+                await pilot.press("enter")
+                await pilot.pause()
+            shell.assert_not_called()
+            assert _sent(app, RequestProfileSwitch) == [
+                RequestProfileSwitch(agent_id="agent-1", agent_mode="probe-heron", instructions="!ls")
+            ]
+
+    async def test_instructions_escape_sends_nothing_and_restores_placeholder(self) -> None:
+        from synth_acp.models.commands import RequestProfileSwitch
+
+        app = _handoff_app()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            bar = await self._pick(app, pilot)
+            await pilot.press("i")
+            await pilot.pause(0.6)
+            ta = bar.query_one("#prompt-input", PromptTextArea)
+            assert str(ta.placeholder) == (
+                "Instructions for the handoff to probe-heron  (enter to send, esc to cancel)"
+            )
+            await pilot.press("escape")
+            await pilot.pause()
+            assert str(ta.placeholder) == "Ask anything    ▌@▐ file  ▌!▐ shell  ▌ctrl+j▐ newline"
+            assert _sent(app, RequestProfileSwitch) == []
+
+    async def test_repick_during_instructions_mode_ends_it(self) -> None:
+        """Silent failure: after a re-pick is cancelled, the user's next message is sent as
+        handoff instructions instead of as a prompt."""
+        from synth_acp.models.commands import RequestProfileSwitch, SendPrompt
+
+        app = _handoff_app()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            bar = await self._pick(app, pilot)
+            await pilot.press("i")
+            await pilot.pause(0.6)
+            bar._on_picker_selected("picker-agent", "probe-heron")
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause(0.6)
+            bar.query_one(PromptTextArea).insert("hello agent")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert _sent(app, RequestProfileSwitch) == []
+            assert _sent(app, SendPrompt) == [SendPrompt(agent_id="agent-1", text="hello agent")]
+
+    def test_mode_harness_agent_pick_sends_set_config_option(self) -> None:
+        """Silent failure: a harness that switches in place loses its SetConfigOption."""
+        from unittest.mock import AsyncMock
+
+        bar = TestConfigOptionPickers()._make_input_bar()
+        mock_app = MagicMock()
+        mock_app.broker.handle = AsyncMock()
+        mock_app.switches_profile_by_handoff = MagicMock(return_value=False)
+        mock_app.run_worker = MagicMock(side_effect=lambda coro, **_kw: coro.close())
+
+        with patch.object(bar, "query_one", return_value=MagicMock(spec=_PickerLabel)), \
+             patch.object(bar, "_confirm_profile_switch") as confirm, \
+             patch.object(type(bar), "app", new_callable=lambda: property(lambda _: mock_app)), \
+             patch("synth_acp.ui.widgets.input_bar.isinstance", side_effect=lambda obj, cls: True if obj is mock_app else isinstance(obj, cls)):
+            bar._on_picker_selected("picker-agent", "probe-heron")
+
+        confirm.assert_not_called()
+        mock_app.broker.handle.assert_called_once_with(
+            SetConfigOption(agent_id="test-agent", config_id="agent", value="probe-heron")
+        )

@@ -8,6 +8,7 @@ import logging
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,7 +20,7 @@ from synth_acp.broker.lifecycle import (
 )
 from synth_acp.broker.registry import AgentRegistry
 from synth_acp.models.agent import AgentConfig, AgentState
-from synth_acp.models.config import SessionConfig
+from synth_acp.models.config import SessionConfig, SettingsConfig
 from synth_acp.models.events import AgentHandedOff, BrokerError, HookFired
 
 pytestmark = pytest.mark.usefixtures("available_harness_binaries")
@@ -340,6 +341,7 @@ class TestResurrect:
             agent_mode=None,
             cwd="/tmp",
             parent="parent-agent",
+            harness_variant=None,
         )
         status, error = self._get_command_status(lc, cmd_id)
         assert status == "processed"
@@ -632,7 +634,7 @@ class TestLifecycleSerialization:
             if fetch_count <= 2:
                 fetch_started.set()
                 await fetch_unblock.wait()
-                return ("acp-session-1", "kiro", None, ".", None, "", "inactive")
+                return ("acp-session-1", "kiro", None, ".", None, "", "inactive", "v2")
             return None
 
         lc._db_op = stub_db_op  # type: ignore[method-assign]
@@ -835,76 +837,6 @@ class TestSetConfigOption:
         errors = [e for e in events if isinstance(e, BrokerError)]
         assert len(errors) == 1
         assert "cannot change config option" in errors[0].message
-
-
-class TestSetAgent:
-    async def test_set_agent_calls_fork_with_agent_and_updates_db(self, tmp_path: Path) -> None:
-        """set_agent must call fork_with_agent and persist new session_id to DB.
-        Silent failure: DB not updated means session restore uses stale session_id."""
-        import sqlite3
-
-        from synth_acp.db import ensure_schema_sync
-
-        db_path = tmp_path / "synth.db"
-        config = _config("a")
-        reg = AgentRegistry()
-        events: list = []
-
-        async def sink(e: object) -> None:
-            events.append(e)
-
-        lc = AgentLifecycle(config, reg, sink, db_path=db_path, session_id="s1")
-
-        # Seed DB with agent row
-        with sqlite3.connect(str(db_path)) as conn:
-            ensure_schema_sync(conn)
-            conn.execute(
-                "INSERT INTO agents (agent_id, session_id, status, registered, harness, acp_session_id) "
-                "VALUES (?, ?, 'active', 1000, 'claude', 'old-acp-sess')",
-                ("a", "s1"),
-            )
-            conn.commit()
-
-        mock_session = AsyncMock()
-        mock_session.state = AgentState.IDLE
-        mock_session.fork_with_agent = AsyncMock(return_value="new-acp-sess")
-        reg.register("a", mock_session)
-
-        await lc.set_agent("a", "code-planner")
-
-        mock_session.fork_with_agent.assert_awaited_once_with("code-planner")
-
-        # Verify DB updated
-        with sqlite3.connect(str(db_path)) as conn:
-            row = conn.execute(
-                "SELECT acp_session_id FROM agents WHERE agent_id = ? AND session_id = ?",
-                ("a", "s1"),
-            ).fetchone()
-        assert row[0] == "new-acp-sess"
-
-    async def test_set_agent_emits_error_when_not_idle(self) -> None:
-        """set_agent on a non-idle agent must emit BrokerError and not call fork.
-        Silent failure: fork attempted on busy agent causes undefined behavior."""
-        config = _config("a")
-        reg = AgentRegistry()
-        events: list = []
-
-        async def sink(e: object) -> None:
-            events.append(e)
-
-        lc = AgentLifecycle(config, reg, sink, db_path=Path("/tmp/unused.db"), session_id="s1")
-
-        mock_session = AsyncMock()
-        mock_session.state = AgentState.BUSY
-        mock_session.fork_with_agent = AsyncMock()
-        reg.register("a", mock_session)
-
-        await lc.set_agent("a", "code-planner")
-
-        mock_session.fork_with_agent.assert_not_awaited()
-        errors = [e for e in events if isinstance(e, BrokerError)]
-        assert len(errors) == 1
-        assert "cannot switch agent" in errors[0].message
 
 
 class TestAvailableAgents:
@@ -1387,6 +1319,14 @@ class TestHandoffCommand:
 
         assert self._status(lc, cmd_id) == ("processed", None)
         assert [e for e in events if isinstance(e, BrokerError)] == []
+        conn = sqlite3.connect(str(lc._db_path))
+        try:
+            # No agent_mode keeps the predecessor's (NULL in the seed), as before.
+            assert conn.execute(
+                "SELECT agent_mode FROM agents WHERE agent_id = 'worker'"
+            ).fetchone() == (None,)
+        finally:
+            conn.close()
 
     async def test_shutting_down_rejects_without_starting_anything(self, tmp_path: Path) -> None:
         events: list = []
@@ -1400,6 +1340,202 @@ class TestHandoffCommand:
         assert status == "rejected"
         predecessor.force_kill.assert_not_called()
         assert [e for e in events if isinstance(e, BrokerError)] == []
+
+
+class _ProbeExtension:
+    """check_profile knows exactly one profile, like a Claude install with one agent file."""
+
+    def check_profile(self, agent_mode: str, cwd: Path) -> Any:
+        from synth_acp.models.extensions import ProfileUnavailable
+
+        if agent_mode == "probe-heron":
+            return None
+        return ProfileUnavailable(
+            requested=agent_mode, fallback="default", reason=f"no agent named '{agent_mode}'"
+        )
+
+
+class TestHandoffProfileSwitch:
+    """handle_handoff_command resolves the successor's agent_mode before anything retires."""
+
+    @staticmethod
+    def _agents(lc: AgentLifecycle) -> list[tuple]:
+        conn = sqlite3.connect(str(lc._db_path))
+        try:
+            return conn.execute(
+                "SELECT agent_id, status, agent_mode FROM agents ORDER BY agent_id"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _successor_mode(lc: AgentLifecycle) -> str | None:
+        conn = sqlite3.connect(str(lc._db_path))
+        try:
+            return conn.execute(
+                "SELECT agent_mode FROM agents WHERE agent_id = 'worker'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def _setup(self, tmp_path: Path) -> tuple[AgentLifecycle, MagicMock, list]:
+        events: list = []
+        lc, _, predecessor = _handoff_lifecycle(tmp_path, events)
+        predecessor.extension = _ProbeExtension()
+        return lc, predecessor, events
+
+    async def test_pending_target_is_written_to_the_successor(self, tmp_path: Path) -> None:
+        lc, _, _ = self._setup(tmp_path)
+        cmd_id = TestHandoffCommand._cmd(lc)
+
+        await lc.handle_handoff_command(
+            cmd_id,
+            "worker",
+            {"agent_id": "worker", "agent_mode": "probe-heron"},
+            pending_agent_mode="probe-heron",
+        )
+
+        assert TestHandoffCommand._status(lc, cmd_id) == ("processed", None)
+        assert self._successor_mode(lc) == "probe-heron"
+
+    async def test_omitted_agent_mode_keeps_the_current_mode_while_a_switch_is_pending(
+        self, tmp_path: Path
+    ) -> None:
+        """User decision 2026-09-24: None always keeps the current mode. Silent failure:
+        None read as 'take the pending target', or the handoff refused."""
+        lc, _, _ = self._setup(tmp_path)
+        cmd_id = TestHandoffCommand._cmd(lc)
+
+        await lc.handle_handoff_command(
+            cmd_id, "worker", {"agent_id": "worker"}, pending_agent_mode="probe-heron"
+        )
+
+        assert TestHandoffCommand._status(lc, cmd_id) == ("processed", None)
+        assert self._successor_mode(lc) is None  # the seeded predecessor's agent_mode
+
+    async def test_a_profile_other_than_the_pending_target_is_rejected_before_retiring(
+        self, tmp_path: Path
+    ) -> None:
+        lc, predecessor, events = self._setup(tmp_path)
+        cmd_id = TestHandoffCommand._cmd(lc)
+        before = self._agents(lc)
+
+        await lc.handle_handoff_command(
+            cmd_id,
+            "worker",
+            {"agent_id": "worker", "agent_mode": "probe-crane"},
+            pending_agent_mode="probe-heron",
+        )
+
+        status, error = TestHandoffCommand._status(lc, cmd_id)
+        assert status == "rejected"
+        assert error == (
+            "The user asked to switch you to 'probe-heron'; call handoff with "
+            "agent_mode='probe-heron'"
+        )
+        assert self._agents(lc) == before
+        predecessor.force_kill.assert_not_called()
+        assert [e for e in events if isinstance(e, BrokerError)] == []
+
+    async def test_an_unknown_profile_is_rejected_before_retiring(self, tmp_path: Path) -> None:
+        lc, predecessor, events = self._setup(tmp_path)
+        cmd_id = TestHandoffCommand._cmd(lc)
+        before = self._agents(lc)
+
+        await lc.handle_handoff_command(
+            cmd_id, "worker", {"agent_id": "worker", "agent_mode": "probe-nope"}
+        )
+
+        assert TestHandoffCommand._status(lc, cmd_id) == ("rejected", "no agent named 'probe-nope'")
+        assert self._agents(lc) == before
+        predecessor.force_kill.assert_not_called()
+        assert [e for e in events if isinstance(e, BrokerError)] == []
+
+    async def test_a_known_profile_without_a_pending_switch_is_written(
+        self, tmp_path: Path
+    ) -> None:
+        lc, _, _ = self._setup(tmp_path)
+        cmd_id = TestHandoffCommand._cmd(lc)
+
+        await lc.handle_handoff_command(
+            cmd_id, "worker", {"agent_id": "worker", "agent_mode": "probe-heron"}
+        )
+
+        assert TestHandoffCommand._status(lc, cmd_id) == ("processed", None)
+        assert self._successor_mode(lc) == "probe-heron"
+
+    async def test_empty_agent_mode_starts_the_successor_as_the_default_agent(
+        self, tmp_path: Path
+    ) -> None:
+        """'' is an explicit switch to the harness default: the successor row is NULL, so
+        no profile is sent. It is not checked against discovered profiles, and it is
+        not None, which would keep the current profile."""
+        lc, _, _ = self._setup(tmp_path)
+        conn = sqlite3.connect(str(lc._db_path))
+        conn.execute("UPDATE agents SET agent_mode = 'plan' WHERE agent_id = 'worker'")
+        conn.commit()
+        conn.close()
+        cmd_id = TestHandoffCommand._cmd(lc)
+
+        await lc.handle_handoff_command(cmd_id, "worker", {"agent_id": "worker", "agent_mode": ""})
+
+        assert TestHandoffCommand._status(lc, cmd_id) == ("processed", None)
+        assert self._successor_mode(lc) is None
+
+    async def test_a_pending_default_agent_switch_matches_only_empty_agent_mode(
+        self, tmp_path: Path
+    ) -> None:
+        lc, predecessor, _ = self._setup(tmp_path)
+        cmd_id = TestHandoffCommand._cmd(lc)
+
+        await lc.handle_handoff_command(
+            cmd_id,
+            "worker",
+            {"agent_id": "worker", "agent_mode": "probe-heron"},
+            pending_agent_mode="",
+        )
+
+        assert TestHandoffCommand._status(lc, cmd_id) == (
+            "rejected",
+            "The user asked to switch you to ''; call handoff with agent_mode=''",
+        )
+        predecessor.force_kill.assert_not_called()
+
+        ok_id = TestHandoffCommand._cmd(lc)
+        await lc.handle_handoff_command(
+            ok_id, "worker", {"agent_id": "worker", "agent_mode": ""}, pending_agent_mode=""
+        )
+        assert TestHandoffCommand._status(lc, ok_id) == ("processed", None)
+
+    async def test_user_instructions_follow_the_handoff_message_verbatim(
+        self, tmp_path: Path
+    ) -> None:
+        """Silent failure: instructions dropped, reformatted, or brace-mangled."""
+        events: list = []
+        lc, _, _ = _handoff_lifecycle(tmp_path, events)
+        lc._config = SessionConfig(
+            project="t",
+            settings=SettingsConfig.model_validate(
+                {"hooks": {"on_agent_startup": {"active": False}}}
+            ),
+        )
+        seeded: list[str] = []
+
+        class _State:
+            async def drain_agent_journal(self, agent_id: str) -> None: ...
+
+            def apply_handoff_rekey(self, result: object) -> None: ...
+
+            def seed_first_prompt(self, agent_id: str, text: str, from_agent: str) -> None:
+                seeded.append(text)
+
+        lc.set_handoff_state(_State())
+
+        await lc.handoff("worker", "BRIEF", user_instructions="keep {x}\nline two")
+
+        assert seeded == [
+            "BRIEF\n\nInstructions from the user for this handoff:\nkeep {x}\nline two"
+        ]
 
 
 class TestHandoffShutdownOrdering:
@@ -1890,3 +2026,163 @@ class TestEveryHarnessInheritsByDefault:
 
         assert "SYNTH_PROBE_MARKER" not in (lc._resolve_harness_env(claude) or {})
         assert (lc._resolve_harness_env(kiro) or {})["SYNTH_PROBE_MARKER"] == "present"
+
+
+_V3_SETTINGS = SettingsConfig(harness_variant={"kiro": "v3"})
+
+
+class TestHarnessVariantTracking:
+    """Each agent row records the engine variant that created its ACP session, and
+    restore never hands a session id to a different engine.
+
+    Silent failure guarded: Kiro v3 answers session/load of a v2 id by creating an empty
+    session, so without the comparison a restored agent silently loses its memory.
+    """
+
+    @staticmethod
+    def _lifecycle(tmp_path: Path, events: list) -> tuple[AgentLifecycle, AgentRegistry]:
+        from synth_acp.db import ensure_schema_sync
+
+        async def sink(e: object) -> None:
+            events.append(e)
+
+        config = SessionConfig(project="test", settings=_V3_SETTINGS)
+        reg = AgentRegistry()
+        lc = AgentLifecycle(config, reg, sink, db_path=tmp_path / "synth.db", session_id="s1")
+        conn = sqlite3.connect(str(tmp_path / "synth.db"))
+        ensure_schema_sync(conn)
+        conn.close()
+        return lc, reg
+
+    @staticmethod
+    def _variants(tmp_path: Path) -> dict[str, str | None]:
+        conn = sqlite3.connect(str(tmp_path / "synth.db"))
+        try:
+            return dict(conn.execute("SELECT agent_id, harness_variant FROM agents").fetchall())
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _fake_build(lc: AgentLifecycle, built: list[MagicMock]) -> Any:
+        """Patch session construction; every built session is appended to ``built``."""
+
+        def _build(_cfg: object, _entry: object) -> MagicMock:
+            session = MagicMock(state=AgentState.INITIALIZING)
+            session.run = AsyncMock()
+            session.run_restored = AsyncMock()
+            built.append(session)
+            return session
+
+        return patch.object(lc, "_build_session", side_effect=_build)
+
+    async def test_launch_rows_and_session_callback_record_the_variant(
+        self, tmp_path: Path
+    ) -> None:
+        events: list = []
+        lc, _reg = self._lifecycle(tmp_path, events)
+
+        with patch.object(lc, "_make_run_task"):
+            await lc.launch("root", adhoc_config=AgentConfig(agent_id="root", harness="kiro"))
+            await lc.handle_launch_command(
+                1, "root", {"agent_id": "kid", "harness": "kiro", "cwd": str(tmp_path)}
+            )
+        assert self._variants(tmp_path) == {"root": "v3", "kid": "v3"}
+
+        # The callback _build_session registers writes the variant with the session id.
+        conn = sqlite3.connect(str(tmp_path / "synth.db"))
+        conn.execute("UPDATE agents SET harness_variant = 'v2' WHERE agent_id = 'root'")
+        conn.commit()
+        conn.close()
+        session = lc._registry.get_session("root")
+        assert session is not None
+        await session._on_session_created("root", "sess_new")  # type: ignore[misc]
+        assert self._variants(tmp_path)["root"] == "v3"
+
+    async def test_handoff_successor_row_records_the_configured_variant(
+        self, tmp_path: Path
+    ) -> None:
+        events: list = []
+        lc, reg, _ = _handoff_lifecycle(tmp_path, events)
+        v3_config = SessionConfig(project="test", settings=_V3_SETTINGS)
+        lc._harness_registry = AgentLifecycle(
+            v3_config, reg, AsyncMock(), db_path=tmp_path / "synth.db", session_id="s1"
+        )._harness_registry
+
+        result = await lc.handoff("worker", "brief")
+
+        variants = self._variants(tmp_path)
+        assert variants["worker"] == "v3"
+        assert variants[result.retired_agent_id] is None
+
+    async def test_restore_of_other_variant_starts_fresh_and_warns(self, tmp_path: Path) -> None:
+        events: list = []
+        lc, _reg = self._lifecycle(tmp_path, events)
+        built: list[MagicMock] = []
+
+        with self._fake_build(lc, built):
+            await lc.restore(
+                agent_id="a",
+                acp_session_id="acp-v2",
+                harness="kiro",
+                agent_mode=None,
+                cwd=str(tmp_path),
+                parent=None,
+                harness_variant="v2",
+            )
+            await asyncio.sleep(0)
+
+        built[0].run_restored.assert_not_awaited()
+        built[0].run.assert_awaited_once()
+        # The fresh session has no conversation, so its first prompt must still get
+        # the startup context.
+        assert "a" not in lc._first_prompted
+        warnings = [e for e in events if isinstance(e, BrokerError) and e.severity == "warning"]
+        assert len(warnings) == 1
+        assert "'a'" in warnings[0].message
+        assert "'v2'" in warnings[0].message
+        assert "'v3'" in warnings[0].message
+
+    async def test_restore_of_same_variant_restores(self, tmp_path: Path) -> None:
+        events: list = []
+        lc, _reg = self._lifecycle(tmp_path, events)
+        built: list[MagicMock] = []
+
+        with self._fake_build(lc, built):
+            await lc.restore(
+                agent_id="a",
+                acp_session_id="sess_v3",
+                harness="kiro",
+                agent_mode=None,
+                cwd=str(tmp_path),
+                parent=None,
+                harness_variant="v3",
+            )
+            await asyncio.sleep(0)
+
+        built[0].run_restored.assert_awaited_once_with("sess_v3")
+        assert "a" in lc._first_prompted
+        assert [e for e in events if isinstance(e, BrokerError)] == []
+
+    async def test_resurrect_passes_the_stored_variant(self, tmp_path: Path) -> None:
+        events: list = []
+        lc, _reg = self._lifecycle(tmp_path, events)
+        built: list[MagicMock] = []
+        conn = sqlite3.connect(str(tmp_path / "synth.db"))
+        conn.execute(
+            "INSERT INTO agents (agent_id, session_id, status, registered, harness, "
+            "acp_session_id, cwd, harness_variant) "
+            "VALUES ('a', 's1', 'inactive', 1, 'kiro', 'acp-v2', ?, 'v2')",
+            (str(tmp_path),),
+        )
+        conn.commit()
+        conn.close()
+
+        with self._fake_build(lc, built):
+            await lc.resurrect("a")
+            await asyncio.sleep(0)
+
+        built[0].run_restored.assert_not_awaited()
+        built[0].run.assert_awaited_once()
+        warnings = [e for e in events if isinstance(e, BrokerError) and e.severity == "warning"]
+        assert len(warnings) == 1
+        assert "'v2'" in warnings[0].message

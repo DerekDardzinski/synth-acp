@@ -42,7 +42,8 @@ synth --harness kiro
 # Launch with a specific agent mode
 synth --harness kiro --agent-mode plan
 
-# Launch Claude Code with a specific agent (full qualified name for plugins)
+# Launch Claude Code with a specific agent (full qualified name for plugins;
+# `synth --list-agents --harness claude` prints the exact names on your machine)
 synth --harness claude --agent-mode local-SHScienceAgentKit-all:code-planner
 
 # Restore a previous session
@@ -93,7 +94,7 @@ synth config set auto_approve_tools "synth-mcp/send_message,synth-mcp/list_agent
 synth config path                    # Print config file path
 ```
 
-Settable keys: `default_harness`, `default_agent_id`, `default_agent_mode`, `communication_mode`, `auto_approve_tools`, `messages_interrupt`, `handoff_nudge`, `handoff_nudge_threshold`, `handoff_nudge_template`. Hooks are edited directly in the JSON file.
+Settable keys: `default_harness`, `default_agent_id`, `default_agent_mode`, `communication_mode`, `auto_approve_tools`, `messages_interrupt`, `handoff_nudge`, `handoff_nudge_threshold`, `handoff_nudge_template`, `handoff_switch_template`. Hooks are edited directly in the JSON file.
 
 ## Startup Context (`~/.synth/context.md`)
 
@@ -137,12 +138,14 @@ When `.synth.json` exists, its settings override global config. Fields not set i
 | Field | Global Default | Description |
 |-------|---------------|-------------|
 | `communication_mode` | `"LOCAL"` | `MESH` (all agents visible) or `LOCAL` (family only) |
-| `auto_approve_tools` | `["synth-mcp"]` | Tool name patterns to auto-approve without prompting |
+| `auto_approve_tools` | `["synth-mcp"]` | Tool name patterns to auto-approve without prompting. When the harness reports the tool's identity (`<server>/<tool>`, Kiro v3 MCP tools), a pattern must equal the server name (`synth-mcp`) or the full identity (`synth-mcp/send_message`); a prefix such as `synth` no longer matches. Otherwise the pattern is matched as a substring of the permission title |
 | `messages_interrupt` | `true` | Deliver inter-agent messages into a running turn instead of waiting for it to end. Kiro only; other harnesses always wait for the turn to end |
 | `handoff_nudge` | `true` | Send an agent a one-time message suggesting it call `handoff` once its context window passes `handoff_nudge_threshold` |
 | `handoff_nudge_threshold` | `0.5` | Fraction of the context window that triggers the nudge. Must be greater than 0 and at most 1 |
 | `handoff_nudge_template` | see below | Nudge body. Slots: `{agent_id}`, `{used}`, `{nudge_threshold}`. `{used}` and `{nudge_threshold}` render as whole percents (e.g. `62%`) |
+| `handoff_switch_template` | built in | Body of the message that asks an agent to hand off to the profile picked in the agent picker (see [Agent Mode](#agent-mode)). Slots: `{agent_id}`, `{agent_mode}` (the value to pass to `handoff`, `""` for the default agent), `{profile}` (`the agent profile "<name>"` or `the default agent`), `{instructions}` (empty, or a header followed by the user's instructions verbatim) |
 | `harness_env` | `{}` | Per-harness environment policy, keyed by harness short name. See [Harness Environment](#harness-environment) |
+| `harness_variant` | `{}` | Engine variant per harness short name, e.g. `{"kiro": "v2"}`. A harness without an entry uses its TOML's `default_variant`. JSON-only (not settable with `synth config set`). A project value overrides the global one per harness. An unknown variant name stops synth with an error that lists the valid ones. See [Adding a Harness](#adding-a-harness) |
 
 ### Harness Environment
 
@@ -214,8 +217,9 @@ appears in the conversation transcript exactly like any other message — mid-tu
 a suggestion: the agent decides whether to act on it.
 
 Usage data comes from whatever the harness reports. Claude Code reports token counts.
-Kiro CLI reports a percentage over a proprietary notification and reports no token
-counts, so the usage bar and this threshold are accurate to one percent for Kiro agents.
+Kiro CLI reports a percentage and no token counts (the v2 engine over a proprietary
+notification, the v3 engine in `session_info_update` notifications), so the usage bar
+and this threshold are accurate to one percent for Kiro agents.
 Harnesses that report no usage at all never trigger the nudge.
 
 Set `handoff_nudge` to `false` to disable it.
@@ -284,12 +288,31 @@ The `--agent-mode` flag has different semantics per harness:
 
 | Harness | `agent_mode` meaning | Example |
 |---------|---------------------|---------|
-| Kiro | Agent config name (passed as `--agent` CLI flag + `set_session_mode`) | `plan`, `code-planner` |
-| Claude Code | Agent name (passed as `_meta.claudeCode.options.agent` on session creation) | `local-SHScienceAgentKit-all:code-planner` |
+| Kiro | Agent config name. v2 engine: passed as the `--agent` CLI flag + `set_session_mode`. v3 engine: passed as `_meta.kiro.modeId` on session creation + `set_session_mode` (v3 rejects `--agent`) | `plan`, `code-planner` |
+| Claude Code | Agent name (passed by the `claude` extension as `_meta.claudeCode.options.extraArgs.agent`, which the adaptor turns into the Claude CLI's `--agent` flag; the agent picker switches agents by handoff, see below) | `local-SHScienceAgentKit-all:code-planner` |
 | OpenCode | Not supported | — |
 | Gemini CLI | Not supported | — |
 
 For Claude Code, plugin agents require the full qualified name: `<plugin-name>:<agent-name>`. User/project agents (in `~/.claude/agents/` or `.claude/agents/`) use just the agent name.
+
+Claude agent selection is verified on claude-agent-acp 0.70.0 and 0.81.2 (the adaptor's
+first-class `options.agent` was removed in 0.77.0; `extraArgs.agent` works on both). Notes:
+
+- The adaptor accepts an unknown agent name silently and runs the default agent, so synth
+  checks the name against the user, project and plugin agents it discovers and shows a
+  warning when none matches. The launch continues.
+- The Claude CLI fixes a session's agent when the session is created. Resume and fork keep
+  that agent, so restore cannot change a session's agent.
+- The agent picker therefore switches a Claude agent by handoff. After you confirm, synth
+  sends the agent a message (`handoff_switch_template`) asking it to call `handoff` with
+  `agent_mode` set to the chosen agent and a briefing for it. The successor starts as the
+  chosen agent, and any instructions you added are appended verbatim to its opening
+  prompt. The picker shows the switch as pending until the handoff happens. If the agent
+  ends its turn without handing off, or hands off without `agent_mode`, the switch is
+  dropped with a warning; pick the agent again to retry. Kiro switches in place with
+  `set_session_mode`.
+- Sessions created on claude-agent-acp 0.77.0 or later by an older synth, which sent
+  `options.agent`, ran as the default agent, and restoring them keeps the default agent.
 
 ### Config Options
 
@@ -297,12 +320,75 @@ Synth dynamically renders configuration pickers based on what the harness advert
 
 | Harness | Available pickers |
 |---------|------------------|
-| Kiro | Mode (agents), Model |
+| Kiro (v2 engine) | Mode (agents), Model |
+| Kiro (v3 engine) | Whatever v3 advertises: Mode, Model, Effort, and v3's own options (e.g. thinking, autopilot) |
 | Claude Code | Mode (permission), Model, Effort |
 | OpenCode | None |
 | Gemini CLI | None |
 
 The effort level picker appears only for models that support it (e.g., Opus, Sonnet). Switching to Haiku removes the effort picker automatically.
+
+### Kiro CLI v3 Engine
+
+The `kiro` harness has two engine variants. `v2` (`kiro-cli acp`) is the default. `v3`
+runs `kiro-cli acp --agent-engine=v3 --auth-method=cli` (kiro-cli 2.24.0 or later).
+Enable v3 in `~/.synth/config.json`, or under `settings` in `.synth.json`:
+
+```json
+{ "harness_variant": { "kiro": "v3" } }
+```
+
+Differences on v3:
+
+- **Agent profiles that use `allowedTools` or `toolsSettings` are rejected by v3**
+  (reason code `cli_only_agent`), which includes the SHScienceAgentKit profiles. v3 then
+  runs the agent in its default mode `vibe`, and synth shows a warning naming the
+  requested profile, the fallback and the reason. The launch continues.
+- Context usage is reported as a percentage, as on v2.
+- A mode switch keeps the MCP servers connected, so synth does not reload the session.
+- Restore loads the session without replaying its history (see below).
+- v3 starts your global `~/.kiro` MCP servers and steering files in every session, so N
+  agents run N copies of each global MCP server.
+
+### Session Restore
+
+`synth --restore` reconnects each agent to its previous ACP session without replaying
+the conversation into synth. For every harness, synth uses standard `session/resume`
+when the agent advertises it (Claude Code), otherwise `session/load`, where Kiro v3 is
+asked not to replay history. Any history an agent does replay during a load is
+suppressed. If the resume or load fails, the agent starts a fresh session with a warning.
+
+synth records the engine variant that created each agent's session. When the recorded
+variant differs from the configured one (for example a session created under Kiro v2,
+restored after switching to v3), synth does not hand the old session to the new engine:
+the agent starts a fresh session without its previous conversation, and synth shows a
+warning naming the agent, the recorded variant and the configured one.
+
+### Adding a Harness
+
+A harness is one TOML file in `src/synth_acp/data/harnesses/`. Fields:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `identity`, `name`, `short_name` | yes | Unique key, display name, and the value used with `--harness` and in `harness_env` / `harness_variant` |
+| `binary_names` | yes | Executables searched in PATH for auto-detect |
+| `run_cmd` | yes | Command that starts the harness in ACP mode |
+| `mode_arg` | no | CLI flag that carries `agent_mode` (e.g. `--agent`) |
+| `extension` | no | ACP extension name; defaults to `"standard"` (plain ACP) |
+| `executable_env_var`, `clear_env_vars`, `install_hint` | no | Subprocess environment tweaks and the install command shown when `run_cmd` is missing |
+
+A harness with more than one engine declares variants instead of top-level `run_cmd` / `mode_arg` / `extension`, and `harness_variant` picks one:
+
+```toml
+default_variant = "v2"
+
+[variants.v2]
+run_cmd = "kiro-cli acp"
+mode_arg = "--agent"
+extension = "kiro_v2"
+```
+
+Standard ACP (sessions, prompts, permissions, modes, models, config options, usage updates) works with no extension. Write an extension module only for proprietary behavior: extra `_meta` on session requests, proprietary notifications or agent-to-client requests, in-turn steering, or agent-profile discovery. Subclass `AcpExtension` in `src/synth_acp/acp/extensions/`, override only the hooks the engine needs, and register the class in `src/synth_acp/acp/extensions/__init__.py`. ACPSession, the broker and the UI need no change: they read only the extension's `ExtensionCapabilities` and the normalized values its hooks return.
 
 ## Architecture
 
@@ -353,7 +439,7 @@ Agents communicate via a bundled MCP server (`synth-mcp`) injected into every ag
 | `terminate_agent` | Terminate a child agent you previously launched |
 | `resurrect_agent` | Resurrect a previously terminated agent |
 | `get_my_context` | Get your identity, parent, task, and communication rules |
-| `handoff` | Retire yourself and hand your work to a fresh session that keeps your agent id |
+| `handoff` | Retire yourself and hand your work to a fresh session that keeps your agent id. Optional `agent_mode` starts the successor as another agent profile (`""` for the harness default; omitted keeps the current one). An unknown profile, or one other than the profile the user picked, is returned as an error and nothing retires |
 
 Messages are delivered to idle agents between turns. MCP-delivered inter-agent messages are prefixed with sender attribution via the configurable `on_mcp_message` hook (active by default), so recipients can see who sent a message and whom to reply to; `system` messages (join/exit notifications) use a no-action wrapper instead. Message bodies are always preserved unchanged.
 

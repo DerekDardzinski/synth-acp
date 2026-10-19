@@ -63,6 +63,24 @@ class SetConfigOption(BrokerCommand):
     value: str | bool
 
 
+class RequestProfileSwitch(BrokerCommand):
+    """The user confirmed switching agent_id to another agent profile by an agent-written handoff.
+
+    Used for harnesses whose ``ExtensionCapabilities.profile_switch`` is ``"handoff"``:
+    the broker asks the agent to call the ``handoff`` MCP tool with ``agent_mode``, and
+    appends ``instructions`` verbatim to the successor's opening prompt.
+
+    Attributes:
+        agent_id: The agent to switch.
+        agent_mode: Qualified name of the target agent profile.
+        instructions: Free text the user added for the handoff; None or "" means none.
+    """
+
+    agent_id: str
+    agent_mode: str
+    instructions: str | None = None
+
+
 class SetAgentMode(BrokerCommand):
     """Deprecated: use SetConfigOption(config_id='mode', value=mode_id) instead.
 

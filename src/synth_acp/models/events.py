@@ -99,6 +99,9 @@ class PermissionRequested(BrokerEvent):
     title: str
     kind: str
     options: list[PermissionOption]
+    tool_identity: str | None = None
+    """``"<server>/<tool>"`` when the extension can tell; None otherwise, and in rows
+    journaled before the field existed."""
 
 
 class PermissionAutoResolved(BrokerEvent):
@@ -270,6 +273,18 @@ class UserPromptSubmitted(BrokerEvent):
     text: str
 
 
+class ProfileSwitchChanged(BrokerEvent):
+    """A pending profile switch for agent_id started, or ended.
+
+    ``pending_agent_mode`` is the target profile while the switch is pending, and None
+    once it ended for any reason: the agent handed off, it finished its turn without
+    handing off, or it terminated. The broker emits a BrokerError warning alongside
+    when the switch did not happen.
+    """
+
+    pending_agent_mode: str | None
+
+
 class AgentHandedOff(BrokerEvent):
     """An agent was retired and a successor took over its id.
 
@@ -317,7 +332,7 @@ type SystemEvent = (
     BrokerError | PermissionRequested | PermissionAutoResolved
     | UsageUpdated | HookFired | QueueUpdated
     | SessionRestoreComplete | UserPromptSubmitted | MessageSteered
-    | AgentHandedOff
+    | AgentHandedOff | ProfileSwitchChanged
 )
 
 type BrokerEventUnion = AgentEvent | ConfigEvent | SystemEvent

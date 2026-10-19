@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import typer
 
 from synth_acp.cli import (
     _apply_global_settings,
@@ -221,6 +222,30 @@ class TestConfigSet:
         assert result.exit_code == 1
         assert config_mod.load_global_config().messages_interrupt is False
 
+    def test_config_set_handoff_switch_template_validates(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Silent failure: an invalid template saved to config.json breaks every later load."""
+        from typer.testing import CliRunner
+
+        import synth_acp.models.config as config_mod
+        from synth_acp.cli import app
+
+        monkeypatch.setattr(config_mod, "SYNTH_DIR", tmp_path)
+        monkeypatch.setattr(config_mod, "GLOBAL_CONFIG_PATH", tmp_path / "config.json")
+        runner = CliRunner()
+
+        bad = runner.invoke(app, ["config", "set", "handoff_switch_template", "{used}"])
+        assert bad.exit_code == 1
+        assert (
+            config_mod.load_global_config().handoff_switch_template
+            == config_mod.DEFAULT_HANDOFF_SWITCH_TEMPLATE
+        )
+
+        good = runner.invoke(app, ["config", "set", "handoff_switch_template", "go to {agent_mode}"])
+        assert good.exit_code == 0
+        assert config_mod.load_global_config().handoff_switch_template == "go to {agent_mode}"
+
     def test_config_set_unknown_key_exits(self) -> None:
         from typer.testing import CliRunner
 
@@ -259,7 +284,7 @@ class TestDetectInstalledHarnesses:
             identity="test", name="Test", short_name="test",
             binary_names=["test-bin"], run_cmd="test-bin",
         )
-        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda: [entry])
+        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda _variants=None: [entry])
         monkeypatch.setattr("shutil.which", lambda b: "/usr/bin/test-bin" if b == "test-bin" else None)
         result = _detect_installed_harnesses()
         assert result == [(entry, "/usr/bin/test-bin")]
@@ -271,7 +296,7 @@ class TestDetectInstalledHarnesses:
             identity="test", name="Test", short_name="test",
             binary_names=["test-bin"], run_cmd="test-bin",
         )
-        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda: [entry])
+        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda _variants=None: [entry])
         monkeypatch.setattr("shutil.which", lambda _b: None)
         result = _detect_installed_harnesses()
         assert result == []
@@ -279,6 +304,25 @@ class TestDetectInstalledHarnesses:
 
 class TestApplyGlobalSettings:
     """Tests for _apply_global_settings."""
+
+    def test_switch_template_project_wins_and_unset_falls_through(self) -> None:
+        """Silent failure: a forgotten merge ignores the project's template."""
+        from synth_acp.models.config import RawSettingsConfig
+
+        global_cfg = GlobalConfig(handoff_switch_template="global {agent_mode}")
+        project = RawSessionConfig(
+            project="t", settings=RawSettingsConfig(handoff_switch_template="project {agent_mode}")
+        )
+        unset = RawSessionConfig(project="t", settings=RawSettingsConfig())
+
+        assert (
+            _apply_global_settings(project, global_cfg).settings.handoff_switch_template
+            == "project {agent_mode}"
+        )
+        assert (
+            _apply_global_settings(unset, global_cfg).settings.handoff_switch_template
+            == "global {agent_mode}"
+        )
 
     def test_apply_global_settings_uses_raw_communication_mode(self) -> None:
         from synth_acp.models.config import (
@@ -448,7 +492,7 @@ class TestResolveConfig:
         )
         monkeypatch.setattr(
             "synth_acp.cli._detect_installed_harnesses",
-            lambda: [(entry, "/usr/bin/kiro-cli")],
+            lambda _variants=None: [(entry, "/usr/bin/kiro-cli")],
         )
 
         config, agent = _resolve_config(None, None, None, None)
@@ -472,7 +516,7 @@ class TestResolveConfig:
             (HarnessEntry(identity="kiro", name="Kiro", short_name="kiro", binary_names=["kiro-cli"], run_cmd="kiro-cli"), "/usr/bin/kiro-cli"),
             (HarnessEntry(identity="claude", name="Claude", short_name="claude", binary_names=["claude"], run_cmd="claude"), "/usr/bin/claude"),
         ]
-        monkeypatch.setattr("synth_acp.cli._detect_installed_harnesses", lambda: entries)
+        monkeypatch.setattr("synth_acp.cli._detect_installed_harnesses", lambda _variants=None: entries)
 
         with pytest.raises(ClickExit) as exc_info:
             _resolve_config(None, None, None, None)
@@ -513,7 +557,7 @@ class TestResolveHarnessForDiscovery:
             identity="kiro", name="Kiro CLI", short_name="kiro",
             binary_names=["kiro-cli"], run_cmd="kiro-cli",
         )
-        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda: [entry])
+        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda _variants=None: [entry])
 
         result = _resolve_harness_for_discovery("kiro")
         assert result.short_name == "kiro"
@@ -530,11 +574,11 @@ class TestResolveHarnessForDiscovery:
             identity="kiro", name="Kiro CLI", short_name="kiro",
             binary_names=["kiro-cli"], run_cmd="kiro-cli",
         )
-        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda: [entry])
+        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda _variants=None: [entry])
         monkeypatch.setattr("synth_acp.cli.load_global_config", GlobalConfig)
         monkeypatch.setattr(
             "synth_acp.cli._detect_installed_harnesses",
-            lambda: [(entry, "/usr/bin/kiro-cli")],
+            lambda _variants=None: [(entry, "/usr/bin/kiro-cli")],
         )
 
         result = _resolve_harness_for_discovery(None)
@@ -550,7 +594,7 @@ class TestListAgents:
 
         import synth_acp.models.config as config_mod
         from synth_acp.cli import app
-        from synth_acp.discovery import DiscoveredAgent
+        from synth_acp.models.agent import DiscoveredAgent
         from synth_acp.models.config import HarnessEntry
 
         monkeypatch.setattr(config_mod, "SYNTH_DIR", tmp_path)
@@ -560,7 +604,7 @@ class TestListAgents:
             identity="kiro", name="Kiro CLI", short_name="kiro",
             binary_names=["kiro-cli"], run_cmd="kiro-cli",
         )
-        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda: [entry])
+        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda _variants=None: [entry])
         from synth_acp.models.config import GlobalConfig
 
         monkeypatch.setattr("synth_acp.cli.load_global_config", lambda: GlobalConfig(default_harness="kiro"))
@@ -593,7 +637,7 @@ class TestListAgents:
             identity="kiro", name="Kiro CLI", short_name="kiro",
             binary_names=["kiro-cli"], run_cmd="kiro-cli",
         )
-        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda: [entry])
+        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda _variants=None: [entry])
         from synth_acp.models.config import GlobalConfig
 
         monkeypatch.setattr("synth_acp.cli.load_global_config", lambda: GlobalConfig(default_harness="kiro"))
@@ -616,7 +660,7 @@ class TestSelectAgent:
 
         import synth_acp.models.config as config_mod
         from synth_acp.cli import app
-        from synth_acp.discovery import DiscoveredAgent
+        from synth_acp.models.agent import DiscoveredAgent
         from synth_acp.models.config import HarnessEntry
 
         monkeypatch.setattr(config_mod, "SYNTH_DIR", tmp_path)
@@ -626,7 +670,7 @@ class TestSelectAgent:
             identity="kiro", name="Kiro CLI", short_name="kiro",
             binary_names=["kiro-cli"], run_cmd="kiro-cli",
         )
-        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda: [entry])
+        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda _variants=None: [entry])
         from synth_acp.models.config import GlobalConfig
 
         monkeypatch.setattr("synth_acp.cli.load_global_config", lambda: GlobalConfig(default_harness="kiro"))
@@ -655,7 +699,7 @@ class TestSelectAgent:
 
         import synth_acp.models.config as config_mod
         from synth_acp.cli import app
-        from synth_acp.discovery import DiscoveredAgent
+        from synth_acp.models.agent import DiscoveredAgent
         from synth_acp.models.config import HarnessEntry
 
         monkeypatch.setattr(config_mod, "SYNTH_DIR", tmp_path)
@@ -665,7 +709,7 @@ class TestSelectAgent:
             identity="kiro", name="Kiro CLI", short_name="kiro",
             binary_names=["kiro-cli"], run_cmd="kiro-cli",
         )
-        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda: [entry])
+        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda _variants=None: [entry])
         from synth_acp.models.config import GlobalConfig
 
         monkeypatch.setattr("synth_acp.cli.load_global_config", lambda: GlobalConfig(default_harness="kiro"))
@@ -993,6 +1037,34 @@ class TestHarnessEnvWiring:
         assert policy.inherit == ["AWS_*"]
 
 
+class TestHarnessVariantWiring:
+    """harness_variant resolution from global and project config."""
+
+    def test_harness_variant_merges_per_key(self) -> None:
+        """A project choosing one harness's engine must keep the global choice for
+        every other harness, rather than replacing the global dict wholesale."""
+        global_cfg = GlobalConfig(harness_variant={"kiro": "v2", "x": "a"})
+        raw = RawSessionConfig.model_validate(
+            {"project": "p", "settings": {"harness_variant": {"kiro": "v2b"}}}
+        )
+        resolved = _apply_global_settings(raw, global_cfg)
+        assert resolved.settings.harness_variant == {"kiro": "v2b", "x": "a"}
+
+    def test_unknown_variant_exits_1_with_message(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A typo'd variant must stop the CLI with the valid names, not start a
+        default engine or surface as a traceback."""
+        global_cfg = GlobalConfig(harness_variant={"kiro": "nope"})
+        with pytest.raises(typer.Exit) as exc_info:
+            _build_transient_config("kiro", None, None, global_cfg)
+        assert exc_info.value.exit_code == 1
+        err = capsys.readouterr().err
+        assert "'kiro'" in err
+        assert "'nope'" in err
+        assert "v2" in err
+
+
 class TestDetectRequiresTheSpawnedProgram:
     """Auto-detect must not offer a harness whose adaptor is absent.
 
@@ -1006,7 +1078,7 @@ class TestDetectRequiresTheSpawnedProgram:
             binary_names=["split-tool"], run_cmd="split-adaptor",
             install_hint="npm install -g split-adaptor",
         )
-        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda: [entry])
+        monkeypatch.setattr("synth_acp.cli.load_harness_registry", lambda _variants=None: [entry])
         return entry
 
     def test_skipped_when_only_the_harness_tool_is_present(

@@ -33,6 +33,7 @@ from synth_acp.models.events import (
     UsageUpdated,
     UserPromptSubmitted,
 )
+from synth_acp.models.extensions import ExtensionCapabilities
 from synth_acp.ui import app as synth_app_module
 from synth_acp.ui.app import DynamicAgentInfo, SynthApp, _coalesce_events
 from synth_acp.ui.messages import BrokerEventMessage
@@ -712,12 +713,14 @@ class TestSynthesizeAgentOption:
 
         from acp.schema import SessionConfigOptionSelect
 
-        from synth_acp.discovery import DiscoveredAgent
+        from synth_acp.models.agent import DiscoveredAgent
 
         broker = _make_broker(agent_ids=["agent-1"])
         # Set up registry mock
         registry = MagicMock()
-        registry.get_agent_mode_target = MagicMock(return_value="meta_agent")
+        registry.get_capabilities = MagicMock(
+            return_value=ExtensionCapabilities(profile_switch="handoff")
+        )
         registry.get_agent_mode = MagicMock(return_value="plugin-x:code-planner")
         broker._registry = registry
 
@@ -758,7 +761,7 @@ class TestSynthesizeAgentOption:
 
         broker = _make_broker(agent_ids=["agent-1"])
         registry = MagicMock()
-        registry.get_agent_mode_target = MagicMock(return_value="acp_mode")
+        registry.get_capabilities = MagicMock(return_value=ExtensionCapabilities())
         broker._registry = registry
 
         app = SynthApp(broker, _make_config("agent-1"))
@@ -1658,3 +1661,76 @@ class TestTerminationDoesNotStealSelection:
 
             assert app._auto_selected_from is None
             assert app.selected_agent == "agent-2", "selection still moves off the dead agent"
+
+
+class TestPendingProfileSwitchLabel:
+    """The agent picker shows a pending profile switch the broker reports."""
+
+    @staticmethod
+    def _agent_option():
+        from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+
+        return SessionConfigOptionSelect(
+            id="agent",
+            name="Agent",
+            category="agent",
+            type="select",
+            current_value="",
+            options=[
+                SessionConfigSelectOption(value="", name="Default"),
+                SessionConfigSelectOption(value="probe-heron", name="probe-heron"),
+            ],
+        )
+
+    @staticmethod
+    def _label(app: SynthApp, agent_id: str) -> str:
+        from synth_acp.ui.widgets.input_bar import _PickerLabel
+
+        bar = app._panels[agent_id].input_bar
+        assert bar is not None
+        return str(bar.query_one("#picker-agent", _PickerLabel).content)
+
+    async def test_profile_switch_changed_sets_and_clears_pending_label(self) -> None:
+        """Silent failure: the label never shows the pending target, or never clears it."""
+        from synth_acp.models.events import ProfileSwitchChanged
+
+        app = _make_app("agent-1")
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await pilot.pause()
+            bar = app._panels["agent-1"].input_bar
+            assert bar is not None
+            bar.update_config_options([self._agent_option()])
+
+            await app.on_broker_event_message(
+                BrokerEventMessage(
+                    ProfileSwitchChanged(agent_id="agent-1", pending_agent_mode="probe-heron")
+                )
+            )
+            assert "→ probe-heron pending" in self._label(app, "agent-1")
+
+            await app.on_broker_event_message(
+                BrokerEventMessage(ProfileSwitchChanged(agent_id="agent-1", pending_agent_mode=None))
+            )
+            assert "pending" not in self._label(app, "agent-1")
+
+    async def test_new_feed_reads_pending_switch_from_broker(self) -> None:
+        """Silent failure: selecting an agent whose switch is pending shows no pending state."""
+        broker = _make_broker(agent_ids=["agent-1"])
+        broker._registry.get_capabilities = MagicMock(
+            return_value=ExtensionCapabilities(profile_switch="handoff")
+        )
+        broker.pending_profile_switch = MagicMock(
+            side_effect=lambda aid: "probe-heron" if aid == "agent-2" else None
+        )
+        app = SynthApp(
+            broker, _make_config("agent-1"), initial_agent=AgentConfig(agent_id="agent-1", harness="claude")
+        )
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._dynamic_agents["agent-2"] = DynamicAgentInfo(
+                parent=None, task="", harness="claude", cwd="."
+            )
+            app._agent_config_options["agent-2"] = [self._agent_option()]
+            await app.select_agent("agent-2")
+            await pilot.pause()
+            assert "→ probe-heron pending" in self._label(app, "agent-2")

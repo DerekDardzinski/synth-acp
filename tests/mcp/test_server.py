@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
@@ -384,11 +385,31 @@ class TestMcpConnectionSafety:
         conn.close()
 
 class TestHandoff:
-    async def test_handoff_records_a_pending_command_and_returns_acceptance(
-        self, db_path: Path, mcp_factory
+    @staticmethod
+    def _settle_later(db_path: Path, delay: float, status: str, error: str | None) -> asyncio.Task:
+        """Stand in for the broker: settle the only command row after ``delay`` seconds."""
+
+        async def _settle() -> None:
+            await asyncio.sleep(delay)
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute("UPDATE agent_commands SET status = ?, error = ?", (status, error))
+                conn.commit()
+            finally:
+                conn.close()
+
+        return asyncio.create_task(_settle())
+
+    async def test_handoff_records_a_pending_command_with_agent_mode(
+        self, db_path: Path, mcp_factory, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The payload must carry agent_id, or the broker's self-service authorization
-        check rejects the handoff for a reason the calling agent never sees."""
+        check rejects the handoff for a reason the calling agent never sees; and it must
+        carry agent_mode, or the broker never sees the profile switch."""
+        import synth_acp.mcp.server as server_module
+
+        monkeypatch.setattr(server_module, "_HANDOFF_POLL_TIMEOUT", 0.05)
+        monkeypatch.setattr(server_module, "_HANDOFF_POLL_INTERVAL", 0.01)
         _init_schema(db_path)
         notified: list[bool] = []
 
@@ -400,53 +421,52 @@ class TestHandoff:
         brief = "Context: mid-refactor.\n\nNext: finish db.py."
 
         result = json.loads(await handoff(handoff_message=brief))
+        await handoff(handoff_message="b2", agent_mode="probe-heron")
 
         conn = sqlite3.connect(str(db_path))
         try:
-            row = conn.execute(
-                "SELECT id, from_agent, command, payload, status FROM agent_commands"
-            ).fetchone()
+            rows = conn.execute(
+                "SELECT id, from_agent, command, payload, status FROM agent_commands ORDER BY id"
+            ).fetchall()
         finally:
             conn.close()
-        assert result == {"accepted": True, "command_id": row[0]}
-        assert (row[1], row[2], row[4]) == ("worker", "handoff", "pending")
-        payload = json.loads(row[3])
-        assert payload == {"agent_id": "worker", "handoff_message": brief}
-        assert notified == [True]
+        assert result == {"accepted": True, "command_id": rows[0][0]}
+        assert (rows[0][1], rows[0][2], rows[0][4]) == ("worker", "handoff", "pending")
+        assert json.loads(rows[0][3]) == {
+            "agent_id": "worker", "handoff_message": brief, "agent_mode": None
+        }
+        assert json.loads(rows[1][3])["agent_mode"] == "probe-heron"
+        assert notified == [True, True]
 
-    async def test_handoff_reports_acceptance_not_completion(
+    async def test_a_rejection_after_more_than_three_seconds_reaches_the_agent(
         self, db_path: Path, mcp_factory
     ) -> None:
-        """It must NOT copy launch_agent's poll. That loop treats any status other than
-        'pending' as terminal, so a handoff sitting at 'processing' would be reported as
-        SUCCESS on the first 0.3s poll -- before its successor exists. And carrying out a
-        handoff kills the process group running this very tool call, so no completion
-        response could be delivered at all.
-        """
+        """Silent failure: launch_agent's 3 s poll cap copied here, so the agent is told
+        'accepted' while the broker, still behind the command tail, rejects it later.
+        Real time on purpose: the property is the wall-clock bound."""
         _init_schema(db_path)
-        server = mcp_factory(agent="worker")
-        handoff = _get_tool(server, "handoff")
+        handoff = _get_tool(mcp_factory(agent="worker"), "handoff")
+        error = "The user asked to switch you to 'probe-heron'; call handoff with agent_mode='probe-heron'"
+        settle = self._settle_later(db_path, 3.3, "rejected", error)
 
-        result = json.loads(await handoff(handoff_message="brief"))
+        result = json.loads(await handoff(handoff_message="brief", agent_mode="probe-crane"))
 
-        # Acceptance only: no ok/error verdict is claimed either way.
-        assert result["accepted"] is True
-        assert "ok" not in result
-        assert "error" not in result
+        await settle
+        assert result == {"error": error}
 
-    def test_handoff_does_not_poll_for_a_terminal_status(self) -> None:
-        """Structural guard: the source of the handoff tool must contain no poll loop.
-        A behavioral test cannot distinguish 'polled and got lucky' from 'never polled'."""
-        import ast
-        import inspect
-
+    async def test_processing_is_not_treated_as_an_outcome(
+        self, db_path: Path, mcp_factory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A claimed row can still be rejected. Silent failure: 'processing' read as done."""
         import synth_acp.mcp.server as server_module
 
-        src = inspect.getsource(server_module)
-        fn = next(
-            n
-            for n in ast.walk(ast.parse(src))
-            if isinstance(n, ast.AsyncFunctionDef) and n.name == "handoff"
-        )
-        assert not [n for n in ast.walk(fn) if isinstance(n, ast.For | ast.While)]
-        assert "sleep" not in ast.dump(fn)
+        monkeypatch.setattr(server_module, "_HANDOFF_POLL_INTERVAL", 0.01)
+        _init_schema(db_path)
+        handoff = _get_tool(mcp_factory(agent="worker"), "handoff")
+        processing = self._settle_later(db_path, 0.02, "processing", None)
+        rejected = self._settle_later(db_path, 0.2, "rejected", "no agent named 'x'")
+
+        result = json.loads(await handoff(handoff_message="brief", agent_mode="x"))
+
+        await asyncio.gather(processing, rejected)
+        assert result == {"error": "no agent named 'x'"}

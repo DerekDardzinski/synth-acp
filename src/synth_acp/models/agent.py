@@ -156,3 +156,12 @@ class HandoffResult(BaseModel):
     """True only if the successor's session was created AND its first prompt submitted."""
     error: str | None
     """Human-readable failure reason when successor_started is False; None otherwise."""
+
+
+class DiscoveredAgent(BaseModel, frozen=True):
+    """A discovered agent configuration."""
+
+    qualified_name: str  # The value to pass as agent_mode
+    name: str  # Human-readable short name (from file's name field)
+    description: str  # From file metadata, empty string if absent
+    source: str  # e.g. "user", "project", "plugin:local-SHScienceAgentKit-all"

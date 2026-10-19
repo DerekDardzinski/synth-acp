@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from collections.abc import Mapping
 
 from pydantic import BaseModel, ConfigDict
 
@@ -21,6 +22,7 @@ CREATE TABLE IF NOT EXISTS agents (
     cwd         TEXT,
     retired_from TEXT,
     retired_at  INTEGER,
+    harness_variant TEXT,
     PRIMARY KEY (agent_id, session_id)
 );
 CREATE TABLE IF NOT EXISTS messages (
@@ -159,9 +161,22 @@ def _migrate_schema_sync(conn) -> None:
     # predates this migration.
     cur = conn.execute("PRAGMA table_info(agents)")
     agent_cols = {row[1] for row in cur.fetchall()}
-    for name, decl in (("retired_from", "TEXT"), ("retired_at", "INTEGER")):
+    for name, decl in (
+        ("retired_from", "TEXT"),
+        ("retired_at", "INTEGER"),
+        ("harness_variant", "TEXT"),
+    ):
         if name not in agent_cols:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {name} {decl}")
+    # The engine variant that created each row's ACP session.  Every kiro row that
+    # predates the column was created by the only engine synth ran then, v2.  Only in
+    # the branch that adds the column, so a later run never rewrites a stored value.
+    # Other harnesses stay NULL, which matches an entry whose variant is None.
+    if "harness_variant" not in agent_cols:
+        conn.execute(
+            "UPDATE agents SET harness_variant = 'v2' "
+            "WHERE harness = 'kiro' AND harness_variant IS NULL"
+        )
     conn.commit()
 
     # Migrate session_embeddings: detect old single-PK schema (no agent_id column)
@@ -392,6 +407,8 @@ class AgentRenameResult(BaseModel):
     task: str
     harness: str
     agent_mode: str | None
+    """The SUCCESSOR's agent_mode: ``successor_agent_mode`` when given, else the
+    predecessor's, copied."""
     cwd: str
     retired_acp_session_id: str | None
     """The PREDECESSOR's ACP session id.  Stays with the predecessor so it remains
@@ -417,6 +434,8 @@ def rename_agent_sync(
     new_agent_id: str,
     session_id: str,
     now_ms: int,
+    harness_variants: Mapping[str, str | None] | None = None,
+    successor_agent_mode: str | None = None,
 ) -> AgentRenameResult:
     """Rename an agent and insert a successor under the freed id, atomically.
 
@@ -427,7 +446,8 @@ def rename_agent_sync(
     The predecessor ends at status 'inactive', which is exactly what
     AgentLifecycle.resurrect requires, so it stays resurrectable.  The successor is
     inserted 'active' with the predecessor's parent, task, harness, agent_mode and cwd
-    copied, and with acp_session_id NULL.
+    copied, and with acp_session_id NULL.  ``successor_agent_mode`` replaces the copied
+    agent_mode when given, which is how a handoff switches the agent profile.
 
     Does NOT modify agents.parent on any other row: children continue to point at
     old_agent_id, which after this call denotes the successor.  That is the purpose of
@@ -443,6 +463,12 @@ def rename_agent_sync(
         new_agent_id: The id it is renamed to.  Must not exist in this session.
         session_id: Scopes every statement.
         now_ms: Epoch milliseconds recorded as the successor's `registered`.
+        harness_variants: The configured engine variant per harness short name.  The
+            successor's row records the entry for the predecessor row's harness: the
+            configured variant, not the predecessor's, because the successor is a fresh
+            session.  A harness absent from the mapping records NULL.
+        successor_agent_mode: The agent profile the successor starts as.  None keeps the
+            predecessor's; "" starts it as the harness default (agent_mode NULL).
 
     Returns:
         The predecessor fields the caller needs to build the successor's session.
@@ -467,6 +493,10 @@ def rename_agent_sync(
                 f"Cannot rename '{old_agent_id}': no such agent in session '{session_id}'"
             )
         parent, task, harness, agent_mode, cwd, retired_acp_session_id = row
+        if successor_agent_mode is not None:
+            # "" selects the harness default: stored as NULL, so no profile is sent.
+            agent_mode = successor_agent_mode or None
+        harness_variant = (harness_variants or {}).get(harness)
 
         taken = conn.execute(
             "SELECT 1 FROM agents WHERE agent_id = ? AND session_id = ?",
@@ -510,9 +540,20 @@ def rename_agent_sync(
         # copying the predecessor's values would make the live agent claim to be retired.
         conn.execute(
             "INSERT INTO agents "
-            "(agent_id, session_id, status, registered, parent, task, harness, agent_mode, cwd) "
-            "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)",
-            (old_agent_id, session_id, now_ms, parent, task, harness, agent_mode, cwd),
+            "(agent_id, session_id, status, registered, parent, task, harness, agent_mode, cwd, "
+            "harness_variant) "
+            "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                old_agent_id,
+                session_id,
+                now_ms,
+                parent,
+                task,
+                harness,
+                agent_mode,
+                cwd,
+                harness_variant,
+            ),
         )
 
         # Recipient column: a row still 'pending' is picked up by

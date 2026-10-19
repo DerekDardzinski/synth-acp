@@ -790,6 +790,28 @@ class TestRenameAgent:
         _rules_table(conn)
         return conn
 
+    def test_successor_agent_mode_replaces_the_copy(self) -> None:
+        """Silent failure: the successor silently starts as the predecessor's agent."""
+        conn = self._conn()
+        _seed_handoff(conn)
+
+        result = rename_agent_sync(
+            conn,
+            old_agent_id=OLD,
+            new_agent_id=NEW,
+            session_id=SID,
+            now_ms=999,
+            successor_agent_mode="probe-heron",
+        )
+
+        modes = dict(
+            conn.execute(
+                "SELECT agent_id, agent_mode FROM agents WHERE agent_id IN (?, ?)", (OLD, NEW)
+            ).fetchall()
+        )
+        assert modes == {OLD: "probe-heron", NEW: "plan"}
+        assert result.agent_mode == "probe-heron"
+
     def test_rename_moves_authored_and_leaves_pointers(self) -> None:
         conn = self._conn()
         _seed_handoff(conn)
@@ -1231,4 +1253,48 @@ class TestHandoffLineageColumns:
             "sess-old", "inactive", 5, "boss", "old work", "acp-9",
             "kiro", "plan", "/tmp/legacy",
         )
+        conn.close()
+
+
+class TestHarnessVariantColumn:
+    """agents.harness_variant records the engine that created each row's ACP session.
+
+    Restore compares it with the configured variant, so a wrong value silently loads a
+    Kiro v2 session id into v3 (an empty session) or throws away a matching session.
+    """
+
+    def test_migration_adds_column_and_backfills_kiro_rows_once(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript("""
+            CREATE TABLE agents (
+                agent_id    TEXT NOT NULL,
+                session_id  TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'active',
+                registered  INTEGER NOT NULL,
+                parent      TEXT,
+                task        TEXT,
+                acp_session_id TEXT,
+                harness     TEXT,
+                agent_mode  TEXT,
+                cwd         TEXT,
+                retired_from TEXT,
+                retired_at  INTEGER,
+                PRIMARY KEY (agent_id, session_id)
+            );
+            INSERT INTO agents (agent_id, session_id, registered, harness)
+            VALUES ('k', 's', 1, 'kiro'), ('c', 's', 1, 'claude');
+        """)
+
+        ensure_schema_sync(conn)
+        rows = "SELECT agent_id, harness_variant FROM agents ORDER BY agent_id"
+        assert conn.execute(rows).fetchall() == [("c", None), ("k", "v2")]
+
+        # A later run must not rewrite a value recorded after the migration.
+        conn.execute("UPDATE agents SET harness_variant = 'v3' WHERE agent_id = 'k'")
+        conn.execute(
+            "INSERT INTO agents (agent_id, session_id, registered, harness) "
+            "VALUES ('k2', 's', 1, 'kiro')"
+        )
+        ensure_schema_sync(conn)
+        assert conn.execute(rows).fetchall() == [("c", None), ("k", "v3"), ("k2", None)]
         conn.close()

@@ -50,6 +50,7 @@ from synth_acp.models.events import (
     TurnComplete,
     UserPromptSubmitted,
 )
+from synth_acp.models.extensions import ExtensionCapabilities
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.messages import BrokerEventMessage
 from synth_acp.ui.widgets.conversation import ConversationFeed
@@ -570,8 +571,8 @@ class _FakeBroker:
 
 
 class _FakeRegistry:
-    def get_agent_mode_target(self, agent_id: str) -> str:
-        return "acp_mode"
+    def get_capabilities(self, agent_id: str) -> ExtensionCapabilities:
+        return ExtensionCapabilities()
 
     def get_agent_mode(self, agent_id: str) -> str | None:
         return None

@@ -17,7 +17,8 @@ class PermissionEngine:
     """Loads, caches, and persists per-agent permission rules.
 
     Rules are keyed on ``(agent_id, tool_kind, session_id)`` and stored in a
-    SQLite ``rules`` table.  The in-memory cache starts empty each session —
+    SQLite ``rules`` table.  ``tool_kind`` holds a rule key from
+    ``permission_rule_key`` (tool identity when known, else tool kind).  The in-memory cache starts empty each session —
     no pre-loading from SQLite.
     """
 
@@ -45,7 +46,8 @@ class PermissionEngine:
 
         Args:
             agent_id: The agent that requested permission.
-            tool_kind: The kind of tool call (e.g. ``"execute"``).
+            tool_kind: The rule key from ``permission_rule_key`` (e.g. ``"execute"``
+                or ``"tool:github/create_issue"``).
             session_id: The per-run session UUID.
 
         Returns:

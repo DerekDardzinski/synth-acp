@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from synth_acp.models.events import ToolCallUpdated
+from synth_acp.models.events import PermissionRequested, ToolCallUpdated
 
 
 class TestToolCallUpdatedParentField:
@@ -28,6 +28,17 @@ class TestToolCallUpdatedParentField:
             parent_tool_call_id="parent-tc-1",
         )
         assert evt.parent_tool_call_id == "parent-tc-1"
+
+
+class TestPermissionRequestedJournalCompat:
+    def test_row_journaled_without_tool_identity_loads(self) -> None:
+        """Restore replays ui_events with model_validate_json; a required field would
+        make every pre-existing PermissionRequested row fail to load."""
+        payload = (
+            '{"agent_id": "a", "request_id": "r1", "title": "ls", "kind": "execute", "options": []}'
+        )
+        evt = PermissionRequested.model_validate_json(payload)
+        assert evt.tool_identity is None
 
 
 class TestAgentHandedOffUnion:

@@ -6,4 +6,4 @@ run_cmd = "claude-agent-acp"
 install_hint = "npm install -g @agentclientprotocol/claude-agent-acp"
 executable_env_var = "CLAUDE_CODE_EXECUTABLE"
 clear_env_vars = ["CLAUDECODE"]
-agent_mode_target = "meta_agent"
+extension = "claude"

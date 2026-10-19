@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 from typing import ClassVar
 
@@ -13,17 +14,21 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, OptionList, Select
 from textual.widgets.option_list import Option
 
-from synth_acp.discovery import DiscoveredAgent, discover_agents
+from synth_acp.discovery import discover_agents
 from synth_acp.harnesses import load_harness_registry
-from synth_acp.models.agent import AgentConfig
+from synth_acp.models.agent import AgentConfig, DiscoveredAgent
 from synth_acp.models.config import HarnessEntry
 from synth_acp.ui.file_discovery import fuzzy_score
 
 
-def _detect_harnesses() -> list[HarnessEntry]:
-    """Return harness entries whose binary is found in PATH."""
+def _detect_harnesses(variants: Mapping[str, str] | None = None) -> list[HarnessEntry]:
+    """Return harness entries whose binary is found in PATH.
+
+    Args:
+        variants: The ``harness_variant`` setting used to resolve each entry.
+    """
     available: list[HarnessEntry] = []
-    for entry in load_harness_registry():
+    for entry in load_harness_registry(variants):
         for binary in entry.binary_names:
             if shutil.which(binary):
                 available.append(entry)
@@ -39,9 +44,9 @@ class LaunchAgentScreen(ModalScreen[AgentConfig | None]):
 
     BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "dismiss_none", "Close")]
 
-    def __init__(self) -> None:
+    def __init__(self, harness_variant: Mapping[str, str] | None = None) -> None:
         super().__init__()
-        self._harnesses = _detect_harnesses()
+        self._harnesses = _detect_harnesses(harness_variant)
         self._agents: list[DiscoveredAgent] = []
         self._selected_agent: str | None = None
 

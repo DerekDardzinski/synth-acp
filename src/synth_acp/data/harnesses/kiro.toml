@@ -2,6 +2,15 @@ identity = "kiro"
 name = "Kiro CLI"
 short_name = "kiro"
 binary_names = ["kiro-cli"]
+default_variant = "v2"
+
+[variants.v2]
 run_cmd = "kiro-cli acp"
 mode_arg = "--agent"
-steer_protocol = "kiro"
+extension = "kiro_v2"
+
+# v3 rejects --agent (exits 2), so it has no mode_arg; the agent mode travels as
+# session/new _meta.kiro.modeId instead.
+[variants.v3]
+run_cmd = "kiro-cli acp --agent-engine=v3 --auth-method=cli"
+extension = "kiro_v3"

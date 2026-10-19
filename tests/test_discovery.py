@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from synth_acp.discovery import DiscoveredAgent, discover_agents
+from synth_acp.discovery import discover_agents
+from synth_acp.models.agent import DiscoveredAgent
 from synth_acp.models.config import HarnessEntry
 
 
@@ -16,6 +17,7 @@ def _claude_harness() -> HarnessEntry:
         short_name="claude",
         binary_names=["claude"],
         run_cmd="claude-agent-acp",
+        extension="claude",
     )
 
 
@@ -26,6 +28,7 @@ def _kiro_harness() -> HarnessEntry:
         short_name="kiro",
         binary_names=["kiro-cli"],
         run_cmd="kiro-cli acp",
+        extension="kiro_v2",
     )
 
 

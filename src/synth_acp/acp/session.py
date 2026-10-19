@@ -6,11 +6,11 @@ import asyncio
 import asyncio.subprocess as aio_subprocess
 import contextlib
 import logging
-import math
 import os
 import signal
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, TypeVar
 
 from acp.client.connection import ClientSideConnection
@@ -36,7 +36,9 @@ from acp.schema import (
     RequestPermissionResponse,
     SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
+    SessionConfigSelectGroup,
     SessionConfigSelectOption,
+    SessionResumeCapabilities,
     TerminalExitStatus,
     TerminalOutputResponse,
     ToolCallProgress,
@@ -48,6 +50,7 @@ from acp.schema import (
 from acp.transports import default_environment
 
 from acp import text_block
+from synth_acp.acp.extensions import AcpExtension, get_extension
 from synth_acp.acp.state_machine import AgentStateMachine
 from synth_acp.models.agent import (
     AgentMode,
@@ -77,6 +80,14 @@ from synth_acp.models.events import (
     TurnComplete,
     UsageUpdated,
 )
+from synth_acp.models.extensions import (
+    ContextUsage,
+    ExtensionCapabilities,
+    ProfileUnavailable,
+    Signal,
+    SteerOutcome,
+    UpdateHints,
+)
 from synth_acp.terminal.manager import Command, TerminalProcess
 
 log = logging.getLogger(__name__)
@@ -91,7 +102,7 @@ DRAIN_PASSES: int = 4
 _PIPE_LIMIT = 8 * 1024 * 1024  # 8 MiB — agent tool responses can be large
 
 _STEER_ACCEPTANCE_TIMEOUT = 10.0
-"""Seconds to wait for Kiro's deterministic steering acceptance response."""
+"""Seconds to wait for the harness's deterministic steering acceptance response."""
 
 _HANDSHAKE_TIMEOUT = 60.0
 """Seconds to wait for one handshake request before declaring the agent dead.
@@ -194,16 +205,6 @@ class HandshakeTimeoutError(Exception):
         )
 
 
-# Kiro's proprietary usage notification. The wire method is "_kiro.dev/metadata";
-# the acp SDK strips the leading underscore before dispatching to a client, so the
-# name matched here has none. See ACPSession.ext_notification.
-_KIRO_METADATA_NOTIFICATION = "kiro.dev/metadata"
-
-# Denominator used when a harness reports context fullness as a percentage rather
-# than as token counts, so UsageUpdated.used / .size is the true fraction.
-_PERCENT_SCALE = 100
-
-
 @asynccontextmanager
 async def _spawn_isolated_agent(
     client: Any,
@@ -275,6 +276,32 @@ async def _spawn_isolated_agent(
             process.stdin.close()
 
 
+def _allowed_values(
+    opt: SessionConfigOptionSelect | SessionConfigOptionBoolean,
+) -> frozenset[str] | None:
+    """The values a select option advertises, groups flattened; None for a boolean."""
+    if not isinstance(opt, SessionConfigOptionSelect):
+        return None
+    values: set[str] = set()
+    for item in opt.options:
+        if isinstance(item, SessionConfigSelectGroup):
+            values.update(o.value for o in item.options)
+        else:
+            values.add(item.value)
+    return frozenset(values)
+
+
+def _advertises_resume(init_response: Any) -> bool:
+    """Whether the InitializeResponse advertises standard ``session/resume``.
+
+    An isinstance check rather than ``is not None``, so only a parsed
+    ``SessionResumeCapabilities`` counts.
+    """
+    caps = getattr(init_response, "agent_capabilities", None)
+    session_caps = getattr(caps, "session_capabilities", None)
+    return isinstance(getattr(session_caps, "resume", None), SessionResumeCapabilities)
+
+
 class ACPSession:
     """Wraps one ACP agent subprocess.
 
@@ -292,9 +319,22 @@ class ACPSession:
         mcp_servers: list[McpServerStdio] | None = None,
         agent_mode: str | None = None,
         env: dict[str, str] | None = None,
-        agent_mode_target: str | None = None,
-        steer_protocol: str | None = None,
+        extension: AcpExtension | None = None,
     ) -> None:
+        """Build an unstarted session.
+
+        Args:
+            agent_id: Synth agent id stamped on every event.
+            binary: Program to spawn.
+            args: Its arguments.
+            cwd: Working directory for the agent and its sessions.
+            event_sink: Receives every BrokerEvent this session emits.
+            mcp_servers: MCP servers passed on session/new and session/load.
+            agent_mode: Configured agent profile, or None.
+            env: Environment overrides for the subprocess.
+            extension: The harness engine's ACP extension; None means
+                ``get_extension("standard")``.
+        """
         self.agent_id = agent_id
         self._sm = AgentStateMachine(agent_id, self._on_state_transition)
         self._binary = binary
@@ -306,10 +346,11 @@ class ACPSession:
         self._proc: Any = None
         self._session_id: str | None = None
         self._permission_futures: dict[str, asyncio.Future[str]] = {}
+        self._tool_kinds: dict[str, str] = {}
+        """Kind of each live tool call by toolCallId, for permission requests without one."""
         self._capabilities: Any = None
         self._agent_mode = agent_mode
-        self._agent_mode_target = agent_mode_target
-        self._steer_protocol = steer_protocol
+        self._ext = extension if extension is not None else get_extension("standard")
         self._env = env
         self._available_modes: list[AgentMode] = []
         self._current_mode_id: str | None = None
@@ -346,14 +387,14 @@ class ACPSession:
         return self._agent_mode
 
     @property
-    def steer_protocol(self) -> str | None:
-        """The harness's in-turn steering protocol, or None when unsupported."""
-        return self._steer_protocol
+    def capabilities(self) -> ExtensionCapabilities:
+        """What synth may rely on for this session's harness engine."""
+        return self._ext.capabilities
 
     @property
-    def agent_mode_target(self) -> str | None:
-        """How agent_mode is applied: 'meta_agent' or 'acp_mode', or None."""
-        return self._agent_mode_target
+    def extension(self) -> AcpExtension:
+        """The harness engine's ACP extension."""
+        return self._ext
 
     async def force_terminate(self) -> None:
         """Force transition to TERMINATED. Safe for cleanup paths and voluntary exit.
@@ -459,9 +500,8 @@ class ACPSession:
         holds a state the user cannot leave until the agent answers.  Apply it to the CALL
         SITE, not to the method name, because the same method appears under both states --
         ``session/load`` holds INITIALIZING from ``run_restored`` and CONFIGURING from
-        ``_restore_mcp_servers``, and ``session/fork`` and ``session/new`` hold CONFIGURING
-        inside ``fork_with_agent``.  Every call of initialize, session/new, session/load,
-        session/fork, session/set_mode, session/set_model and session/set_config_option
+        ``_restore_mcp_servers``.  Every call of initialize, session/new, session/load,
+        session/set_mode, session/set_model and session/set_config_option
         currently qualifies, which is why all of them are wrapped.
 
         An earlier version of this docstring listed only the first four methods, which was
@@ -521,12 +561,14 @@ class ACPSession:
                     "initialize",
                 )
                 self._capabilities = getattr(init_response, "agent_capabilities", None)
-                new_session_kwargs: dict[str, Any] = {}
-                if self._agent_mode_target == "meta_agent" and self._agent_mode:
-                    new_session_kwargs["claudeCode"] = {"options": {"agent": self._agent_mode}}
+                if (info := getattr(init_response, "agent_info", None)) is not None:
+                    log.info("%s: agent %s %s", self.agent_id, info.name, info.version)
+                await self._check_profile(self._agent_mode)
                 session = await self._handshake(
                     conn.new_session(
-                        cwd=self._cwd, mcp_servers=self._mcp_servers, **new_session_kwargs
+                        cwd=self._cwd,
+                        mcp_servers=self._mcp_servers,
+                        **self._ext.session_meta("new", self._agent_mode),
                     ),
                     "session/new",
                 )
@@ -574,7 +616,7 @@ class ACPSession:
                     )
 
                 # Apply agent_mode from config if advertised
-                if self._agent_mode is not None and self._agent_mode_target != "meta_agent":
+                if self._agent_mode is not None and self.capabilities.profile_switch == "mode":
                     mode_ids = {m.id for m in self._available_modes}
                     if self._agent_mode in mode_ids:
                         await self._handshake(
@@ -587,48 +629,51 @@ class ACPSession:
                         await self._event_sink(
                             AgentModeChanged(agent_id=self.agent_id, mode_id=self._agent_mode)
                         )
-                        # Re-read model state — mode switch may change the model.
-                        # Safe to load_session here because no conversation history
-                        # exists yet.
-                        try:
-                            loaded = await self._handshake(
-                                conn.load_session(
-                                    session_id=self._session_id,
-                                    cwd=self._cwd,
-                                    mcp_servers=self._mcp_servers or None,
-                                ),
-                                "session/load",
-                            )
-                            if loaded.models is not None:
-                                new_model = loaded.models.current_model_id
-                                if new_model and new_model != self._current_model_id:
-                                    self._current_model_id = new_model
-                                    await self._event_sink(
-                                        AgentModelChanged(
-                                            agent_id=self.agent_id, model_id=new_model
+                        # Re-read model state — mode switch may change the model, and
+                        # reconnect the MCP servers the switch dropped.  Only for an
+                        # engine that drops them (reload_after_mode_switch).  Safe to
+                        # load_session here because no conversation history exists yet.
+                        if self.capabilities.reload_after_mode_switch:
+                            try:
+                                loaded = await self._handshake(
+                                    conn.load_session(
+                                        session_id=self._session_id,
+                                        cwd=self._cwd,
+                                        mcp_servers=self._mcp_servers or None,
+                                        **self._ext.session_meta("load", self._agent_mode),
+                                    ),
+                                    "session/load",
+                                )
+                                if loaded.models is not None:
+                                    new_model = loaded.models.current_model_id
+                                    if new_model and new_model != self._current_model_id:
+                                        self._current_model_id = new_model
+                                        await self._event_sink(
+                                            AgentModelChanged(
+                                                agent_id=self.agent_id, model_id=new_model
+                                            )
                                         )
-                                    )
-                        except HandshakeTimeoutError:
-                            # Explicit re-raise, because the broad handler below would
-                            # otherwise swallow it -- HandshakeTimeoutError is an Exception,
-                            # so a comment alone does not exempt it.  An earlier revision
-                            # here consisted of exactly that comment and no branch, and the
-                            # timeout went on being swallowed while the comment said it did
-                            # not.
-                            raise
-                        # An earlier version reported the timeout and carried on, reasoning
-                        # that the agent had already answered three requests so a stall
-                        # confined to this best-effort re-read was a harness quirk.  That was
-                        # wrong: asyncio.wait_for cancels only synth's local future and sends
-                        # no ACP cancellation, so the agent goes on processing the load, and
-                        # carrying on to IDLE would permit a prompt concurrent with a live
-                        # load_session -- which set_mode's docstring records as hanging Kiro
-                        # indefinitely.  Propagating reaches run()'s handler, which reports
-                        # it, and leaving the spawn context kills the process group.
-                        except Exception:
-                            log.debug(
-                                "Model re-read after initial mode switch failed", exc_info=True
-                            )
+                            except HandshakeTimeoutError:
+                                # Explicit re-raise, because the broad handler below would
+                                # otherwise swallow it -- HandshakeTimeoutError is an Exception,
+                                # so a comment alone does not exempt it.  An earlier revision
+                                # here consisted of exactly that comment and no branch, and the
+                                # timeout went on being swallowed while the comment said it did
+                                # not.
+                                raise
+                            # An earlier version reported the timeout and carried on, reasoning
+                            # that the agent had already answered three requests so a stall
+                            # confined to this best-effort re-read was a harness quirk.  That was
+                            # wrong: asyncio.wait_for cancels only synth's local future and sends
+                            # no ACP cancellation, so the agent goes on processing the load, and
+                            # carrying on to IDLE would permit a prompt concurrent with a live
+                            # load_session -- which set_config_option's docstring records as hanging Kiro
+                            # indefinitely.  Propagating reaches run()'s handler, which reports
+                            # it, and leaving the spawn context kills the process group.
+                            except Exception:
+                                log.debug(
+                                    "Model re-read after initial mode switch failed", exc_info=True
+                                )
                     else:
                         log.warning(
                             "agent_mode '%s' not in available_modes for %s — skipping",
@@ -685,13 +730,18 @@ class ACPSession:
         session_id does not match self._session_id — so setting it afterwards
         would make the guard order below meaningless.
 
-        We set _suppress_history_replay=True so session_update returns early
-        without emitting while the agent replays its whole conversation.  The
-        broker replays the UI event journal separately.  The flag is cleared in
-        a finally block, after _settle_replay_guard() has let already-created
-        replay runners reach the guard.
+        Restore order, for every harness: standard ``session/resume`` when the
+        InitializeResponse advertises ``sessionCapabilities.resume`` (no history
+        replay; Claude), otherwise ``session/load`` with the extension's load
+        ``_meta`` (Kiro v3 asks for no replay there).
 
-        If load_session fails (e.g. the agent has no history for that
+        We set _suppress_history_replay=True for either call so session_update
+        returns early without emitting while the agent replays its whole
+        conversation.  The broker replays the UI event journal separately.  The
+        flag is cleared in a finally block, after _settle_replay_guard() has let
+        already-created replay runners reach the guard.
+
+        If the resume or load fails (e.g. the agent has no history for that
         session ID), we fall back to new_session and invoke
         _on_session_created so the fresh acp_session_id is persisted to DB.
         """
@@ -718,20 +768,40 @@ class ACPSession:
                     "initialize",
                 )
                 self._capabilities = getattr(init_response, "agent_capabilities", None)
+                if (info := getattr(init_response, "agent_info", None)) is not None:
+                    log.info("%s: agent %s %s", self.agent_id, info.name, info.version)
+
+                # Once per run_restored, before load: the fallback new_session below
+                # must not warn a second time.
+                await self._check_profile(self._agent_mode)
 
                 # CRITICAL: assign session_id BEFORE calling load_session.
                 self._session_id = saved_acp_session_id
 
                 self._suppress_history_replay = True
                 try:
-                    session = await self._handshake(
-                        conn.load_session(
-                            session_id=saved_acp_session_id,
-                            cwd=self._cwd,
-                            mcp_servers=self._mcp_servers,
-                        ),
-                        "session/load",
-                    )
+                    if _advertises_resume(init_response):
+                        session = await self._handshake(
+                            conn.resume_session(
+                                session_id=saved_acp_session_id,
+                                cwd=self._cwd,
+                                # A list, never None: the SDK sends None as null
+                                # rather than coercing it to [].
+                                mcp_servers=list(self._mcp_servers),
+                                **self._ext.session_meta("resume", self._agent_mode),
+                            ),
+                            "session/resume",
+                        )
+                    else:
+                        session = await self._handshake(
+                            conn.load_session(
+                                session_id=saved_acp_session_id,
+                                cwd=self._cwd,
+                                mcp_servers=self._mcp_servers,
+                                **self._ext.session_meta("load", self._agent_mode),
+                            ),
+                            "session/load",
+                        )
                 except HandshakeTimeoutError:
                     # Deliberately NOT the fallback below.  A timeout means the child is
                     # not answering at all, so new_session would spend a second full
@@ -740,7 +810,7 @@ class ACPSession:
                     raise
                 except Exception as exc:
                     log.warning(
-                        "load_session failed for %s (session %s), falling back to new_session: %s",
+                        "Session restore failed for %s (session %s), falling back to new_session: %s",
                         self.agent_id,
                         saved_acp_session_id,
                         exc,
@@ -752,12 +822,11 @@ class ACPSession:
                             severity="warning",
                         )
                     )
-                    new_session_kwargs: dict[str, Any] = {}
-                    if self._agent_mode_target == "meta_agent" and self._agent_mode:
-                        new_session_kwargs["claudeCode"] = {"options": {"agent": self._agent_mode}}
                     session = await self._handshake(
                         conn.new_session(
-                            cwd=self._cwd, mcp_servers=self._mcp_servers, **new_session_kwargs
+                            cwd=self._cwd,
+                            mcp_servers=self._mcp_servers,
+                            **self._ext.session_meta("new", self._agent_mode),
                         ),
                         "session/new",
                     )
@@ -802,7 +871,7 @@ class ACPSession:
                 # Apply configured agent_mode if it differs from the restored mode
                 if (
                     self._agent_mode is not None
-                    and self._agent_mode_target != "meta_agent"
+                    and self.capabilities.profile_switch == "mode"
                     and self._agent_mode != self._current_mode_id
                     and self._agent_mode in {m.id for m in self._available_modes}
                 ):
@@ -906,54 +975,6 @@ class ACPSession:
                 await self._sm.transition(AgentState.BUSY)
                 await self._sm.transition(AgentState.IDLE)
 
-    async def set_mode(self, mode_id: str) -> None:
-        """Switch the agent's mode, preserving the current model.
-
-        Transitions to CONFIGURING for the duration of the switch. This blocks
-        any concurrent prompt from being sent to the agent while set_session_mode,
-        set_session_model, and load_session (MCP restore) are in flight — sending
-        a prompt concurrently with load_session causes Kiro to hang indefinitely.
-
-        CONFIGURING → IDLE in the finally block ensures the state is always
-        restored even if an RPC fails mid-switch.
-        """
-        if self._conn and self._session_id and self.state == AgentState.IDLE:
-            await self._sm.transition(AgentState.CONFIGURING)
-            try:
-                await self._handshake(
-                    self._conn.set_session_mode(mode_id=mode_id, session_id=self._session_id),
-                    "session/set_mode",
-                )
-                if self._current_model_id:
-                    await self._handshake(
-                        self._conn.set_session_model(
-                            model_id=self._current_model_id, session_id=self._session_id
-                        ),
-                        "session/set_model",
-                    )
-                await self._restore_mcp_servers()
-                # _restore_mcp_servers TERMINATES the session on a timeout, and returns
-                # normally rather than raising, because raising would change the contract
-                # of a method the broker calls without a handler.  So the success path
-                # below has to be guarded, or a killed agent is announced as having
-                # switched: subscribers saw AgentModeChanged for a session the same call
-                # had just terminated.  CONFIGURING is the right predicate rather than a
-                # returned flag -- it is the state this method itself established, and the
-                # finally below already trusts it.
-                if self.state != AgentState.CONFIGURING:
-                    return
-                self._current_mode_id = mode_id
-                await self._event_sink(AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id))
-            except HandshakeTimeoutError as exc:
-                # ONE handler for every request in the block above.  Caught rather than
-                # allowed to propagate because the broker awaits this method with no
-                # handler of its own; the success path is skipped by the unwinding, so
-                # there is no per-request flag for a later edit to forget.
-                await self._end_session_on_config_timeout(exc, "Mode switch")
-            finally:
-                if self.state == AgentState.CONFIGURING:
-                    await self._sm.transition(AgentState.IDLE)
-
     async def _end_session_on_config_timeout(
         self, exc: HandshakeTimeoutError, what: str
     ) -> None:
@@ -962,16 +983,15 @@ class ACPSession:
         Every handshake timeout is terminal.  For the requests made during ``run()`` and
         ``run_restored()`` that is free -- the exception leaves the spawn context manager,
         which kills the process group on the way out.  The requests made after launch, by
-        ``set_mode``, ``set_model``, ``set_config_option`` and ``_restore_mcp_servers``,
-        are outside that context, so the kill is explicit and lives here rather than in
-        four copies.
+        ``set_config_option`` and ``_restore_mcp_servers``, are outside that context, so
+        the kill is explicit and lives here rather than in a copy per caller.
 
         Terminal rather than recoverable, and neither of the two obvious alternatives
         works.  Reporting and returning to IDLE is unsafe, for one MEASURED reason and one
         JUDGMENT that are worth keeping apart.  Measured: ``asyncio.wait_for`` cancels only
         synth's LOCAL future and sends no ACP cancellation (SDK ``connection.py`` sends the
         request then awaits its future with no cancellation path), so the agent goes on
-        processing, and for ``session/load`` specifically ``set_mode``'s docstring records
+        processing, and for ``session/load`` specifically ``set_config_option``'s docstring records
         that a concurrent prompt hangs Kiro indefinitely.  Judgment, alternatives not
         discriminated: for ``set_session_mode``, ``set_session_model`` and
         ``set_config_option`` no equivalent hang has been observed, and the reason to end
@@ -1032,6 +1052,7 @@ class ACPSession:
                     session_id=self._session_id,
                     cwd=self._cwd,
                     mcp_servers=self._mcp_servers,
+                    **self._ext.session_meta("load", self._agent_mode),
                 ),
                 "session/load",
             )
@@ -1050,30 +1071,16 @@ class ACPSession:
             finally:
                 self._suppress_history_replay = False
 
-    async def set_model(self, model_id: str) -> None:
-        """Switch the agent's model, transitioning through CONFIGURING."""
-        if self._conn and self._session_id and self.state == AgentState.IDLE:
-            await self._sm.transition(AgentState.CONFIGURING)
-            try:
-                await self._handshake(
-                    self._conn.set_session_model(
-                        model_id=model_id, session_id=self._session_id
-                    ),
-                    "session/set_model",
-                )
-                self._current_model_id = model_id
-                await self._event_sink(AgentModelChanged(agent_id=self.agent_id, model_id=model_id))
-            except HandshakeTimeoutError as exc:
-                await self._end_session_on_config_timeout(exc, "Model switch")
-            finally:
-                if self.state == AgentState.CONFIGURING:
-                    await self._sm.transition(AgentState.IDLE)
-
     async def set_config_option(self, config_id: str, value: str | bool) -> None:
         """Switch a session config option.
 
         Precondition: state must be IDLE.
         State transitions: IDLE → CONFIGURING → IDLE (in finally block).
+
+        CONFIGURING blocks any concurrent prompt from being sent while the switch's
+        requests (set_session_mode, set_session_model, and the load_session MCP restore)
+        are in flight: sending a prompt concurrently with load_session causes Kiro to
+        hang indefinitely.
         """
         if not self._conn or not self._session_id:
             return
@@ -1082,6 +1089,22 @@ class ACPSession:
                 BrokerError(
                     agent_id=self.agent_id,
                     message=f"Cannot change config while {self.state}",
+                    severity="warning",
+                )
+            )
+            return
+        # Some agents (Kiro v3) accept any value and any configId without error, so a
+        # value the agent never advertised is rejected here rather than sent.  With no
+        # options advertised at all there is nothing to check against, and the request
+        # passes through as it always has.
+        opt = next((o for o in self._config_options if o.id == config_id), None)
+        allowed = _allowed_values(opt) if opt is not None else None
+        if self._config_options and (opt is None or (allowed is not None and value not in allowed)):
+            reason = "Unknown config option" if opt is None else "Value not offered for"
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=f"{reason} {config_id}: {value}",
                     severity="warning",
                 )
             )
@@ -1129,7 +1152,8 @@ class ACPSession:
                         ),
                         "session/set_model",
                     )
-                await self._restore_mcp_servers()
+                if self.capabilities.reload_after_mode_switch:
+                    await self._restore_mcp_servers()
                 # _restore_mcp_servers TERMINATES the session on a timeout, and returns
                 # normally rather than raising, because raising would change the contract
                 # of a method the broker calls without a handler.  So the success path
@@ -1189,100 +1213,6 @@ class ACPSession:
             if self.state == AgentState.CONFIGURING:
                 await self._sm.transition(AgentState.IDLE)
 
-    async def fork_with_agent(self, agent_name: str) -> str | None:
-        """Fork current session with a different agent.
-
-        Calls conn.fork_session with _meta.claudeCode.options.agent set to agent_name.
-        On success: swaps _session_id, updates _agent_mode, re-captures config_options
-        from fork response, emits ConfigOptionsReceived. Returns new session_id.
-        On failure: emits BrokerError, returns None.
-
-        Precondition: state must be IDLE.
-        State transitions: IDLE -> CONFIGURING -> IDLE (in finally).
-        """
-        if not self._conn or not self._session_id:
-            return None
-        if self.state != AgentState.IDLE:
-            await self._event_sink(
-                BrokerError(
-                    agent_id=self.agent_id,
-                    message=f"Cannot switch agent while {self.state}",
-                    severity="warning",
-                )
-            )
-            return None
-
-        await self._sm.transition(AgentState.CONFIGURING)
-        try:
-            meta_kwargs: dict[str, Any] = {}
-            if agent_name:
-                meta_kwargs["claudeCode"] = {"options": {"agent": agent_name}}
-            try:
-                response = await self._handshake(
-                    self._conn.fork_session(
-                        cwd=self._cwd,
-                        session_id=self._session_id,
-                        mcp_servers=self._mcp_servers or None,
-                        **meta_kwargs,
-                    ),
-                    "session/fork",
-                )
-            except RequestError as exc:
-                if exc.code == -32002:
-                    # Empty session — no history to fork. Fall back to new_session.
-                    log.debug("Fork failed (no history), falling back to new_session for %s", self.agent_id)
-                    response = await self._handshake(
-                        self._conn.new_session(
-                            cwd=self._cwd,
-                            mcp_servers=self._mcp_servers,
-                            **meta_kwargs,
-                        ),
-                        "session/new",
-                    )
-                else:
-                    raise
-            self._session_id = response.session_id
-            self._agent_mode = agent_name or None
-            await self._capture_config_options(response)
-            return response.session_id
-        except HandshakeTimeoutError as exc:
-            # TERMINAL, like every other handshake timeout, and for a reason specific to
-            # this call: synth gave up locally but sent no ACP cancellation, so the agent
-            # may still COMPLETE the fork afterwards.  It would then be on a session id
-            # synth never learned, while synth kept using the old one -- silent state
-            # divergence, which is worse than ending the session.  The Kiro prompt/load
-            # hang recorded on set_mode is evidence for load_session specifically; this
-            # divergence argument is a property of the protocol's local-only cancellation
-            # and so applies to any session-creating request.
-            log.warning("fork timed out for %s, terminating: %s", self.agent_id, exc)
-            await self._event_sink(
-                BrokerError(
-                    agent_id=self.agent_id,
-                    message=(
-                        f"Failed to switch agent to {agent_name}: {exc} "
-                        "The agent stopped answering and was terminated, because it may "
-                        "still complete the switch on a session synth cannot see."
-                    ),
-                    severity="error",
-                )
-            )
-            self.force_kill()
-            await self.force_terminate()
-            return None
-        except Exception as exc:
-            log.warning("fork_with_agent failed for %s: %s", self.agent_id, exc)
-            await self._event_sink(
-                BrokerError(
-                    agent_id=self.agent_id,
-                    message=f"Failed to switch agent to {agent_name}: {exc}",
-                    severity="error",
-                )
-            )
-            return None
-        finally:
-            if self.state == AgentState.CONFIGURING:
-                await self._sm.transition(AgentState.IDLE)
-
     @property
     def available_modes(self) -> list[AgentMode]:
         """Return a copy of available modes, or [] if none received."""
@@ -1308,31 +1238,25 @@ class ACPSession:
         if self._conn and self._session_id and self.state == AgentState.BUSY:
             await self._conn.cancel(session_id=self._session_id)
 
-    async def steer(self, text: str) -> bool:
-        """Inject text into the agent's RUNNING turn via the harness steer method.
+    async def steer(self, text: str) -> SteerOutcome:
+        """Inject text into the agent's RUNNING turn via the extension's steer hook.
 
         Args:
             text: The message body to inject, sent to the harness unchanged.
 
         Returns:
-            True if the harness ACCEPTED the steer. Acceptance is NOT
-            confirmation of in-turn delivery: Kiro returns an opaque
-            ``{"queued": true}`` that does not say which delivery path ran.
-            False on any failure, including an unsupported protocol, a JSON-RPC
-            error, or a lost connection — the caller falls back to queueing.
+            The extension's outcome.  ``outcome.accepted`` means the harness owns
+            delivery; acceptance is NOT confirmation of in-turn delivery.  Status
+            ``"failed"`` when there is no connection or session, on an acceptance
+            timeout, a JSON-RPC error, or a lost connection, so the caller falls back
+            to queueing.  ``"unsupported"`` from an engine that cannot steer.
 
-        Kiro payload: ``{"sessionId": <sid>, "message": text}`` to method
-        ``"session/steer"``. NO leading underscore: the acp SDK's ``ext_method``
-        prepends one itself, so ``"_session/steer"`` reaches the wire as
-        ``__session/steer`` and returns -32601, which reads exactly like the
-        harness not supporting steering.
-
-        Never raises for an acceptance timeout or transport failure. The acp
-        SDK's ``RequestError`` is not a ``ConnectionError`` subclass, so it is
-        caught explicitly.
+        Never raises for an acceptance timeout or transport failure. The acp SDK's
+        ``RequestError`` is not a ``ConnectionError`` subclass, so it is caught
+        explicitly.
         """
-        if not self._conn or not self._session_id or self._steer_protocol != "kiro":
-            return False
+        if not self._conn or not self._session_id:
+            return SteerOutcome(status="failed")
 
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -1343,11 +1267,8 @@ class ACPSession:
             _STEER_ACCEPTANCE_TIMEOUT,
         )
         try:
-            result = await asyncio.wait_for(
-                self._conn.ext_method(
-                    "session/steer",
-                    {"sessionId": self._session_id, "message": text},
-                ),
+            outcome = await asyncio.wait_for(
+                self._ext.steer(self._conn, self._session_id, text),
                 timeout=_STEER_ACCEPTANCE_TIMEOUT,
             )
         except TimeoutError:
@@ -1366,8 +1287,8 @@ class ACPSession:
                         agent_id=self.agent_id,
                         message=(
                             "Steering acceptance timed out. The message will use the "
-                            "existing queue fallback and may arrive twice if Kiro accepted "
-                            "it before the response timed out."
+                            "existing queue fallback and may arrive twice if the harness "
+                            "accepted it before the response timed out."
                         ),
                         severity="warning",
                     )
@@ -1380,7 +1301,7 @@ class ACPSession:
                     self._session_id,
                     type(exc).__name__,
                 )
-            return False
+            return SteerOutcome(status="failed")
         except (RequestError, ConnectionError, OSError) as exc:
             elapsed_ms = (loop.time() - started) * 1000
             log.debug(
@@ -1391,18 +1312,18 @@ class ACPSession:
                 elapsed_ms,
                 type(exc).__name__,
             )
-            return False
+            return SteerOutcome(status="failed")
 
         elapsed_ms = (loop.time() - started) * 1000
         log.debug(
-            "Steer acceptance outcome=accepted agent=%s session=%s elapsed_ms=%.3f "
-            "queued=%r",
+            "Steer acceptance outcome=%s agent=%s session=%s elapsed_ms=%.3f status=%s",
+            "accepted" if outcome.accepted else "not_accepted",
             self.agent_id,
             self._session_id,
             elapsed_ms,
-            result.get("queued"),
+            outcome.status,
         )
-        return True
+        return outcome
 
     async def terminate(self) -> None:
         """Terminate the agent and all its children via process group kill.
@@ -1441,7 +1362,12 @@ class ACPSession:
 
         Dispatches directly to a ``BrokerEvent`` with no ``SessionAccumulator``
         involved.  Guards in order: shutting-down → session_id mismatch →
-        ``UsageUpdate`` special case → ``_suppress_history_replay``.
+        ``UsageUpdate`` special case → replay (``_suppress_history_replay`` OR the
+        extension's ``UpdateHints.is_replay``).
+
+        The extension's ``interpret_update`` runs synchronously right after the
+        session_id guard.  Its signals are emitted from the emission task (or, for a
+        ``UsageUpdate``, after the usage event), never awaited ahead of task creation.
 
         A non-matching ``session_id`` is dropped silently.  ``UsageUpdate``
         emits ``UsageUpdated`` unless ``_suppress_history_replay`` is set, then
@@ -1473,10 +1399,12 @@ class ACPSession:
 
         log.debug("session_update type=%s agent=%s", type(update).__name__, self.agent_id)
 
+        hints = self._interpret_update(update)
+
         # UsageUpdate is emitted inline — it carries no streaming content, so
         # the await below cannot reorder chunks relative to each other.
         if isinstance(update, UsageUpdate):
-            if self._suppress_history_replay:
+            if self._suppress_history_replay or hints.is_replay:
                 return
             cost = update.cost
             await self._event_sink(
@@ -1488,6 +1416,8 @@ class ACPSession:
                     cost_currency=cost.currency if cost else None,
                 )
             )
+            for sig in hints.signals:
+                await self._emit_signal(sig)
             return
 
         # Relocated from the deleted _on_snapshot.  LOAD-BEARING: load_session
@@ -1495,9 +1425,12 @@ class ACPSession:
         # without this guard run_restored and _restore_mcp_servers would emit
         # every historical notification into the live UI and the broker sink
         # would journal it, duplicating the entire journal on every restore
-        # and every mode switch.  Synchronous by necessity — see below.
-        if self._suppress_history_replay:
+        # and every mode switch.  Synchronous by necessity — see below.  An
+        # extension may also mark an update as replayed (UpdateHints.is_replay).
+        if self._suppress_history_replay or hints.is_replay:
             return
+
+        self._record_tool_kind(update)
 
         # No await may execute between the end of the UsageUpdate branch and
         # task creation below.  The SDK dispatches one task per notification
@@ -1505,7 +1438,7 @@ class ACPSession:
         # arrival order is preserved only while emission tasks are created
         # synchronously in arrival order.
         try:
-            task = asyncio.create_task(self._emit_from_notification(update))
+            task = asyncio.create_task(self._emit_from_notification(update, hints))
             self._pending_emissions.add(task)
             task.add_done_callback(self._pending_emissions.discard)
             task.add_done_callback(self._log_task_exception)
@@ -1520,42 +1453,21 @@ class ACPSession:
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         """Adapt harness-proprietary notifications onto typed broker events.
 
-        Kiro reports context-window fullness here instead of through the standard
-        ACP ``usage_update``, which it never sends.  The wire method is
-        ``_kiro.dev/metadata``; the acp SDK strips the leading underscore before
-        dispatching, so the name matched below carries none
-        (``acp/client/router.py``).  Payload shape, measured on kiro-cli 2.18.1::
+        The extension's ``on_ext_notification`` translates the notification into
+        signals, which map onto existing events (see ``_emit_signal``).  ``method``
+        arrives with the SDK-stripped leading underscore (``acp/client/router.py``).
+        A method the extension does not recognize yields no signal, which is also the
+        SDK's behavior when a client omits this handler entirely.
 
-            mid-turn:  {sessionId, contextUsagePercentage}
-            turn-end:  {sessionId, contextUsagePercentage,
-                        meteringUsage: [{value, unit, unitPlural}], turnDurationMs}
-
-        ``contextUsagePercentage`` IS A PERCENTAGE AND KIRO REPORTS NO TOKEN
-        COUNTS, so this maps it onto ``UsageUpdated`` as ``size=100`` with ``used``
-        the rounded percent.  Every consumer of those two fields treats them as a
-        ratio -- the TUI's only use is ``used / size`` rendered as a percent
-        (``UsageBarVisual._build_label``), and the handoff nudge compares the same
-        ratio to a threshold -- so the ratio is exact and the resolution is one
-        percent, which is all Kiro reports.  A consumer that read ``size`` as a
-        token budget would be wrong for Kiro agents; none does today.  Claude's
-        real ``usage_update`` still arrives through ``session_update`` carrying
-        genuine token counts.
-
-        An unrecognized method is ignored, which is also the SDK's behavior when a
-        client omits this handler entirely (``acp/client/router.py``).
-
-        Guards, in the same order and for the same reasons as ``session_update``:
-        shutting-down, then method, then ``sessionId`` mismatch -- which includes
-        having no session yet -- then ``_suppress_history_replay``, then the
-        reading itself.  The ``sessionId``
-        guard is not decorative: without it a delayed notification from a session
-        this agent has already left is attributed to the current one, storing a
-        usage figure for the wrong conversation and possibly consuming the
+        Guards, in the same order and for the same reasons as ``session_update``, run
+        BEFORE the extension sees anything: shutting-down, then ``sessionId`` mismatch
+        -- which includes having no session yet -- then ``_suppress_history_replay``.
+        The ``sessionId`` guard is not decorative: without it a delayed notification
+        from a session this agent has already left is attributed to the current one,
+        storing a usage figure for the wrong conversation and possibly consuming the
         agent's single handoff nudge.
         """
         if self._shutting_down:
-            return
-        if method != _KIRO_METADATA_NOTIFICATION:
             return
         # `is None` first: without it a payload that omits sessionId compares
         # equal while _session_id is still unset, and usage is emitted for an
@@ -1567,37 +1479,71 @@ class ACPSession:
         # replays history, and a replayed usage figure is not the current one.
         if self._suppress_history_replay:
             return
-        raw_pct = params.get("contextUsagePercentage")
-        if isinstance(raw_pct, bool) or not isinstance(raw_pct, int | float):
-            return
-        # NaN and the infinities survive json.loads, which the SDK uses verbatim,
-        # and the clamp below does not stop them: every comparison against NaN is
-        # False, so min(100.0, nan) returns 100.0 and a NaN reading became a false
-        # full-context event. A non-finite reading is no reading at all.
-        if not math.isfinite(raw_pct):
-            return
-        pct = max(0.0, min(float(_PERCENT_SCALE), float(raw_pct)))
+        for sig in self._ext.on_ext_notification(method, params):
+            await self._emit_signal(sig)
 
-        cost_amount: float | None = None
-        cost_currency: str | None = None
-        metering = params.get("meteringUsage")
-        if isinstance(metering, list) and metering and isinstance(metering[0], dict):
-            first = metering[0]
-            value = first.get("value")
-            if not isinstance(value, bool) and isinstance(value, int | float):
-                cost_amount = float(value)
-                unit = first.get("unitPlural") or first.get("unit")
-                cost_currency = unit if isinstance(unit, str) else None
+    async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """ACP Client callback for agent-to-client extension requests.
 
-        await self._event_sink(
-            UsageUpdated(
-                agent_id=self.agent_id,
-                size=_PERCENT_SCALE,
-                used=round(pct),
-                cost_amount=cost_amount,
-                cost_currency=cost_currency,
+        Delegates to the extension's ``on_ext_request``.
+
+        Raises:
+            RequestError: ``method_not_found(method)`` when the extension returns None.
+        """
+        result = await self._ext.on_ext_request(method, params)
+        if result is None:
+            raise RequestError.method_not_found(method)
+        return result
+
+    def _interpret_update(self, update: Any) -> UpdateHints:
+        """Run the extension's synchronous ``interpret_update``, never raising.
+
+        ``session_update`` must not raise into the SDK and must reach task creation
+        without awaiting, so a failing extension degrades to no hints.
+        """
+        try:
+            return self._ext.interpret_update(update)
+        except Exception:
+            log.warning(
+                "interpret_update failed for %s on %s",
+                self.agent_id,
+                type(update).__name__,
+                exc_info=True,
             )
-        )
+            return UpdateHints()
+
+    async def _emit_signal(self, sig: Signal) -> None:
+        """Map one extension signal onto its existing BrokerEvent."""
+        if isinstance(sig, ContextUsage):
+            await self._event_sink(
+                UsageUpdated(
+                    agent_id=self.agent_id,
+                    size=sig.size,
+                    used=sig.used,
+                    cost_amount=sig.cost_amount,
+                    cost_currency=sig.cost_currency,
+                )
+            )
+        elif isinstance(sig, ProfileUnavailable):
+            fallback = sig.fallback or "the harness default"
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=(
+                        f"Agent profile '{sig.requested}' is unavailable "
+                        f"({sig.reason}); using {fallback}."
+                    ),
+                    severity="warning",
+                )
+            )
+
+    async def _check_profile(self, agent_mode: str | None) -> None:
+        """Warn once, without stopping the launch, when the extension rejects agent_mode."""
+        if not agent_mode:
+            return
+        unavailable = self._ext.check_profile(agent_mode, Path(self._cwd))
+        if unavailable is not None:
+            await self._emit_signal(unavailable)
 
     async def _drain_pending_emissions(self) -> None:
         """Await emission tasks registered during a finite number of passes.
@@ -1657,13 +1603,22 @@ class ACPSession:
         if not task.cancelled() and task.exception():
             log.error("_emit_from_notification failed", exc_info=task.exception())
 
-    async def _emit_from_notification(self, update: Any) -> None:
+    async def _emit_from_notification(
+        self, update: Any, hints: UpdateHints | None = None
+    ) -> None:
         """Map a raw session update to the corresponding BrokerEvent and emit it.
 
         Args:
             update: The raw session update to dispatch.  ``SessionNotification``
                 is not constructed on this path.
+            hints: What the extension read from the update; its signals are
+                emitted first, then the update's own event.  None means read them
+                here, for a caller that did not go through ``session_update``.
         """
+        if hints is None:
+            hints = self._interpret_update(update)
+        for sig in hints.signals:
+            await self._emit_signal(sig)
         if isinstance(update, AgentMessageChunk):
             content = update.content
             if content:
@@ -1696,11 +1651,6 @@ class ACPSession:
                 [item.type for item in (update.content or [])],
                 update.field_meta,
             )
-            parent_tool_call_id: str | None = None
-            if update.field_meta:
-                claude_meta = update.field_meta.get("claudeCode", {})
-                if isinstance(claude_meta, dict):
-                    parent_tool_call_id = claude_meta.get("parentToolUseId")
             default_status = "pending" if isinstance(update, ToolCallStart) else "in_progress"
             diffs: list[ToolCallDiff] = []
             text_parts: list[str] = []
@@ -1739,7 +1689,7 @@ class ACPSession:
                     raw_input=update.raw_input,
                     raw_output=update.raw_output,
                     terminal_id=terminal_id,
-                    parent_tool_call_id=parent_tool_call_id,
+                    parent_tool_call_id=hints.parent_tool_call_id,
                 )
             )
         elif isinstance(update, CurrentModeUpdate):
@@ -1749,7 +1699,16 @@ class ACPSession:
                 await self._event_sink(AgentModeChanged(agent_id=self.agent_id, mode_id=mode_id))
         elif isinstance(update, ConfigOptionUpdate):
             old_values = {opt.id: opt.current_value for opt in self._config_options}
+            old_shape = {opt.id: _allowed_values(opt) for opt in self._config_options}
             self._config_options = list(update.config_options)
+            # Options can appear and disappear with the model (Kiro v3 effortLevel and
+            # thinking; Claude effort), which a per-value change cannot express.
+            if old_shape != {opt.id: _allowed_values(opt) for opt in self._config_options}:
+                await self._event_sink(
+                    ConfigOptionsReceived(
+                        agent_id=self.agent_id, config_options=self._config_options
+                    )
+                )
             for opt in self._config_options:
                 old_val = old_values.get(opt.id)
                 if old_val != opt.current_value:
@@ -1784,6 +1743,20 @@ class ACPSession:
         if future and not future.done():
             future.set_result(option_id)
 
+    def _record_tool_kind(self, update: Any) -> None:
+        """Remember a tool call's kind by toolCallId until the call completes or fails.
+
+        Runs synchronously in ``session_update``, not in the emission task: the SDK
+        dispatches ``request_permission`` as its own task, which can run before the
+        tool_call's emission task, so recording there would lose the race.
+        """
+        if not isinstance(update, (ToolCallStart, ToolCallProgress)) or not update.tool_call_id:
+            return
+        if update.status in ("completed", "failed"):
+            self._tool_kinds.pop(update.tool_call_id, None)
+        elif update.kind:
+            self._tool_kinds[update.tool_call_id] = update.kind
+
     async def request_permission(
         self,
         options: list[PermissionOption],
@@ -1801,6 +1774,9 @@ class ACPSession:
         if session_id != self._session_id:
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         request_id = tool_call.tool_call_id or ""
+        # Some harnesses (Kiro v3) omit toolCall.kind here; the earlier tool_call has it.
+        kind = tool_call.kind or self._tool_kinds.get(request_id) or "other"
+        hints = self._ext.permission_hints(tool_call, dict(kwargs))
         await self._sm.transition(AgentState.AWAITING_PERMISSION)
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._permission_futures[request_id] = future
@@ -1809,8 +1785,9 @@ class ACPSession:
                 agent_id=self.agent_id,
                 request_id=request_id,
                 title=tool_call.title or "",
-                kind=tool_call.kind or "other",
+                kind=kind,
                 options=list(options),
+                tool_identity=hints.tool_identity,
             )
         )
         try:

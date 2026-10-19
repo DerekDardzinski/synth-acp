@@ -172,6 +172,24 @@ DiffScrollContainer { overflow-x: hidden; height: auto; }
 LineAnnotations { width: auto; height: auto; }
 DiffCode { width: 1fr; height: auto; }
 
+/* ── Choice bar ── */
+/* Before PermissionBar: the ChoiceBar type selector also matches that subclass, so the
+   PermissionBar rule below must come later to keep its warning border. */
+ChoiceBar {
+    height: auto;
+    background: transparent;
+    border-top: tall $primary;
+    padding: 0 1;
+    margin: 0 3;
+}
+ChoiceBar:blur {
+    #index { opacity: 0.3; }
+    #caret { opacity: 0.3; }
+}
+#choice-title { margin-bottom: 1; color: $text-primary; }
+#choice-option-container { height: auto; }
+#choice-option-container.-blink _OptionRow.-active #caret { opacity: 0.2; }
+
 /* ── Permission modal ── */
 /* ── Permission bar ── */
 PermissionBar {

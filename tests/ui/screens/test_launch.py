@@ -6,8 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from textual.widgets import Input, OptionList, Select
 
-from synth_acp.discovery import DiscoveredAgent
-from synth_acp.models.agent import AgentConfig
+from synth_acp.models.agent import AgentConfig, DiscoveredAgent
 from synth_acp.models.config import HarnessEntry
 from synth_acp.ui.screens.launch import LaunchAgentScreen, _detect_harnesses
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -18,6 +19,14 @@ from synth_acp.db import configure_connection, ensure_schema_sync
 from synth_acp.models.visibility import get_resurrectable_agents, get_visible_agents
 
 type NotifyFn = Callable[[], Awaitable[None]]
+
+_HANDOFF_POLL_INTERVAL: float = 0.3
+_HANDOFF_POLL_TIMEOUT: float = 30.0
+"""How long the handoff tool waits for the broker to settle its command.
+
+Longer than launch_agent's 3 s: a handoff runs behind the serialized command tail and
+takes the agent lock. A successful handoff kills this process during the wait.
+"""
 
 
 async def _noop_notify() -> None:
@@ -305,7 +314,7 @@ def create_mcp_server(
         return json.dumps({"ok": True, "agent_id": target_agent_id})
 
     @mcp.tool()
-    async def handoff(handoff_message: str) -> str:
+    async def handoff(handoff_message: str, agent_mode: str | None = None) -> str:
         """Hand your work to a fresh instance of YOURSELF, keeping your agent id.
 
         Call this when your context window is filling up. Synth stops you, starts a brand
@@ -332,18 +341,28 @@ def create_mcp_server(
 
         Args:
             handoff_message: The complete briefing for your successor.
+            agent_mode: Start your successor as this agent profile instead of your
+                current one. Omit it to keep your current profile; pass "" to start
+                the successor as the harness's default agent. When the user asked you
+                to switch to a profile, pass exactly the value they asked for.
 
         Returns:
-            {"accepted": true, "command_id": int} as soon as the request is durably
-            recorded. This reports ACCEPTANCE, not completion: carrying out the handoff
-            kills the process group this tool call is running in, so no completion
-            response could reach you. Do not wait for one, and do not call this twice.
+            Normally nothing: carrying out the handoff kills the process group this tool
+            call is running in. {"error": str} when synth rejects the handoff, for
+            example an unknown agent_mode or one other than the profile the user asked
+            for; nothing has retired in that case. {"accepted": true, "command_id": int}
+            if synth has not settled the request within 30 seconds; do not call this
+            twice.
         """
         def _sync(conn: sqlite3.Connection) -> int:
             _ensure_registered(conn)
             now = int(time.time() * 1000)
             payload = json.dumps(
-                {"agent_id": _caller_id, "handoff_message": handoff_message}
+                {
+                    "agent_id": _caller_id,
+                    "handoff_message": handoff_message,
+                    "agent_mode": agent_mode,
+                }
             )
             cursor = conn.execute(
                 "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, created_at) VALUES (?, ?, 'handoff', ?, 'pending', ?)",
@@ -355,6 +374,21 @@ def create_mcp_server(
 
         cmd_id = await _db_op(_sync)
         await notify()
+
+        def _poll(conn: sqlite3.Connection) -> tuple | None:
+            return conn.execute(
+                "SELECT status, error FROM agent_commands WHERE id = ?", (cmd_id,)
+            ).fetchone()
+
+        # 'processing' is not an outcome: the broker has claimed the row but the handoff
+        # may still be rejected, so only a settled status ends the wait.
+        for _ in range(math.ceil(_HANDOFF_POLL_TIMEOUT / _HANDOFF_POLL_INTERVAL)):
+            await asyncio.sleep(_HANDOFF_POLL_INTERVAL)
+            row = await _db_op(_poll)
+            if row and row[0] == "rejected":
+                return json.dumps({"error": row[1] or "Handoff rejected"})
+            if row and row[0] not in ("pending", "processing"):
+                break
         return json.dumps({"accepted": True, "command_id": cmd_id})
 
     @mcp.tool()

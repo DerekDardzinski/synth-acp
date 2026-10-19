@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from synth_acp.harnesses import load_harness_registry
+import pytest
+
+from synth_acp.acp.extensions import get_extension
+from synth_acp.harnesses import UnknownHarnessVariantError, load_harness_registry
 
 
 class TestLoadHarnessRegistry:
@@ -15,14 +18,17 @@ class TestLoadHarnessRegistry:
             assert entry.binary_names
             assert entry.run_cmd
 
-    def test_steer_protocol_declared_only_for_kiro(self) -> None:
+    def test_steering_declared_only_for_kiro(self) -> None:
         """Steering is opt-in per harness; a stray declaration would steer a harness
         whose payload shape differs and silently fail with -32602."""
-        by_short_name = {e.short_name: e.steer_protocol for e in load_harness_registry()}
-        assert by_short_name["kiro"] == "kiro"
-        assert by_short_name["claude"] is None
-        assert by_short_name["opencode"] is None
-        assert by_short_name["gemini"] is None
+        by_short_name = {
+            e.short_name: get_extension(e.extension).capabilities.steer
+            for e in load_harness_registry()
+        }
+        assert by_short_name["kiro"] is True
+        assert by_short_name["claude"] is False
+        assert by_short_name["opencode"] is False
+        assert by_short_name["gemini"] is False
 
     def test_spawn_commands_are_unchanged_and_only_claude_needs_an_install_hint(self) -> None:
         """Two claims the npx removal rests on, pinned structurally.
@@ -54,3 +60,60 @@ class TestLoadHarnessRegistry:
         which synth can only render as a permanent INITIALIZING."""
         for entry in load_harness_registry():
             assert entry.run_cmd.split()[0] not in {"npx", "npm", "pnpm", "yarn", "bunx", "uvx"}
+
+    def test_default_variants_resolve(self) -> None:
+        """With no harness_variant, kiro must keep its v2 command line and extension:
+        losing mode_arg launches Kiro without --agent, losing the extension loses
+        steering and context usage."""
+        by_short_name = {e.short_name: e for e in load_harness_registry()}
+        kiro = by_short_name["kiro"]
+        assert (kiro.run_cmd, kiro.mode_arg, kiro.extension, kiro.variant) == (
+            "kiro-cli acp",
+            "--agent",
+            "kiro_v2",
+            "v2",
+        )
+        assert (by_short_name["claude"].extension, by_short_name["claude"].variant) == (
+            "claude",
+            None,
+        )
+        assert by_short_name["opencode"].extension == "standard"
+        assert by_short_name["gemini"].extension == "standard"
+
+    def test_v3_variant_resolves(self) -> None:
+        """v3 exits 2 on --agent, so a mode_arg leaking in from v2 would stop every launch."""
+        kiro = next(e for e in load_harness_registry({"kiro": "v3"}) if e.short_name == "kiro")
+        assert (kiro.run_cmd, kiro.mode_arg, kiro.extension, kiro.variant) == (
+            "kiro-cli acp --agent-engine=v3 --auth-method=cli",
+            None,
+            "kiro_v3",
+            "v3",
+        )
+
+    def test_unknown_variant_raises_naming_harness_requested_and_valid(self) -> None:
+        """A typo must fail, not silently fall back to the default engine."""
+        with pytest.raises(UnknownHarnessVariantError) as exc_info:
+            load_harness_registry({"kiro": "nope"})
+        message = str(exc_info.value)
+        assert "'kiro'" in message
+        assert "'nope'" in message
+        assert "v2" in message
+
+    @pytest.mark.parametrize(
+        ("variants", "harness", "requested"),
+        [({"claude": "v9"}, "claude", "v9"), ({"kiro": ""}, "kiro", "")],
+    )
+    def test_variant_the_harness_cannot_honor_raises(
+        self, variants: dict[str, str], harness: str, requested: str
+    ) -> None:
+        """A variant for a harness without variants, or an empty name, must not be ignored."""
+        with pytest.raises(UnknownHarnessVariantError) as exc_info:
+            load_harness_registry(variants)
+        message = str(exc_info.value)
+        assert f"'{harness}'" in message
+        assert f"'{requested}'" in message
+
+    def test_every_bundled_extension_is_registered(self) -> None:
+        """A TOML extension typo would otherwise surface only when an agent launches."""
+        for entry in load_harness_registry():
+            assert get_extension(entry.extension).name == entry.extension

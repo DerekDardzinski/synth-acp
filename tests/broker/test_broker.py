@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import json
 import sqlite3
 import textwrap
 import time
@@ -24,6 +25,7 @@ from acp.schema import (
     McpServerStdio,
     PermissionOption,
     PlanEntry,
+    SessionInfoUpdate,
     SessionNotification,
     TextContentBlock,
     ToolCallProgress,
@@ -31,13 +33,18 @@ from acp.schema import (
     UsageUpdate,
 )
 
+from synth_acp.acp.extensions import AcpExtension, get_extension
 from synth_acp.acp.session import DRAIN_PASSES, ACPSession, _StderrTail
 from synth_acp.broker.broker import ACPBroker
 from synth_acp.broker.prompt_queue import QueuedItem
 from synth_acp.db import ensure_schema_sync
 from synth_acp.models.agent import AgentConfig, AgentState
 from synth_acp.models.commands import (
+    CommitQueueEdit,
+    DeleteQueueItem,
+    DrainQueue,
     LaunchAgent,
+    RequestProfileSwitch,
     RespondPermission,
     SendPrompt,
     SetAgentMode,
@@ -53,6 +60,7 @@ from synth_acp.models.events import (
     MessageSteered,
     PermissionRequested,
     PlanReceived,
+    ProfileSwitchChanged,
     ToolCallDiff,
     ToolCallLocation,
     ToolCallUpdated,
@@ -60,9 +68,12 @@ from synth_acp.models.events import (
     UsageUpdated,
     UserPromptSubmitted,
 )
+from synth_acp.models.extensions import ProfileUnavailable, SteerOutcome
 from synth_acp.models.permissions import PermissionDecision
 
 pytestmark = pytest.mark.usefixtures("available_harness_binaries")
+
+_QUEUED = SteerOutcome(status="queued")
 
 
 def _make_config() -> SessionConfig:
@@ -787,8 +798,8 @@ class TestInTurnSteering:
         self,
         broker: ACPBroker,
         *,
-        steer_protocol: str | None = "kiro",
-        steer_result: bool = True,
+        extension: str = "kiro_v2",
+        steer_result: SteerOutcome = _QUEUED,
         state: AgentState = AgentState.BUSY,
     ) -> TestInTurnSteering._Fake:
         session = ACPSession(
@@ -797,7 +808,7 @@ class TestInTurnSteering:
             args=[],
             cwd=".",
             event_sink=broker._sink,
-            steer_protocol=steer_protocol,
+            extension=get_extension(extension),
         )
         session._sm._state = state
         prompt_mock = AsyncMock()
@@ -839,7 +850,7 @@ class TestInTurnSteering:
         await broker._start_message_bus()
         lifecycle = await broker._ensure_lifecycle()
         lifecycle._first_prompted.add("agent-1")
-        fake = self._busy_session(broker, steer_result=False)
+        fake = self._busy_session(broker, steer_result=SteerOutcome(status="failed"))
         bus = broker._message_bus
         assert bus is not None
 
@@ -865,6 +876,21 @@ class TestInTurnSteering:
         finally:
             await bus.stop()
 
+    async def test_dropped_steer_outcome_requeues(self, tmp_path: Path) -> None:
+        """A harness that answers but drops the steer (not accepted) must leave the
+        message queued; treating any answer as delivery would lose it."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        lifecycle = await broker._ensure_lifecycle()
+        lifecycle._first_prompted.add("agent-1")
+        self._busy_session(broker, steer_result=SteerOutcome(status="dropped", message_id="s-1"))
+
+        await broker._on_mcp_message("agent-1", "hello", "agent-a", "chat")
+
+        assert [i.text for i in broker._prompt_queue.items("agent-1")] == [
+            "[Message from agent-a]: hello"
+        ]
+        assert self._steered(broker) == []
+
     async def test_stalled_steer_releases_message_bus_and_agent_lock(
         self, tmp_path: Path
     ) -> None:
@@ -885,7 +911,7 @@ class TestInTurnSteering:
             args=[],
             cwd=".",
             event_sink=broker._sink,
-            steer_protocol="kiro",
+            extension=get_extension("kiro_v2"),
         )
         session._sm._state = AgentState.BUSY
         session._session_id = "sess-1"
@@ -1021,7 +1047,7 @@ class TestInTurnSteering:
         broker = _make_broker("agent-1", tmp_path=tmp_path)
         lifecycle = await broker._ensure_lifecycle()
         lifecycle._first_prompted.add("agent-1")
-        self._busy_session(broker, steer_result=False)
+        self._busy_session(broker, steer_result=SteerOutcome(status="failed"))
         broker._prompt_queue.enqueue(
             "agent-1", QueuedItem(text="older", source="mcp", steerable=True)
         )
@@ -1085,7 +1111,7 @@ class TestInTurnSteering:
         """Claude's steering takes a different payload shape and would fail with
         -32602; opencode and gemini have none at all."""
         broker = _make_broker("agent-1", tmp_path=tmp_path)
-        self._busy_session(broker, steer_protocol=None)
+        self._busy_session(broker, extension="claude")
         assert broker._steer_eligible("agent-1", "chat") is False
 
 
@@ -1204,6 +1230,82 @@ class TestPermissionFlushActiveSlotRace:
         assert broker._permission_queue.get("a1") == [concurrent]
 
 
+class TestToolIdentityPermissions:
+    """Auto-approve and "always" rules keyed on tool identity, kind as fallback."""
+
+    @staticmethod
+    def _request(
+        rid: str, *, kind: str, identity: str | None, title: str = "t"
+    ) -> PermissionRequested:
+        return PermissionRequested(
+            agent_id="a1",
+            request_id=rid,
+            title=title,
+            kind=kind,
+            tool_identity=identity,
+            options=[
+                PermissionOption(kind="allow_once", option_id=f"{rid}-once", name="Allow"),
+                PermissionOption(kind="allow_always", option_id=f"{rid}-always", name="Always"),
+            ],
+        )
+
+    def test_auto_approve_matches_identity_before_title(self, tmp_path: Path) -> None:
+        """Silent failure: a shell command whose text contains "synth-mcp" is
+        auto-approved by the title substring match."""
+        broker = _make_broker("a1", tmp_path=tmp_path)
+        object.__setattr__(broker._config.settings, "auto_approve_tools", ("synth-mcp",))
+
+        def approved(identity: str | None, title: str) -> bool:
+            req = self._request("r", kind="other", identity=identity, title=title)
+            return broker._should_auto_approve(req)
+
+        assert approved("synth-mcp/send_message", "whatever") is True
+        assert approved(None, "@synth-mcp/send_message") is True
+        assert approved("shell-thing/run", "echo synth-mcp") is False
+        assert approved(None, "echo synth-mcp") is True
+
+    def test_full_identity_pattern_approves_only_that_tool(self, tmp_path: Path) -> None:
+        """Silent failure: a per-tool pattern approves every tool on the server."""
+        broker = _make_broker("a1", tmp_path=tmp_path)
+        object.__setattr__(
+            broker._config.settings, "auto_approve_tools", ("synth-mcp/send_message",)
+        )
+        send = self._request("r1", kind="other", identity="synth-mcp/send_message")
+        listing = self._request("r2", kind="other", identity="synth-mcp/list_agents")
+        assert broker._should_auto_approve(send) is True
+        assert broker._should_auto_approve(listing) is False
+
+    async def test_always_rule_keyed_on_identity_then_kind(self, tmp_path: Path) -> None:
+        """Silent failure: one "Always allow" on an MCP tool (kind "other")
+        auto-approves every other kind-"other" tool."""
+        broker = _make_broker("a1", tmp_path=tmp_path)
+        resolved: dict[str, str] = {}
+        session = MagicMock()
+        session.resolve_permission = resolved.__setitem__
+        broker._registry._sessions["a1"] = session
+
+        async def sink_then_answer(req: PermissionRequested, option_id: str) -> None:
+            await broker._sink(req)
+            await broker._resolve_permission("a1", req.request_id, option_id)
+
+        await sink_then_answer(
+            self._request("gh-1", kind="other", identity="github/create_issue"),
+            "gh-1-always",
+        )
+        await sink_then_answer(self._request("ex-1", kind="execute", identity=None), "ex-1-always")
+        await broker._sink(self._request("gh-2", kind="other", identity="github/create_issue"))
+        await broker._sink(self._request("slack-1", kind="other", identity="slack/post"))
+        await broker._sink(self._request("ex-2", kind="execute", identity=None))
+
+        assert resolved == {
+            "gh-1": "gh-1-always",
+            "ex-1": "ex-1-always",
+            "gh-2": "gh-2-always",
+            "ex-2": "ex-2-always",
+        }
+        assert "slack-1" in broker._pending_permissions
+
+
 class TestListRestorableSessions:
     async def test_list_restorable_sessions_returns_enriched_fields(self, tmp_path: Path) -> None:
         """list_restorable_sessions must return cwd, tasks, first_messages."""
@@ -1314,62 +1416,33 @@ class TestListRestorableSessions:
 
 
 class TestBrokerAgentRouting:
-    """Tests for SetConfigOption(config_id='agent') routing to set_agent."""
+    async def test_agent_config_on_a_handoff_harness_is_not_routed_to_a_fork(
+        self, tmp_path: Path
+    ) -> None:
+        """config_id='agent' goes to set_config_option like every other id.
 
-    async def test_broker_routes_agent_config_to_set_agent_for_meta_agent(self, tmp_path: Path) -> None:
-        """config_id='agent' with meta_agent target must route to lifecycle.set_agent.
-        Silent failure: goes through set_config_option which doesn't know how to fork."""
+        Silent failure: a leftover route would still fork a picker selection, which on
+        Claude keeps the old agent (the CLI fixes it at session creation).
+        """
         from synth_acp.models.commands import SetConfigOption
 
         broker = _make_broker("agent-1", tmp_path=tmp_path)
         lifecycle = await broker._ensure_lifecycle()
-
-        # Register a session with agent_mode_target="meta_agent"
         session = ACPSession(
             agent_id="agent-1",
             binary="echo",
             args=[],
             cwd=".",
             event_sink=broker._sink,
-            agent_mode_target="meta_agent",
+            extension=get_extension("claude"),
         )
         session._sm._state = AgentState.IDLE
         broker._registry._sessions["agent-1"] = session
-
-        lifecycle.set_agent = AsyncMock()  # type: ignore[method-assign]
         lifecycle.set_config_option = AsyncMock()  # type: ignore[method-assign]
 
         await broker.handle(SetConfigOption(agent_id="agent-1", config_id="agent", value="code-planner"))
 
-        lifecycle.set_agent.assert_awaited_once_with("agent-1", "code-planner")
-        lifecycle.set_config_option.assert_not_awaited()
-
-    async def test_broker_routes_non_agent_config_to_set_config_option(self, tmp_path: Path) -> None:
-        """config_id='mode' must still route to set_config_option unchanged.
-        Silent failure: all config options accidentally routed to set_agent."""
-        from synth_acp.models.commands import SetConfigOption
-
-        broker = _make_broker("agent-1", tmp_path=tmp_path)
-        lifecycle = await broker._ensure_lifecycle()
-
-        session = ACPSession(
-            agent_id="agent-1",
-            binary="echo",
-            args=[],
-            cwd=".",
-            event_sink=broker._sink,
-            agent_mode_target="meta_agent",
-        )
-        session._sm._state = AgentState.IDLE
-        broker._registry._sessions["agent-1"] = session
-
-        lifecycle.set_agent = AsyncMock()  # type: ignore[method-assign]
-        lifecycle.set_config_option = AsyncMock()  # type: ignore[method-assign]
-
-        await broker.handle(SetConfigOption(agent_id="agent-1", config_id="mode", value="trust"))
-
-        lifecycle.set_config_option.assert_awaited_once_with("agent-1", "mode", "trust")
-        lifecycle.set_agent.assert_not_awaited()
+        lifecycle.set_config_option.assert_awaited_once_with("agent-1", "agent", "code-planner")
 
 
 class TestDiscoveryCache:
@@ -1378,7 +1451,7 @@ class TestDiscoveryCache:
         Silent failure: broker re-implements discovery or drops the agent_id."""
         from unittest.mock import MagicMock
 
-        from synth_acp.discovery import DiscoveredAgent
+        from synth_acp.models.agent import DiscoveredAgent
 
         broker = _make_broker("agent-1", tmp_path=tmp_path)
         lifecycle = await broker._ensure_lifecycle()
@@ -1953,9 +2026,18 @@ def _history_updates(n: int) -> list[Any]:
     return updates
 
 
-def _replay_session(broker: ACPBroker, session_id: str = "sess-saved") -> ACPSession:
+def _replay_session(
+    broker: ACPBroker,
+    session_id: str = "sess-saved",
+    extension: AcpExtension | None = None,
+) -> ACPSession:
     session = ACPSession(
-        agent_id="agent-1", binary="echo", args=[], cwd=".", event_sink=broker._sink
+        agent_id="agent-1",
+        binary="echo",
+        args=[],
+        cwd=".",
+        event_sink=broker._sink,
+        extension=extension,
     )
     session._session_id = session_id
     return session
@@ -2044,7 +2126,7 @@ class TestSuppressedHistoryReplay:
         broker = _loss_broker(tmp_path, maxsize=2000)
         lifecycle = await broker._ensure_lifecycle()
         await lifecycle._db_op(ensure_schema_sync)
-        session = _replay_session(broker)
+        session = _replay_session(broker, extension=get_extension("kiro_v2"))
         session._mcp_servers = [McpServerStdio(name="synth-mcp", command="echo", args=[], env=[])]
         await session._sm.transition(AgentState.INITIALIZING)
         await session._sm.transition(AgentState.IDLE)
@@ -2064,7 +2146,7 @@ class TestSuppressedHistoryReplay:
         session._conn = conn
         _drain_all(broker)
 
-        await session.set_mode("plan")
+        await session.set_config_option("mode", "plan")
 
         queued = _drain_all(broker)
         assert [e for e in queued if isinstance(e, REPLAY_EVENT_TYPES)] == []
@@ -2072,6 +2154,7 @@ class TestSuppressedHistoryReplay:
         assert [type(e).__name__ for e in queued] == [
             "AgentStateChanged",
             "AgentModeChanged",
+            "ConfigOptionChanged",
             "AgentStateChanged",
         ]
         assert [e.new_state for e in queued if isinstance(e, AgentStateChanged)] == [
@@ -2149,7 +2232,7 @@ class TestReplayGuardSettles:
         self, tmp_path: Path
     ) -> None:
         broker = _loss_broker(tmp_path, maxsize=2000)
-        session = _replay_session(broker)
+        session = _replay_session(broker, extension=get_extension("kiro_v2"))
         session._mcp_servers = [McpServerStdio(name="synth-mcp", command="echo", args=[], env=[])]
         await session._sm.transition(AgentState.INITIALIZING)
         await session._sm.transition(AgentState.IDLE)
@@ -2167,7 +2250,7 @@ class TestReplayGuardSettles:
         session._conn = conn
         _drain_all(broker)
 
-        await session.set_mode("plan")
+        await session.set_config_option("mode", "plan")
         await asyncio.gather(*runners)
 
         assert session._pending_emissions == set()
@@ -2512,7 +2595,7 @@ def _fake_session(broker: ACPBroker, agent_id: str, state: AgentState = AgentSta
     session._sm._state = state
     session.force_kill = MagicMock()  # type: ignore[method-assign]
     session.prompt = AsyncMock()  # type: ignore[method-assign]
-    session.steer = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    session.steer = AsyncMock(return_value=SteerOutcome(status="queued"))  # type: ignore[method-assign]
     return session
 
 
@@ -2816,7 +2899,7 @@ class TestHandoffFirstPromptOrdering:
         broker = _make_broker("worker", tmp_path=tmp_path)
         lifecycle, successors = await _handoff_harness(broker)
         broker._registry.get_session("worker")._sm._state = AgentState.BUSY
-        broker._registry.get_session("worker")._steer_protocol = "kiro"
+        broker._registry.get_session("worker")._ext = get_extension("kiro_v2")
         released = asyncio.Event()
         real_drain = broker.drain_agent_journal
 
@@ -3093,7 +3176,7 @@ class TestSerializedCommandTail:
         released = asyncio.Event()
         started = asyncio.Event()
 
-        async def _handoff_cmd(cmd_id: int, from_agent: str, data: dict) -> None:
+        async def _handoff_cmd(cmd_id: int, from_agent: str, data: dict, **_kw: object) -> None:
             order.append("handoff-start")
             started.set()
             await released.wait()
@@ -3132,7 +3215,7 @@ class TestSerializedCommandTail:
         released = asyncio.Event()
         started = asyncio.Event()
 
-        async def _handoff_cmd(cmd_id: int, from_agent: str, data: dict) -> None:
+        async def _handoff_cmd(cmd_id: int, from_agent: str, data: dict, **_kw: object) -> None:
             order.append("handoff-start")
             started.set()
             await released.wait()
@@ -3169,7 +3252,7 @@ class TestSerializedCommandTail:
         broker = _make_broker("worker", tmp_path=tmp_path)
         lifecycle = await broker._ensure_lifecycle()
 
-        async def _boom(cmd_id: int, from_agent: str, data: dict) -> None:
+        async def _boom(cmd_id: int, from_agent: str, data: dict, **_kw: object) -> None:
             raise RuntimeError("handler exploded")
 
         async def _ok(cmd_id: int, from_agent: str, data: dict) -> None:
@@ -3198,7 +3281,7 @@ class TestSerializedCommandTail:
         dispatching = asyncio.Event()
         finished: list[str] = []
 
-        async def _handoff_cmd(cmd_id: int, from_agent: str, data: dict) -> None:
+        async def _handoff_cmd(cmd_id: int, from_agent: str, data: dict, **_kw: object) -> None:
             dispatching.set()
             await released.wait()
             finished.append("handoff")
@@ -3412,7 +3495,7 @@ class TestHandoffNudge:
             args=[],
             cwd=".",
             event_sink=broker._sink,
-            steer_protocol="kiro",
+            extension=get_extension("kiro_v2"),
         )
         broker._registry.register("agent-1", session)
 
@@ -3434,6 +3517,7 @@ class TestHandoffNudge:
             args=[],
             cwd=".",
             event_sink=broker._sink,
+            extension=get_extension("kiro_v2"),
         )
         session._session_id = "sess-1"
 
@@ -3505,3 +3589,359 @@ class TestHandoffNudge:
         rows = _nudge_rows(tmp_path / "synth.db")
         assert len(rows) == 1
         assert "85% full" in rows[0][3]
+
+    async def test_kiro_v3_context_usage_update_nudges_once_and_replay_never(
+        self, tmp_path: Path
+    ) -> None:
+        """Kiro v3's only usage channel is a session_info_update, not kiro.dev/metadata.
+
+        Driven through a real ACPSession with the kiro_v3 extension: if the reading
+        never reaches UsageUpdated the usage bar and the nudge go dead with no error,
+        and a replayed reading would nudge on a stale figure.
+        """
+
+        def usage(*, replay: bool) -> SessionInfoUpdate:
+            kiro: dict[str, Any] = {"kind": "context_usage", "usagePercentage": 62.0}
+            if replay:
+                kiro["replay"] = True
+            return SessionInfoUpdate.model_validate(
+                {"sessionUpdate": "session_info_update", "_meta": {"kiro": kiro}}
+            )
+
+        for replay, expected in ((True, []), (False, [(100, 62)])):
+            db_dir = tmp_path / ("replay" if replay else "live")
+            db_dir.mkdir()
+            broker = self._broker(db_dir, handoff_nudge_threshold=0.5)
+            session = _replay_session(broker, extension=get_extension("kiro_v3"))
+
+            await session.session_update("sess-saved", usage(replay=replay))
+            await session._drain_pending_emissions()
+
+            readings = [(e.size, e.used) for e in _drain_all(broker) if isinstance(e, UsageUpdated)]
+            assert readings == expected
+            assert len(_nudge_rows(db_dir / "synth.db")) == len(expected)
+
+
+class _ProbeExtension(AcpExtension):
+    """check_profile knows exactly one profile, like a Claude install with one agent file."""
+
+    def check_profile(self, agent_mode: str, cwd: Path) -> ProfileUnavailable | None:
+        if agent_mode == "probe-heron":
+            return None
+        return ProfileUnavailable(
+            requested=agent_mode, fallback="default", reason=f"no agent named '{agent_mode}'"
+        )
+
+
+class TestProfileSwitch:
+    """RequestProfileSwitch through to the handoff, with the real lifecycle and database."""
+
+    @staticmethod
+    async def _setup(tmp_path: Path) -> tuple[ACPBroker, Any, list[ACPSession]]:
+        broker = _make_broker("worker", tmp_path=tmp_path)
+        lifecycle, successors = await _handoff_harness(broker)
+        predecessor = broker._registry.get_session("worker")
+        assert predecessor is not None
+        predecessor._ext = _ProbeExtension()
+        lifecycle._first_prompted.add("worker")  # no startup context on the request
+        return broker, predecessor, successors
+
+    @staticmethod
+    def _events(broker: ACPBroker) -> list[BrokerEvent]:
+        out: list[BrokerEvent] = []
+        while not broker._event_queue.empty():
+            out.append(broker._event_queue.get_nowait())
+        return out
+
+    @staticmethod
+    def _switch_changes(events: list[BrokerEvent]) -> list[tuple[str, str | None]]:
+        return [
+            (e.agent_id, e.pending_agent_mode) for e in events if isinstance(e, ProfileSwitchChanged)
+        ]
+
+    @staticmethod
+    def _prompts(session: ACPSession) -> list[str]:
+        return [c.args[0] for c in session.prompt.await_args_list]  # type: ignore[attr-defined]
+
+    @staticmethod
+    def _db(broker: ACPBroker, sql: str, args: tuple = ()) -> list[tuple]:
+        conn = sqlite3.connect(str(broker._db_path))
+        try:
+            rows = conn.execute(sql, args).fetchall()
+            conn.commit()
+            return rows
+        finally:
+            conn.close()
+
+    @staticmethod
+    async def _request(broker: ACPBroker, mode: str = "probe-heron", instr: str | None = "keep the tests") -> None:
+        await broker.handle(RequestProfileSwitch(agent_id="worker", agent_mode=mode, instructions=instr))
+        await asyncio.sleep(0)
+
+    @staticmethod
+    async def _turn_complete(broker: ACPBroker) -> None:
+        await broker._sink(TurnComplete(agent_id="worker", stop_reason="end_turn"))
+
+    async def _hand_off(self, broker: ACPBroker, payload: dict[str, str]) -> int:
+        cmd_id = self._db(
+            broker,
+            "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, "
+            "created_at) VALUES (?, 'worker', 'handoff', ?, 'processing', 100) RETURNING id",
+            (broker.session_id, json.dumps(payload)),
+        )[0][0]
+        await broker._dispatch_command(cmd_id, "worker", "handoff", json.dumps(payload))
+        return cmd_id
+
+    async def test_request_on_an_idle_agent_submits_one_tagged_prompt(self, tmp_path: Path) -> None:
+        """Silent failure: the request written as a messages row, which the bus marks
+        delivered when it is only queued, or not sent at all."""
+        broker, predecessor, _ = await self._setup(tmp_path)
+
+        await self._request(broker)
+
+        prompts = self._prompts(predecessor)
+        assert len(prompts) == 1
+        assert prompts[0].startswith("[Notification from synth]: The user asked to switch you")
+        assert 'agent_mode="probe-heron"' in prompts[0]
+        assert prompts[0].endswith("The user's instructions for this handoff:\nkeep the tests")
+        assert self._db(broker, "SELECT COUNT(*) FROM messages") == [(0,)]
+        assert self._switch_changes(self._events(broker)) == [("worker", "probe-heron")]
+        assert broker.pending_profile_switch("worker") == "probe-heron"
+
+    async def test_unknown_profile_or_second_request_warns_and_changes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """Silent failure: a second request overwrites the first target and instructions."""
+        broker, predecessor, _ = await self._setup(tmp_path)
+
+        await self._request(broker, mode="probe-nope")
+        events = self._events(broker)
+        assert [e.message for e in _warnings(events)] == [
+            "Cannot switch 'worker' to 'probe-nope': no agent named 'probe-nope'"
+        ]
+        assert self._switch_changes(events) == []
+        assert broker.pending_profile_switch("worker") is None
+
+        await self._request(broker)
+        self._events(broker)
+        await self._request(broker, instr="other")
+        events = self._events(broker)
+        assert len(_warnings(events)) == 1
+        assert self._switch_changes(events) == []
+        assert broker._pending_switches["worker"].instructions == "keep the tests"
+        assert len(self._prompts(predecessor)) == 1
+
+    _NO_HANDOFF_WARNING = (
+        "worker ended its turn without handing off to 'probe-heron'; pick the agent again to retry"
+    )
+
+    async def test_a_request_delivered_directly_to_an_idle_agent_arms(
+        self, tmp_path: Path
+    ) -> None:
+        """The common case: the agent is IDLE, so the request starts at once, bypassing the
+        queue. Silent failure: it never arms, so its turn ends with no warning and the
+        switch stays pending, refusing every later pick."""
+        broker, predecessor, _ = await self._setup(tmp_path)
+        await self._request(broker)
+        assert broker._prompt_queue.items("worker") == []
+        assert len(self._prompts(predecessor)) == 1
+        self._events(broker)
+
+        await self._turn_complete(broker)
+
+        events = self._events(broker)
+        assert [e.message for e in _warnings(events)] == [self._NO_HANDOFF_WARNING]
+        assert self._switch_changes(events) == [("worker", None)]
+        assert broker.pending_profile_switch("worker") is None
+
+    async def test_a_request_released_by_drain_queue_arms(self, tmp_path: Path) -> None:
+        """While the user is typing the queue does not auto-drain; the drain button
+        (DrainQueue) starts the request through _force_drain, which must arm it too."""
+        broker, predecessor, _ = await self._setup(tmp_path)
+        predecessor._sm._state = AgentState.BUSY
+        await self._request(broker)
+        broker.set_composing_check(lambda _aid: True)
+        await _reach_idle(broker, "worker", predecessor)
+        assert self._prompts(predecessor) == []
+
+        await broker.handle(DrainQueue(agent_id="worker"))
+        await asyncio.sleep(0)  # let the prompt task run
+        assert len(self._prompts(predecessor)) == 1
+        self._events(broker)
+        await self._turn_complete(broker)
+
+        events = self._events(broker)
+        assert [e.message for e in _warnings(events)] == [self._NO_HANDOFF_WARNING]
+        assert broker.pending_profile_switch("worker") is None
+
+    async def test_a_busy_time_request_survives_the_running_turn_then_arms(
+        self, tmp_path: Path
+    ) -> None:
+        """The running turn never saw the request, so its TurnComplete must not clear the
+        switch. Only the turn that received it may, and then with one warning."""
+        broker, predecessor, _ = await self._setup(tmp_path)
+        predecessor._sm._state = AgentState.BUSY
+
+        await self._request(broker)
+        await self._turn_complete(broker)
+
+        assert _warnings(self._events(broker)) == []
+        assert broker.pending_profile_switch("worker") == "probe-heron"
+        assert self._prompts(predecessor) == []
+
+        await _reach_idle(broker, "worker", predecessor)
+        assert len(self._prompts(predecessor)) == 1
+        await self._turn_complete(broker)
+
+        events = self._events(broker)
+        assert [e.message for e in _warnings(events)] == [
+            "worker ended its turn without handing off to 'probe-heron'; pick the agent again to retry"
+        ]
+        assert self._switch_changes(events) == [("worker", None)]
+        assert broker.pending_profile_switch("worker") is None
+
+    async def test_an_armed_turn_end_with_a_queued_handoff_row_keeps_the_switch(
+        self, tmp_path: Path
+    ) -> None:
+        """The handoff tool returns before the broker settles its row, so the turn can end
+        while the handoff is still queued. Silent failure: a false warning and a switch
+        that then loses the user's instructions."""
+        broker, _, _ = await self._setup(tmp_path)
+        await self._request(broker)
+        self._events(broker)
+        self._db(
+            broker,
+            "INSERT INTO agent_commands (session_id, from_agent, command, payload, status, "
+            "created_at) VALUES (?, 'worker', 'handoff', '{}', 'pending', 100)",
+            (broker.session_id,),
+        )
+
+        await self._turn_complete(broker)
+        self._db(broker, "UPDATE agent_commands SET status = 'processing'")
+        await self._turn_complete(broker)
+
+        events = self._events(broker)
+        assert _warnings(events) == []
+        assert self._switch_changes(events) == []
+        assert broker.pending_profile_switch("worker") == "probe-heron"
+
+    async def test_deleting_the_queued_request_cancels_it_quietly(self, tmp_path: Path) -> None:
+        """Silent failure: the label stays pending forever and every later pick is refused."""
+        broker, predecessor, _ = await self._setup(tmp_path)
+        predecessor._sm._state = AgentState.BUSY
+        await self._request(broker)
+        self._events(broker)
+        (item,) = broker._prompt_queue.items("worker")
+
+        await broker.handle(DeleteQueueItem(agent_id="worker", item_id=item.id))
+
+        events = self._events(broker)
+        assert self._switch_changes(events) == [("worker", None)]
+        assert [e for e in events if isinstance(e, BrokerError)] == []
+        await self._request(broker)
+        assert broker.pending_profile_switch("worker") == "probe-heron"
+
+    async def test_an_edited_request_keeps_its_tag_and_arms(self, tmp_path: Path) -> None:
+        broker, predecessor, _ = await self._setup(tmp_path)
+        predecessor._sm._state = AgentState.BUSY
+        await self._request(broker)
+        (item,) = broker._prompt_queue.items("worker")
+
+        await broker.handle(CommitQueueEdit(agent_id="worker", item_id=item.id, text="edited"))
+        await _reach_idle(broker, "worker", predecessor)
+        self._events(broker)
+        await self._turn_complete(broker)
+
+        assert self._prompts(predecessor) == ["edited"]
+        assert len(_warnings(self._events(broker))) == 1
+
+    async def test_handing_off_to_the_target_after_a_busy_request_carries_the_instructions(
+        self, tmp_path: Path
+    ) -> None:
+        broker, predecessor, successors = await self._setup(tmp_path)
+        predecessor._sm._state = AgentState.BUSY
+        await self._request(broker)
+        await _reach_idle(broker, "worker", predecessor)
+        self._events(broker)
+
+        cmd_id = await self._hand_off(
+            broker, {"agent_id": "worker", "handoff_message": "BRIEF", "agent_mode": "probe-heron"}
+        )
+        await _reach_idle(broker, "worker", successors[0])
+
+        assert self._db(broker, "SELECT status FROM agent_commands WHERE id = ?", (cmd_id,)) == [
+            ("processed",)
+        ]
+        assert self._db(broker, "SELECT agent_mode FROM agents WHERE agent_id = 'worker'") == [
+            ("probe-heron",)
+        ]
+        (first,) = self._prompts(successors[0])
+        assert first.endswith("BRIEF\n\nInstructions from the user for this handoff:\nkeep the tests")
+        events = self._events(broker)
+        assert self._switch_changes(events) == [("worker", None)]
+        assert _warnings(events) == []
+        assert broker.pending_profile_switch("worker") is None
+
+    async def test_handing_off_without_agent_mode_warns_that_the_switch_did_not_happen(
+        self, tmp_path: Path
+    ) -> None:
+        broker, _, _ = await self._setup(tmp_path)
+        await self._request(broker)
+        self._events(broker)
+
+        cmd_id = await self._hand_off(broker, {"agent_id": "worker", "handoff_message": "BRIEF"})
+
+        assert self._db(broker, "SELECT status FROM agent_commands WHERE id = ?", (cmd_id,)) == [
+            ("processed",)
+        ]
+        assert self._db(broker, "SELECT agent_mode FROM agents WHERE agent_id = 'worker'") == [
+            (None,)
+        ]
+        events = self._events(broker)
+        assert [e.message for e in _warnings(events)] == [
+            "worker handed off without switching to 'probe-heron'; pick the agent again to retry"
+        ]
+        assert self._switch_changes(events) == [("worker", None)]
+
+    async def test_a_switch_to_the_default_agent_is_accepted_and_completes_without_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """'' (the picker's Default entry) skips check_profile, which would reject it, and
+        a handoff with agent_mode '' counts as the switch although the row stores NULL."""
+        broker, predecessor, _ = await self._setup(tmp_path)
+
+        await self._request(broker, mode="", instr=None)
+
+        assert broker.pending_profile_switch("worker") == ""
+        (prompt,) = self._prompts(predecessor)
+        assert "switch you to the default agent" in prompt
+        assert 'agent_mode=""' in prompt
+        assert self._switch_changes(self._events(broker)) == [("worker", "")]
+
+        await self._hand_off(broker, {"agent_id": "worker", "handoff_message": "B", "agent_mode": ""})
+
+        events = self._events(broker)
+        assert _warnings(events) == []
+        assert self._switch_changes(events) == [("worker", None)]
+        assert self._db(broker, "SELECT agent_mode FROM agents WHERE agent_id = 'worker'") == [
+            (None,)
+        ]
+
+    async def test_termination_ends_the_switch_and_drops_the_unsent_request(
+        self, tmp_path: Path
+    ) -> None:
+        """Silent failure: a resurrected agent later receives a request nobody is tracking."""
+        broker, predecessor, _ = await self._setup(tmp_path)
+        predecessor._sm._state = AgentState.BUSY
+        await self._request(broker)
+        self._events(broker)
+
+        await broker._sink(
+            AgentStateChanged(
+                agent_id="worker", old_state=AgentState.BUSY, new_state=AgentState.TERMINATED
+            )
+        )
+
+        assert self._switch_changes(self._events(broker)) == [("worker", None)]
+        assert broker.pending_profile_switch("worker") is None
+        assert broker._prompt_queue.items("worker") == []

@@ -27,8 +27,9 @@ from textual.message import Message
 from textual.widgets import Button, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
-from synth_acp.models.commands import CancelTurn, SendPrompt, SetConfigOption
+from synth_acp.models.commands import CancelTurn, RequestProfileSwitch, SendPrompt, SetConfigOption
 from synth_acp.ui.file_discovery import FileEntry, discover_files, estimate_tokens, filter_files
+from synth_acp.ui.widgets.choice_bar import Choice, ChoiceBar
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
 
 log = logging.getLogger(__name__)
@@ -64,6 +65,19 @@ def _git_branch(cwd: str) -> str | None:
 # Matches /slash-command at start of single-line input
 RE_SLASH_COMMAND = re.compile(r"^(/\S+)")
 
+# bar_id of the ChoiceBar that confirms a profile switch by handoff.
+_PROFILE_SWITCH_BAR = "profile-switch"
+
+
+def _default_placeholder() -> Content:
+    """The prompt input's placeholder outside instructions mode."""
+    return Content.assemble(
+        "Ask anything\t".expandtabs(8),
+        ("▌@▐", "r"), " file  ",
+        ("▌!▐", "r"), " shell  ",
+        ("▌ctrl+j▐", "r"), " newline",
+    )
+
 class PromptTextArea(TextArea):
     """TextArea where Enter submits and Ctrl+J inserts newlines."""
 
@@ -79,6 +93,9 @@ class PromptTextArea(TextArea):
     class AtDismiss(Message):
         """Posted when @ context is lost (space after query, cursor moved away)."""
 
+    class Cancelled(Message):
+        """Posted when Escape is pressed in instructions mode."""
+
     class PickerKey(Message):
         """Posted when a picker navigation key is pressed while @ is active."""
 
@@ -89,6 +106,8 @@ class PromptTextArea(TextArea):
     def __init__(self, **kwargs: object) -> None:
         self._highlight_cache: list[Content] | None = None
         self._at_active: bool = False
+        # Set by InputBar while collecting handoff instructions: '!' and '/' are plain text.
+        self.instructions_mode: bool = False
         super().__init__(
             soft_wrap=True,
             show_line_numbers=True,
@@ -106,12 +125,12 @@ class PromptTextArea(TextArea):
         text = self.text
 
         # Slash command: entire single line goes green
-        if text.startswith("/") and "\n" not in text:
+        if text.startswith("/") and "\n" not in text and not self.instructions_mode:
             self._highlight_cache = [Content.styled(text, "$text-success")]
             return self._highlight_cache
 
         # Shell command: entire single line goes warning color
-        if text.startswith("!") and "\n" not in text:
+        if text.startswith("!") and "\n" not in text and not self.instructions_mode:
             self._highlight_cache = [Content.styled(text, "$text-warning")]
             return self._highlight_cache
 
@@ -178,17 +197,14 @@ class PromptTextArea(TextArea):
     # --- Placeholder & ghost text ---
 
     def on_mount(self) -> None:
-        self.placeholder = Content.assemble(
-            "Ask anything\t".expandtabs(8),
-            ("▌@▐", "r"), " file  ",
-            ("▌!▐", "r"), " shell  ",
-            ("▌ctrl+j▐", "r"), " newline",
-        )
+        self.placeholder = _default_placeholder()
 
     def _update_suggestion(self) -> None:
         """Set inline ghost text based on the current prefix character."""
         text = self.text
-        if text == "!":
+        if self.instructions_mode:
+            self.suggestion = ""
+        elif text == "!":
             self.suggestion = "command..."
         elif text == "/":
             self.suggestion = "command"
@@ -215,6 +231,11 @@ class PromptTextArea(TextArea):
             event.prevent_default()
             event.stop()
             self.insert("\n")
+            return
+        if event.key == "escape" and self.instructions_mode:
+            event.prevent_default()
+            event.stop()
+            self.post_message(PromptTextArea.Cancelled())
             return
         if event.key == "escape" and self.suggestion:
             self.suggestion = ""
@@ -320,6 +341,7 @@ class _PickerLabel(Static):
         self._prefix = prefix
         self._items: list[tuple[str, str]] = []  # (id, display_name)
         self._current_id: str | None = None
+        self._pending_id: str | None = None
 
     def set_items(self, items: list[tuple[str, str]], current_id: str | None) -> None:
         """Replace the option list and set the active item."""
@@ -332,13 +354,24 @@ class _PickerLabel(Static):
         self._current_id = current_id
         self._refresh_label()
 
+    def set_pending(self, pending_id: str | None) -> None:
+        """Show a pending switch to pending_id beside the current item, or clear it."""
+        self._pending_id = pending_id
+        self._refresh_label()
+
+    def _name_of(self, item_id: str) -> str:
+        return next((n for vid, n in self._items if vid == item_id), item_id)
+
     def _refresh_label(self) -> None:
         if not self._items or self._current_id is None:
             self.display = False
             return
         self.display = True
-        name = next((n for vid, n in self._items if vid == self._current_id), self._current_id)
-        self.update(f"[dim]{self._prefix}:[/] [$accent]{escape(name)}[/] [dim]▾[/]")
+        name = self._name_of(self._current_id)
+        pending = ""
+        if self._pending_id is not None:
+            pending = f" [dim]→ {escape(self._name_of(self._pending_id))} pending[/]"
+        self.update(f"[dim]{self._prefix}:[/] [$accent]{escape(name)}[/]{pending} [dim]▾[/]")
 
     def on_click(self) -> None:
         """Toggle the popup OptionList on the screen."""
@@ -402,6 +435,10 @@ class InputBar(Vertical):
         self._at_row: int = 0
         self._at_textarea: PromptTextArea | None = None
         self._filter_timer: asyncio.TimerHandle | None = None
+        # Target of the profile-switch ChoiceBar currently mounted, if any.
+        self._switch_target: str | None = None
+        # Target whose handoff instructions the prompt input is collecting, if any.
+        self._instructions_target: str | None = None
 
     def on_mount(self) -> None:
         """Start polling git branch if cwd is set."""
@@ -678,6 +715,13 @@ class InputBar(Vertical):
                 container.mount(picker)
                 picker.set_items(items, opt.current_value)
 
+    def set_pending_profile_switch(self, agent_mode: str | None) -> None:
+        """Show agent_mode as the pending switch target on the agent picker, or clear it."""
+        try:
+            self.query_one("#picker-agent", _PickerLabel).set_pending(agent_mode)
+        except NoMatches:
+            pass
+
     def update_config_option_value(self, config_id: str, value: str) -> None:
         """Update a single picker's current value."""
         try:
@@ -688,13 +732,28 @@ class InputBar(Vertical):
     # --- Picker selection handler ---
 
     def _on_picker_selected(self, picker_id: str, option_id: str) -> None:
-        """Called by _PickerPopup when the user selects an option."""
+        """Called by _PickerPopup when the user selects an option.
+
+        On a harness that switches profiles by handoff, an 'agent' pick is only a proposal:
+        the picker keeps the current agent and a ChoiceBar asks for confirmation.
+        """
+        from synth_acp.ui.app import SynthApp
+
+        if picker_id == "picker-agent":
+            app = self.app
+            if isinstance(app, SynthApp) and app.switches_profile_by_handoff(self._agent_id):
+                try:
+                    current = self.query_one(f"#{picker_id}", _PickerLabel)._current_id
+                except NoMatches:
+                    current = None
+                if option_id != current:
+                    self._confirm_profile_switch(option_id)
+                return
         try:
             picker = self.query_one(f"#{picker_id}", _PickerLabel)
             picker.set_current(option_id)
         except Exception:
             pass
-        from synth_acp.ui.app import SynthApp
 
         app = self.app
         if not isinstance(app, SynthApp):
@@ -703,6 +762,88 @@ class InputBar(Vertical):
         config_id = picker_id.removeprefix("picker-")
         app.run_worker(
             app.broker.handle(SetConfigOption(agent_id=self._agent_id, config_id=config_id, value=option_id))
+        )
+
+    # --- Profile switch by handoff ---
+
+    def _confirm_profile_switch(self, agent_mode: str) -> None:
+        """Mount the ChoiceBar that confirms switching this agent to agent_mode."""
+        for bar in self.query(ChoiceBar):
+            if bar._bar_id == _PROFILE_SWITCH_BAR:
+                bar.remove()
+        # A new pick replaces any earlier one, including one already collecting instructions.
+        if self._instructions_target is not None:
+            self._end_instructions()
+        self._switch_target = agent_mode
+        target = agent_mode or "Default"
+        bar = ChoiceBar(
+            bar_id=_PROFILE_SWITCH_BAR,
+            title=(
+                f"Switch {self._agent_id} to {target}? The agent writes a briefing and a fresh "
+                f"session starts as {target}. The current session is kept and can be resurrected."
+            ),
+            choices=[
+                Choice("handoff", "Hand off", "h"),
+                Choice("instructions", "Hand off with instructions", "i"),
+                Choice("cancel", "Cancel", "c"),
+            ],
+            cancel_id="cancel",
+        )
+        self.mount(bar, before=0)
+
+    def on_choice_bar_chosen(self, event: ChoiceBar.Chosen) -> None:
+        """Act on the profile-switch confirmation."""
+        if event.bar_id != _PROFILE_SWITCH_BAR:
+            return
+        event.stop()
+        target, self._switch_target = self._switch_target, None
+        if target is not None and event.choice_id == "instructions":
+            self.begin_instructions(target)
+            return
+        if target is not None and event.choice_id == "handoff":
+            self._request_profile_switch(target, None)
+        self.query_one("#prompt-input", PromptTextArea).focus()
+
+    def begin_instructions(self, agent_mode: str) -> None:
+        """Enter instructions mode for a handoff to agent_mode.
+
+        The next Enter sends the text as the handoff's instructions and Escape cancels;
+        either one ends the mode.
+        """
+        self._instructions_target = agent_mode
+        ta = self.query_one("#prompt-input", PromptTextArea)
+        ta.instructions_mode = True
+        ta.suggestion = ""
+        ta.placeholder = (
+            f"Instructions for the handoff to {agent_mode or 'Default'}  "
+            "(enter to send, esc to cancel)"
+        )
+        ta.focus()
+
+    def _end_instructions(self) -> None:
+        """Leave instructions mode and restore the normal placeholder."""
+        self._instructions_target = None
+        ta = self.query_one("#prompt-input", PromptTextArea)
+        ta.instructions_mode = False
+        ta.placeholder = _default_placeholder()
+
+    def on_prompt_text_area_cancelled(self, event: PromptTextArea.Cancelled) -> None:
+        """Escape in instructions mode: send nothing."""
+        event.stop()
+        self._end_instructions()
+
+    def _request_profile_switch(self, agent_mode: str, instructions: str | None) -> None:
+        from synth_acp.ui.app import SynthApp
+
+        app = self.app
+        if not isinstance(app, SynthApp):
+            return
+        app.run_worker(
+            app.broker.handle(
+                RequestProfileSwitch(
+                    agent_id=self._agent_id, agent_mode=agent_mode, instructions=instructions
+                )
+            )
         )
 
     # --- Slash commands ---
@@ -801,6 +942,12 @@ class InputBar(Vertical):
     def on_prompt_text_area_submitted(self, message: PromptTextArea.Submitted) -> None:
         """Send prompt to the focused agent."""
         text = message.text_area.text.strip()
+        target = self._instructions_target
+        if target is not None:
+            message.text_area.clear()
+            self._end_instructions()
+            self._request_profile_switch(target, text or None)
+            return
         if not text:
             return
         message.text_area.clear()

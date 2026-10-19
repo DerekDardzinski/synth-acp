@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from acp.schema import EnvVariable, McpServerStdio
 
+from synth_acp.acp.extensions import get_extension
 from synth_acp.acp.session import ACPSession
 from synth_acp.broker.registry import AgentRegistry
 from synth_acp.db import (
@@ -28,9 +29,9 @@ from synth_acp.db import (
     expire_old_sessions_sync,
     rename_agent_sync,
 )
-from synth_acp.discovery import DiscoveredAgent, discover_agents
+from synth_acp.discovery import discover_agents
 from synth_acp.harnesses import load_harness_registry
-from synth_acp.models.agent import AgentConfig, AgentState, HandoffResult
+from synth_acp.models.agent import AgentConfig, AgentState, DiscoveredAgent, HandoffResult
 from synth_acp.models.config import (
     HarnessEntry,
     MessageHook,
@@ -122,7 +123,7 @@ class AgentLifecycle:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._expiry_task: asyncio.Task[None] | None = None
         self._first_prompted: set[str] = set()
-        self._harness_registry = load_harness_registry()
+        self._harness_registry = load_harness_registry(config.settings.harness_variant)
         self._discovery_cache: dict[str, list[DiscoveredAgent]] = {}
         self._terminate_timeout: float = 5.0
         self._handoff_state: HandoffBrokerState | None = None
@@ -175,10 +176,11 @@ class AgentLifecycle:
             mcp_servers=mcp_servers,
             agent_mode=agent_cfg.agent_mode,
             env=self._resolve_harness_env(entry),
-            agent_mode_target=entry.agent_mode_target,
-            steer_protocol=entry.steer_protocol,
+            extension=get_extension(entry.extension),
         )
-        session.set_session_created_callback(self._on_acp_session_created)
+        session.set_session_created_callback(
+            partial(self._on_acp_session_created, harness_variant=entry.variant)
+        )
         return session
 
     async def _cancel_agent_tasks(self, agent_id: str) -> None:
@@ -295,9 +297,18 @@ class AgentLifecycle:
                 ensure_schema_sync(conn)
                 conn.execute(
                     "INSERT OR REPLACE INTO agents "
-                    "(agent_id, session_id, status, registered, harness, agent_mode, cwd) "
-                    "VALUES (?, ?, 'active', ?, ?, ?, ?)",
-                    (agent_id, session_id, now, agent_cfg.harness, agent_cfg.agent_mode, agent_cfg.cwd),
+                    "(agent_id, session_id, status, registered, harness, agent_mode, cwd, "
+                    "harness_variant) "
+                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?)",
+                    (
+                        agent_id,
+                        session_id,
+                        now,
+                        agent_cfg.harness,
+                        agent_cfg.agent_mode,
+                        agent_cfg.cwd,
+                        entry.variant,
+                    ),
                 )
                 conn.commit()
 
@@ -336,7 +347,7 @@ class AgentLifecycle:
 
             await self._db_op(_sync)
         # Keep these OUTSIDE the lock — they don't need serialization against
-        # prompt/set_mode/set_model and shouldn't block other operations.
+        # prompt/set_config_option and shouldn't block other operations.
         task = await self._get_agent_task(agent_id)
         parent = self._registry.get_parent(agent_id)
         await self._fire_message_hook(
@@ -449,42 +460,6 @@ class AgentLifecycle:
             return
         await session.cancel()
 
-    async def set_mode(self, agent_id: str, mode_id: str) -> None:
-        """Forward a mode-switch request to the agent session."""
-        async with self._registry.agent_lock(agent_id):
-            session = self._registry.get_session(agent_id)
-            if not session:
-                await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
-                return
-            if session.state != AgentState.IDLE:
-                await self._sink(
-                    BrokerError(
-                        agent_id=agent_id,
-                        message=f"Agent '{agent_id}' is {session.state}, cannot switch mode",
-                        severity="warning",
-                    )
-                )
-                return
-            await session.set_mode(mode_id)
-
-    async def set_model(self, agent_id: str, model_id: str) -> None:
-        """Forward a model-switch request to the agent session."""
-        async with self._registry.agent_lock(agent_id):
-            session = self._registry.get_session(agent_id)
-            if not session:
-                await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
-                return
-            if session.state != AgentState.IDLE:
-                await self._sink(
-                    BrokerError(
-                        agent_id=agent_id,
-                        message=f"Agent '{agent_id}' is {session.state}, cannot switch model",
-                        severity="warning",
-                    )
-                )
-                return
-            await session.set_model(model_id)
-
     async def set_config_option(self, agent_id: str, config_id: str, value: str | bool) -> None:
         """Forward a config option change to the agent session."""
         async with self._registry.agent_lock(agent_id):
@@ -502,39 +477,6 @@ class AgentLifecycle:
                 )
                 return
             await session.set_config_option(config_id, value)
-
-    async def set_agent(self, agent_id: str, agent_name: str) -> None:
-        """Switch active agent via fork_session."""
-        async with self._registry.agent_lock(agent_id):
-            session = self._registry.get_session(agent_id)
-            if not session:
-                await self._sink(BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'"))
-                return
-            if session.state != AgentState.IDLE:
-                await self._sink(
-                    BrokerError(
-                        agent_id=agent_id,
-                        message=f"Agent '{agent_id}' is {session.state}, cannot switch agent",
-                        severity="warning",
-                    )
-                )
-                return
-            new_session_id = await session.fork_with_agent(agent_name)
-            if new_session_id:
-                await self._update_acp_session_id(agent_id, new_session_id)
-
-    async def _update_acp_session_id(self, agent_id: str, new_session_id: str) -> None:
-        """Update acp_session_id in DB."""
-        session_id = self._session_id
-
-        def _sync(conn: sqlite3.Connection) -> None:
-            conn.execute(
-                "UPDATE agents SET acp_session_id = ? WHERE agent_id = ? AND session_id = ?",
-                (new_session_id, agent_id, session_id),
-            )
-            conn.commit()
-
-        await self._db_op(_sync)
 
     async def handle_launch_command(
         self, cmd_id: int, from_agent: str, data: dict[str, str]
@@ -579,9 +521,10 @@ class AgentLifecycle:
             def _sync(conn: sqlite3.Connection) -> None:
                 conn.execute(
                     "INSERT OR REPLACE INTO agents "
-                    "(agent_id, session_id, status, registered, parent, task, harness, agent_mode, cwd) "
-                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)",
-                    (agent_id, session_id, now, from_agent, task, harness, agent_mode, cwd),
+                    "(agent_id, session_id, status, registered, parent, task, harness, agent_mode, cwd, "
+                    "harness_variant) "
+                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+                    (agent_id, session_id, now, from_agent, task, harness, agent_mode, cwd, entry.variant),
                 )
                 conn.commit()
 
@@ -643,7 +586,8 @@ class AgentLifecycle:
 
             def _fetch(conn: sqlite3.Connection) -> tuple | None:
                 return conn.execute(
-                    "SELECT acp_session_id, harness, agent_mode, cwd, parent, task, status "
+                    "SELECT acp_session_id, harness, agent_mode, cwd, parent, task, status, "
+                    "harness_variant "
                     "FROM agents WHERE agent_id = ? AND session_id = ?",
                     (agent_id, session_id),
                 ).fetchone()
@@ -652,7 +596,7 @@ class AgentLifecycle:
             if not row:
                 await self._sink(BrokerError(agent_id=agent_id, message=f"Agent '{agent_id}' not found"))
                 return
-            acp_session_id, harness, agent_mode, cwd, parent, task, status = row
+            acp_session_id, harness, agent_mode, cwd, parent, task, status, harness_variant = row
             if status != "inactive":
                 await self._sink(
                     BrokerError(agent_id=agent_id, message=f"Agent '{agent_id}' is {status}, not inactive")
@@ -674,6 +618,7 @@ class AgentLifecycle:
                 agent_mode=agent_mode,
                 cwd=cwd or ".",
                 parent=parent,
+                harness_variant=harness_variant,
             )
 
             def _update(conn: sqlite3.Connection) -> None:
@@ -726,8 +671,19 @@ class AgentLifecycle:
         await self.resurrect(agent_id)
         await self.update_command_status(cmd_id, "processed")
 
-    async def handoff(self, agent_id: str, handoff_message: str) -> HandoffResult:
+    async def handoff(
+        self,
+        agent_id: str,
+        handoff_message: str,
+        *,
+        successor_agent_mode: str | None = None,
+        user_instructions: str | None = None,
+    ) -> HandoffResult:
         """Retire an agent and start a successor under its id.
+
+        ``successor_agent_mode`` starts the successor as that agent profile; None keeps
+        the predecessor's.  ``user_instructions`` are appended verbatim to the successor's
+        opening prompt, after the handoff message.
 
         Runs inside an OWNED TASK that nothing cancels, so it awaits _db_op directly and
         needs no shield, no deferred-cancellation loop and no exception-precedence
@@ -778,6 +734,7 @@ class AgentLifecycle:
 
                 now = int(time.time() * 1000)
                 session_id = self._session_id
+                variants = {e.short_name: e.variant for e in self._harness_registry}
                 result: AgentRenameResult = await self._db_op(
                     lambda conn: rename_agent_sync(
                         conn,
@@ -785,6 +742,8 @@ class AgentLifecycle:
                         new_agent_id=new_id,
                         session_id=session_id,
                         now_ms=now,
+                        harness_variants=variants,
+                        successor_agent_mode=successor_agent_mode,
                     )
                 )
 
@@ -830,7 +789,9 @@ class AgentLifecycle:
                     # conversation via ACP session/load and suppress the startup hook,
                     # and both defeat the feature.
                     successor = self._build_session(agent_cfg, entry)
-                    text = self._render_handoff_prompt(agent_id, result, handoff_message)
+                    text = self._render_handoff_prompt(
+                        agent_id, result, handoff_message, user_instructions
+                    )
 
                     # SHUTDOWN CHECK AND REGISTRATION IN ONE SYNCHRONOUS BLOCK, NO
                     # AWAIT BETWEEN THEM.  shutdown sets the flag, awaits owned
@@ -873,15 +834,22 @@ class AgentLifecycle:
             finished.set()
 
     def _render_handoff_prompt(
-        self, agent_id: str, result: AgentRenameResult, handoff_message: str
+        self,
+        agent_id: str,
+        result: AgentRenameResult,
+        handoff_message: str,
+        user_instructions: str | None = None,
     ) -> str:
         """Build the successor's opening prompt, following handle_launch_command.
 
         The handoff text is passed through VERBATIM: this phase makes no LLM call,
         constructs no prompt template of its own, and must not summarize, truncate or
-        reformat what the predecessor wrote.  Pre-adding to _first_prompted is what stops
-        prompt() prepending the startup context a second time on delivery.
+        reformat what the predecessor wrote.  The user's instructions for a profile switch
+        follow it, also verbatim, under a fixed header.  Pre-adding to _first_prompted is
+        what stops prompt() prepending the startup context a second time on delivery.
         """
+        if user_instructions:
+            handoff_message += "\n\nInstructions from the user for this handoff:\n" + user_instructions
         self._first_prompted.add(agent_id)
         self._registry.set_initial_message(agent_id, handoff_message)
         hook = self._config.settings.hooks.on_agent_startup
@@ -902,9 +870,23 @@ class AgentLifecycle:
         return rendered + handoff_message
 
     async def handle_handoff_command(
-        self, cmd_id: int, from_agent: str, data: dict[str, str]
+        self,
+        cmd_id: int,
+        from_agent: str,
+        data: dict[str, str],
+        *,
+        pending_agent_mode: str | None = None,
+        pending_instructions: str | None = None,
     ) -> None:
         """Handle a handoff command from an agent.
+
+        ``pending_agent_mode`` and ``pending_instructions`` describe a profile switch the
+        user asked for and the broker is tracking.  ``data["agent_mode"]`` omitted keeps
+        the current profile, even while a switch is pending (the broker then warns that
+        the switch did not happen); naming a profile other than the pending target is
+        rejected.  An explicit agent_mode the extension does not know is rejected too;
+        ``""`` selects the harness default and is not checked.
+        Both rejections happen before anything is killed.
 
         Self-service: an agent hands ITSELF off, so authorization is
         data["agent_id"] == from_agent.  Reject otherwise.  This is deliberately NOT the
@@ -943,8 +925,33 @@ class AgentLifecycle:
             )
             return
 
+        # None keeps the current profile; "" is an explicit switch to the harness default
+        # and has no profile to validate.
+        requested = data.get("agent_mode")
+        if pending_agent_mode is not None and requested not in (None, pending_agent_mode):
+            await self.update_command_status(
+                cmd_id,
+                "rejected",
+                f"The user asked to switch you to '{pending_agent_mode}'; call handoff with "
+                f"agent_mode='{pending_agent_mode}'",
+            )
+            return
+        session = self._registry.get_session(agent_id)
+        if requested and session is not None:
+            unavailable = session.extension.check_profile(
+                requested, Path(self._registry.get_cwd(agent_id))
+            )
+            if unavailable is not None:
+                await self.update_command_status(cmd_id, "rejected", unavailable.reason)
+                return
+
         try:
-            result = await self.handoff(agent_id, data.get("handoff_message", ""))
+            result = await self.handoff(
+                agent_id,
+                data.get("handoff_message", ""),
+                successor_agent_mode=requested,
+                user_instructions=pending_instructions if pending_agent_mode is not None else None,
+            )
         except (AgentRenameError, sqlite3.OperationalError) as exc:
             # Nothing is durable and no id was retired, so this is not a BrokerError.
             await self.update_command_status(cmd_id, "rejected", str(exc))
@@ -1003,10 +1010,16 @@ class AgentLifecycle:
             expiry.cancel()
             await asyncio.wait([expiry], timeout=1.0)
 
-    async def _on_acp_session_created(self, agent_id: str, acp_session_id: str) -> None:
+    async def _on_acp_session_created(
+        self, agent_id: str, acp_session_id: str, *, harness_variant: str | None
+    ) -> None:
         """Write back the ACP session ID after the agent process creates it.
 
         Sets status to 'active' so only fully-connected agents are considered active.
+        Writes ``harness_variant`` in the same statement, so the stored variant always
+        names the engine that created the stored session id.  Otherwise a restore that
+        started fresh after a variant mismatch would leave the old variant on the row,
+        and every later restore would start fresh again.
 
         Uses asyncio.to_thread + sync sqlite3 because this callback fires
         from a background agent task and can race with shutdown.  A sync
@@ -1017,9 +1030,9 @@ class AgentLifecycle:
             try:
                 configure_connection(conn)
                 conn.execute(
-                    "UPDATE agents SET acp_session_id = ?, status = 'active' "
+                    "UPDATE agents SET acp_session_id = ?, harness_variant = ?, status = 'active' "
                     "WHERE agent_id = ? AND session_id = ?",
-                    (acp_session_id, agent_id, self._session_id),
+                    (acp_session_id, harness_variant, agent_id, self._session_id),
                 )
                 conn.commit()
             finally:
@@ -1038,8 +1051,15 @@ class AgentLifecycle:
         agent_mode: str | None,
         cwd: str,
         parent: str | None,
+        harness_variant: str | None = None,
     ) -> None:
-        """Restore a previously-running agent from saved state (no SQLite insert)."""
+        """Restore a previously-running agent from saved state (no SQLite insert).
+
+        ``harness_variant`` is the engine variant stored with the agent's row.  When it
+        differs from the configured one, the saved ACP session belongs to another engine
+        (a v2 session id loaded into Kiro v3 silently yields an empty session), so this
+        starts a fresh session instead and warns.
+        """
         entry = next((e for e in self._harness_registry if e.short_name == harness), None)
         if not entry:
             await self._sink(
@@ -1051,19 +1071,34 @@ class AgentLifecycle:
             await self._sink(BrokerError(agent_id=agent_id, message=f"Cannot restore: {missing}"))
             return
 
-        cmd = entry.run_cmd.split()
         agent_cfg = AgentConfig(agent_id=agent_id, harness=harness, agent_mode=agent_mode, cwd=cwd)
-        if agent_cfg.agent_mode and entry.mode_arg:
-            cmd += [entry.mode_arg, agent_cfg.agent_mode]
         session = self._build_session(agent_cfg, entry)
         self._registry.register(agent_id, session)
         if parent:
             self._registry.set_parent(agent_id, parent)
         self._registry.set_harness(agent_id, harness)
 
+        variant_mismatch = bool(acp_session_id) and harness_variant != entry.variant
+
         # Suppress on_agent_startup hook — restored agents already have
-        # orchestration context from their prior conversation history.
-        self._first_prompted.add(agent_id)
+        # orchestration context from their prior conversation history.  Not after a
+        # variant mismatch: that session starts with no conversation at all.
+        if not variant_mismatch:
+            self._first_prompted.add(agent_id)
+
+        if variant_mismatch:
+            await self._sink(
+                BrokerError(
+                    agent_id=agent_id,
+                    message=(
+                        f"Agent '{agent_id}' was recorded under {harness} variant "
+                        f"'{harness_variant}' but '{entry.variant}' is configured; "
+                        "starting a fresh session without its previous conversation."
+                    ),
+                    severity="warning",
+                )
+            )
+            acp_session_id = None
 
         # No ACP session ID means the agent never had a conversation — launch fresh.
         if acp_session_id:

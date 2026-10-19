@@ -15,7 +15,7 @@ from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple
+from typing import Any, ClassVar, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,6 +28,7 @@ from acp.schema import (
     Cost,
     CurrentModeUpdate,
     FileEditToolCallContent,
+    Implementation,
     McpServerStdio,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
@@ -39,6 +40,7 @@ from acp.schema import (
     UsageUpdate,
 )
 
+from synth_acp.acp.extensions import AcpExtension, get_extension
 from synth_acp.acp.session import (
     DRAIN_PASSES,
     ACPSession,
@@ -63,6 +65,12 @@ from synth_acp.models.events import (
     ToolCallUpdated,
     TurnComplete,
     UsageUpdated,
+)
+from synth_acp.models.extensions import (
+    ContextUsage,
+    ProfileUnavailable,
+    SteerOutcome,
+    UpdateHints,
 )
 
 
@@ -235,6 +243,7 @@ class TestSessionUpdate:
             session_update="tool_call",
             field_meta={"claudeCode": {"parentToolUseId": "tc-parent"}},
         )
+        session._ext = get_extension("claude")
         await session.session_update("sess-1", update)
         await asyncio.sleep(0)
         assert len(events) == 1
@@ -348,7 +357,7 @@ class TestSessionModes:
     async def test_set_mode_transitions_through_configuring(
         self, session: ACPSession, events: list[BrokerEvent]
     ) -> None:
-        """set_mode must enter CONFIGURING before any RPC and return to IDLE after.
+        """A mode switch must enter CONFIGURING before any RPC and return to IDLE after.
         If state never enters CONFIGURING, concurrent prompts can race the switch."""
         observed_states: list[AgentState] = []
 
@@ -378,7 +387,7 @@ class TestSessionModes:
         events.clear()
         observed_states.clear()
 
-        await session.set_mode("kiro_planner")
+        await session.set_config_option("mode", "kiro_planner")
 
         assert AgentState.CONFIGURING in observed_states, (
             "set_mode must transition to CONFIGURING — without it concurrent "
@@ -392,7 +401,7 @@ class TestSessionModes:
     async def test_set_mode_returns_to_idle_on_rpc_failure(
         self, session: ACPSession, events: list[BrokerEvent]
     ) -> None:
-        """set_mode must return to IDLE even if an RPC raises.
+        """A mode switch must return to IDLE even if an RPC raises.
         If it stays in CONFIGURING the agent is permanently unusable."""
 
         class FailingConn:
@@ -405,7 +414,7 @@ class TestSessionModes:
         events.clear()
 
         with pytest.raises(RuntimeError, match="RPC failed"):
-            await session.set_mode("kiro_planner")
+            await session.set_config_option("mode", "kiro_planner")
 
         assert session.state == AgentState.IDLE, (
             "set_mode must restore IDLE after an RPC failure — "
@@ -623,7 +632,7 @@ class TestSessionRunLifecycle:
 
 
 class TestAgentModeTarget:
-    """Tests for agent_mode_target passthrough in run() and run_restored()."""
+    """Tests for the extension's agent_mode handling in run() and run_restored()."""
 
     @pytest.fixture()
     def events(self) -> list[BrokerEvent]:
@@ -660,7 +669,7 @@ class TestAgentModeTarget:
     async def test_run_meta_agent_passes_meta_and_skips_set_session_mode(
         self, events: list[BrokerEvent], mock_conn: Any, mock_proc: Any
     ) -> None:
-        """When agent_mode_target='meta_agent', new_session must receive _meta kwarg
+        """With the claude extension, new_session must receive _meta kwarg
         and set_session_mode must NOT be called. Silent failure: agent launches
         without its config or gets double-applied mode."""
         from contextlib import asynccontextmanager
@@ -675,7 +684,7 @@ class TestAgentModeTarget:
             cwd=".",
             event_sink=sink,
             agent_mode="plan",
-            agent_mode_target="meta_agent",
+            extension=get_extension("claude"),
         )
 
         @asynccontextmanager
@@ -689,13 +698,13 @@ class TestAgentModeTarget:
 
         mock_conn.new_session.assert_called_once()
         call_kwargs = mock_conn.new_session.call_args[1]
-        assert call_kwargs["claudeCode"] == {"options": {"agent": "plan"}}
+        assert call_kwargs["claudeCode"] == {"options": {"extraArgs": {"agent": "plan"}}}
         mock_conn.set_session_mode.assert_not_called()
 
     async def test_run_restored_fallback_passes_meta(
         self, events: list[BrokerEvent], mock_conn: Any, mock_proc: Any
     ) -> None:
-        """When run_restored() falls back to new_session and agent_mode_target='meta_agent',
+        """When run_restored() falls back to new_session with the claude extension,
         the fallback new_session must also receive _meta. Silent failure: restored agent
         that fails load launches without agent config."""
         from contextlib import asynccontextmanager
@@ -710,7 +719,7 @@ class TestAgentModeTarget:
             cwd=".",
             event_sink=sink,
             agent_mode="plan",
-            agent_mode_target="meta_agent",
+            extension=get_extension("claude"),
         )
 
         mock_conn.load_session.side_effect = RuntimeError("session not found")
@@ -734,13 +743,13 @@ class TestAgentModeTarget:
 
         mock_conn.new_session.assert_called_once()
         call_kwargs = mock_conn.new_session.call_args[1]
-        assert call_kwargs["claudeCode"] == {"options": {"agent": "plan"}}
+        assert call_kwargs["claudeCode"] == {"options": {"extraArgs": {"agent": "plan"}}}
         mock_conn.set_session_mode.assert_not_called()
 
     async def test_run_default_target_calls_set_session_mode(
         self, events: list[BrokerEvent], mock_conn: Any, mock_proc: Any
     ) -> None:
-        """When agent_mode_target is None (default/Kiro path), set_session_mode must
+        """With the kiro_v2 extension (profile_switch 'mode'), set_session_mode must
         be called and _meta must NOT be passed. Silent failure: Kiro mode switching
         regresses."""
         from contextlib import asynccontextmanager
@@ -756,7 +765,7 @@ class TestAgentModeTarget:
             cwd=".",
             event_sink=sink,
             agent_mode="code",
-            agent_mode_target=None,
+            extension=get_extension("kiro_v2"),
         )
 
         # Set up modes so set_session_mode path is triggered
@@ -1099,6 +1108,74 @@ class TestConfigOptionUpdateNotification:
         assert changed_events[0].config_id == "effort"
         assert changed_events[0].value == "high"
 
+    @staticmethod
+    def _model(current: str) -> Any:
+        from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+
+        return SessionConfigOptionSelect(
+            id="model",
+            name="Model",
+            category="model",
+            type="select",
+            current_value=current,
+            options=[
+                SessionConfigSelectOption(name="Auto", value="auto"),
+                SessionConfigSelectOption(name="Sonnet", value="claude-sonnet-4.6"),
+            ],
+        )
+
+    async def test_config_option_update_adding_an_option_emits_full_list(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Silent failure: an effortLevel option that appears with a model switch
+        never gets a picker, because ConfigOptionChanged only updates known options."""
+        from acp.schema import (
+            ConfigOptionUpdate,
+            SessionConfigOptionSelect,
+            SessionConfigSelectOption,
+        )
+
+        from synth_acp.models.events import ConfigOptionsReceived
+
+        session._config_options = [self._model("auto")]
+        pushed = [
+            self._model("claude-sonnet-4.6"),
+            SessionConfigOptionSelect(
+                id="effortLevel",
+                name="Effort",
+                category="thought_level",
+                type="select",
+                current_value="high",
+                options=[SessionConfigSelectOption(name="High", value="high")],
+            ),
+        ]
+        await session._emit_from_notification(
+            ConfigOptionUpdate(config_options=pushed, session_update="config_option_update")
+        )
+
+        received = [e for e in events if isinstance(e, ConfigOptionsReceived)]
+        assert [r.config_options for r in received] == [pushed]
+
+    async def test_config_option_update_value_only_emits_no_full_list(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Silent failure: every value change rebuilds all pickers."""
+        from acp.schema import ConfigOptionUpdate
+
+        from synth_acp.models.events import ConfigOptionChanged
+
+        session._config_options = [self._model("auto")]
+        await session._emit_from_notification(
+            ConfigOptionUpdate(
+                config_options=[self._model("claude-sonnet-4.6")],
+                session_update="config_option_update",
+            )
+        )
+
+        assert [(type(e), getattr(e, "value", None)) for e in events] == [
+            (ConfigOptionChanged, "claude-sonnet-4.6")
+        ]
+
 
 class TestSetConfigOption:
     """Tests for set_config_option() method."""
@@ -1279,158 +1356,60 @@ class TestSetConfigOption:
         assert error_events[0].severity == "warning"
         assert session.state == AgentState.BUSY
 
+    @staticmethod
+    async def _idle_with_models(session: ACPSession, events: list[BrokerEvent]) -> AsyncMock:
+        from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
 
-class TestForkWithAgent:
-    """Tests for ACPSession.fork_with_agent."""
-
-    @pytest.fixture()
-    def events(self) -> list[BrokerEvent]:
-        return []
-
-    @pytest.fixture()
-    def session(self, events: list[BrokerEvent]) -> ACPSession:
-        async def sink(event: BrokerEvent) -> None:
-            events.append(event)
-
-        s = ACPSession(
-            agent_id="test",
-            binary="echo",
-            args=[],
-            cwd="/project",
-            event_sink=sink,
-            agent_mode="old-agent",
-            agent_mode_target="meta_agent",
-        )
-        s._session_id = "sess-1"
-        return s
-
-    async def test_fork_with_agent_calls_fork_session_with_correct_meta(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """fork_session must receive claudeCode options with the agent name.
-        Silent failure: wrong agent loaded if _meta is malformed."""
-
-
+        session._has_native_config_options = True
+        session._config_options = [
+            SessionConfigOptionSelect(
+                id="model",
+                name="Model",
+                category="model",
+                type="select",
+                current_value="auto",
+                options=[
+                    SessionConfigSelectOption(name="Auto", value="auto"),
+                    SessionConfigSelectOption(name="Sonnet", value="claude-sonnet-4.6"),
+                ],
+            )
+        ]
         conn = AsyncMock()
-        conn.fork_session.return_value = AsyncMock(
-            session_id="sess-2", config_options=None, modes=None, models=None
-        )
+        conn.set_config_option.return_value = MagicMock(config_options=session._config_options)
         session._conn = conn
         await session._sm.transition(AgentState.INITIALIZING)
         await session._sm.transition(AgentState.IDLE)
         events.clear()
+        return conn
 
-        await session.fork_with_agent("new-agent")
-
-        conn.fork_session.assert_called_once_with(
-            cwd="/project",
-            session_id="sess-1",
-            mcp_servers=None,
-            claudeCode={"options": {"agent": "new-agent"}},
-        )
-
-    async def test_fork_with_agent_swaps_session_id_and_agent_mode(
+    async def test_set_config_option_rejects_unadvertised_value_and_id(
         self, session: ACPSession, events: list[BrokerEvent]
     ) -> None:
-        """Session ID and agent_mode must update on success.
-        Silent failure: stale session_id means prompts go to old session."""
-
-        conn = AsyncMock()
-        conn.fork_session.return_value = AsyncMock(
-            session_id="sess-new", config_options=None, modes=None, models=None
-        )
-        session._conn = conn
-        await session._sm.transition(AgentState.INITIALIZING)
-        await session._sm.transition(AgentState.IDLE)
-        events.clear()
-
-        result = await session.fork_with_agent("new-agent")
-
-        assert result == "sess-new"
-        assert session._session_id == "sess-new"
-        assert session._agent_mode == "new-agent"
-
-    async def test_fork_with_agent_returns_none_on_failure(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """Must return None and emit BrokerError on exception.
-        Silent failure: exception propagates and crashes caller."""
-
+        """Silent failure: Kiro v3 accepts model "bogus" and configId "nope" without
+        error, so the picker shows a value the agent is not running."""
         from synth_acp.models.events import BrokerError as BErr
 
-        conn = AsyncMock()
-        conn.fork_session.side_effect = RuntimeError("connection lost")
-        session._conn = conn
-        await session._sm.transition(AgentState.INITIALIZING)
-        await session._sm.transition(AgentState.IDLE)
-        events.clear()
+        conn = await self._idle_with_models(session, events)
 
-        result = await session.fork_with_agent("new-agent")
+        await session.set_config_option("model", "bogus")
+        await session.set_config_option("nope", "x")
 
-        assert result is None
-        assert session._session_id == "sess-1"  # unchanged
-        error_events = [e for e in events if isinstance(e, BErr)]
-        assert len(error_events) == 1
-        assert "new-agent" in error_events[0].message
-
-    async def test_fork_with_agent_transitions_through_configuring(
-        self, session: ACPSession, events: list[BrokerEvent]
-    ) -> None:
-        """Must enter CONFIGURING before fork and return to IDLE after.
-        Silent failure: concurrent prompts race the fork."""
-
-        observed_states: list[AgentState] = []
-        original_sink = session._event_sink
-
-        async def tracking_sink(event: BrokerEvent) -> None:
-            if isinstance(event, AgentStateChanged):
-                observed_states.append(event.new_state)
-            await original_sink(event)
-
-        session._event_sink = tracking_sink
-
-        conn = AsyncMock()
-        conn.fork_session.return_value = AsyncMock(
-            session_id="sess-2", config_options=None, modes=None, models=None
-        )
-        session._conn = conn
-        await session._sm.transition(AgentState.INITIALIZING)
-        await session._sm.transition(AgentState.IDLE)
-        observed_states.clear()
-
-        await session.fork_with_agent("new-agent")
-
-        assert AgentState.CONFIGURING in observed_states
+        conn.set_config_option.assert_not_called()
+        assert [e.severity if isinstance(e, BErr) else e for e in events] == [
+            "warning",
+            "warning",
+        ]
         assert session.state == AgentState.IDLE
 
-    async def test_fork_with_agent_falls_back_to_new_session_on_resource_not_found(
+    async def test_set_config_option_sends_advertised_value_unchanged(
         self, session: ACPSession, events: list[BrokerEvent]
     ) -> None:
-        """When fork fails with resource-not-found (empty session), must fall back to new_session.
-        Silent failure: agent switch fails on empty sessions."""
+        """Silent failure: validation rejects or rewrites a value the agent offered."""
+        conn = await self._idle_with_models(session, events)
 
-        from acp.exceptions import RequestError
+        await session.set_config_option("model", "claude-sonnet-4.6")
 
-        conn = AsyncMock()
-        conn.fork_session.side_effect = RequestError(-32002, "Resource not found")
-        conn.new_session.return_value = AsyncMock(
-            session_id="sess-new", config_options=None, modes=None, models=None
-        )
-        session._conn = conn
-        await session._sm.transition(AgentState.INITIALIZING)
-        await session._sm.transition(AgentState.IDLE)
-        events.clear()
-
-        result = await session.fork_with_agent("new-agent")
-
-        assert result == "sess-new"
-        assert session._session_id == "sess-new"
-        assert session._agent_mode == "new-agent"
-        conn.new_session.assert_called_once_with(
-            cwd="/project",
-            mcp_servers=[],
-            claudeCode={"options": {"agent": "new-agent"}},
-        )
+        conn.set_config_option.assert_awaited_once_with("model", "sess-1", "claude-sonnet-4.6")
 
 
 # ---------------------------------------------------------------------------
@@ -1955,7 +1934,7 @@ class TestSteer:
     def _session(
         self,
         *,
-        steer_protocol: str | None = "kiro",
+        extension: str = "kiro_v2",
         events: list[BrokerEvent] | None = None,
     ) -> ACPSession:
         async def sink(event: BrokerEvent) -> None:
@@ -1968,7 +1947,7 @@ class TestSteer:
             args=[],
             cwd=".",
             event_sink=sink,
-            steer_protocol=steer_protocol,
+            extension=get_extension(extension),
         )
         s._session_id = "sess-1"
         return s
@@ -1992,7 +1971,7 @@ class TestSteer:
         session._conn = MagicMock(ext_method=ext_method)
 
         with caplog.at_level(logging.DEBUG, logger="synth_acp.acp.session"):
-            assert await session.steer(sentinel) is True
+            assert await session.steer(sentinel) == SteerOutcome(status="queued")
 
         assert calls == [
             ("session/steer", {"sessionId": "sess-1", "message": sentinel})
@@ -2007,7 +1986,7 @@ class TestSteer:
         assert "agent=test" in accepted
         assert "session=sess-1" in accepted
         assert "elapsed_ms=" in accepted
-        assert "queued=True" in accepted
+        assert "status=queued" in accepted
         assert all(sentinel not in message for message in messages)
 
     async def test_steer_timeout_reports_warning_without_message_body(
@@ -2034,7 +2013,7 @@ class TestSteer:
         ):
             result = await asyncio.wait_for(session.steer(sentinel), timeout=1.0)
 
-        assert result is False
+        assert result.accepted is False
         warnings = [event for event in events if isinstance(event, BrokerError)]
         assert len(warnings) == 1
         assert warnings[0].severity == "warning"
@@ -2064,7 +2043,8 @@ class TestSteer:
         session._conn = MagicMock(ext_method=ext_method)
 
         with patch("synth_acp.acp.session._STEER_ACCEPTANCE_TIMEOUT", 0.01):
-            assert await asyncio.wait_for(session.steer("private"), timeout=1.0) is False
+            outcome = await asyncio.wait_for(session.steer("private"), timeout=1.0)
+            assert outcome.accepted is False
 
     @pytest.mark.parametrize(
         ("exc", "exception_type"),
@@ -2090,7 +2070,7 @@ class TestSteer:
         session._conn = MagicMock(ext_method=ext_method)
 
         with caplog.at_level(logging.DEBUG, logger="synth_acp.acp.session"):
-            assert await session.steer(sentinel) is False
+            assert (await session.steer(sentinel)).accepted is False
 
         assert session.state == AgentState.UNSTARTED
         messages = [record.getMessage() for record in caplog.records]
@@ -2111,10 +2091,10 @@ class TestSteer:
             called = True
             return {}
 
-        session = self._session(steer_protocol=None)
+        session = self._session(extension="standard")
         session._conn = MagicMock(ext_method=ext_method)
 
-        assert await session.steer("hello") is False
+        assert await session.steer("hello") == SteerOutcome(status="unsupported")
         assert called is False
 
 
@@ -2153,7 +2133,14 @@ class TestKiroMetadataAdaptor:
         async def sink(event: BrokerEvent) -> None:
             events.append(event)
 
-        s = ACPSession(agent_id="kiro-1", binary="echo", args=[], cwd=".", event_sink=sink)
+        s = ACPSession(
+            agent_id="kiro-1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            extension=get_extension("kiro_v2"),
+        )
         s._session_id = "sess-1"
         return s
 
@@ -2616,8 +2603,8 @@ class TestTimeoutIsTerminalEverywhere:
     """A bounded stall must not be traded for an unbounded one on the next prompt.
 
     asyncio.wait_for cancels only synth's local future; it sends no ACP cancellation, so
-    after a timeout the agent is still processing the request. set_mode's own docstring
-    records that a prompt concurrent with a live load_session hangs Kiro indefinitely, so
+    after a timeout the agent is still processing the request. set_config_option's
+    docstring records that a prompt concurrent with a live load_session hangs Kiro indefinitely, so
     any handler that reports a timeout and returns the session to IDLE has made the
     failure worse rather than better. Every timeout therefore ends the session.
     """
@@ -2696,7 +2683,9 @@ class TestTimeoutIsTerminalEverywhere:
         )
         conn.set_session_mode = AsyncMock()
         conn.load_session = MagicMock(side_effect=lambda **_kw: self._never())
-        session = self._session(events, agent_mode="plan")
+        session = self._session(
+            events, agent_mode="plan", extension=get_extension("kiro_v2")
+        )
 
         with patch("synth_acp.acp.session._HANDSHAKE_TIMEOUT", 0.3), \
              patch("synth_acp.acp.session._spawn_isolated_agent", self._spawn(conn, proc)):
@@ -2712,7 +2701,7 @@ class TestTimeoutIsTerminalEverywhere:
         else kills the process. Returning to IDLE here is the specific defect: the agent
         would present as usable while still processing a load."""
         events: list = []
-        session = self._session(events)
+        session = self._session(events, extension=get_extension("kiro_v2"))
         conn = MagicMock()
         conn.set_session_mode = AsyncMock()
         conn.set_session_model = AsyncMock()
@@ -2727,7 +2716,7 @@ class TestTimeoutIsTerminalEverywhere:
         await session._sm.transition(AgentState.IDLE)
 
         with patch("synth_acp.acp.session._HANDSHAKE_TIMEOUT", 0.3):
-            await asyncio.wait_for(session.set_mode("plan"), timeout=10)
+            await asyncio.wait_for(session.set_config_option("mode", "plan"), timeout=10)
 
         errors = [e for e in events if isinstance(e, BrokerError)]
         assert len(errors) == 1
@@ -2736,54 +2725,13 @@ class TestTimeoutIsTerminalEverywhere:
         # NOT IDLE: the caller's finally is guarded on CONFIGURING, so TERMINATED sticks.
         assert session.state == AgentState.TERMINATED
 
-    async def test_fork_session_that_never_answers_is_reported(self) -> None:
-        events: list = []
-        session = self._session(events)
-        conn = MagicMock()
-        conn.fork_session = MagicMock(side_effect=lambda **_kw: self._never())
-        session._conn = conn
-        session._session_id = "acp-1"
-        await session._sm.transition(AgentState.INITIALIZING)
-        await session._sm.transition(AgentState.IDLE)
-
-        with patch("synth_acp.acp.session._HANDSHAKE_TIMEOUT", 0.3):
-            result = await asyncio.wait_for(session.fork_with_agent("some-agent"), timeout=10)
-
-        assert result is None
-        errors = [e for e in events if isinstance(e, BrokerError)]
-        assert len(errors) == 1
-        assert "'session/fork' did not respond" in errors[0].message
-        assert session.state == AgentState.TERMINATED
-
-    async def test_fork_fallback_new_session_that_never_answers_is_reported(self) -> None:
-        """The -32002 fallback is a second session-creating request and needs its own bound."""
-        events: list = []
-        session = self._session(events)
-        conn = MagicMock()
-        conn.fork_session = AsyncMock(side_effect=RequestError(code=-32002, message="empty"))
-        conn.new_session = MagicMock(side_effect=lambda **_kw: self._never())
-        session._conn = conn
-        session._session_id = "acp-1"
-        await session._sm.transition(AgentState.INITIALIZING)
-        await session._sm.transition(AgentState.IDLE)
-
-        with patch("synth_acp.acp.session._HANDSHAKE_TIMEOUT", 0.3):
-            result = await asyncio.wait_for(session.fork_with_agent("some-agent"), timeout=10)
-
-        assert result is None
-        errors = [e for e in events if isinstance(e, BrokerError)]
-        assert len(errors) == 1
-        assert "'session/new' did not respond" in errors[0].message
-        assert session.state == AgentState.TERMINATED
-
-
 class TestTerminatedRestoreEmitsNoSuccess:
     """A terminated agent must not be announced as having switched.
 
-    _restore_mcp_servers terminates on a timeout but returns normally, so both callers'
-    success paths run unless guarded. The silent failure is a WRONG EVENT rather than a
-    missing one: subscribers, the UI and the journal all recorded AgentModeChanged -- and
-    through set_config_option, ConfigOptionChanged too -- for a session the same call had
+    _restore_mcp_servers terminates on a timeout but returns normally, so its caller's
+    success path runs unless guarded. The silent failure is a WRONG EVENT rather than a
+    missing one: subscribers, the UI and the journal all recorded AgentModeChanged and
+    ConfigOptionChanged for a session the same call had
     just killed. Asserting the error and the terminal state is not enough, because the
     false success passes that.
     """
@@ -2793,7 +2741,12 @@ class TestTerminatedRestoreEmitsNoSuccess:
             events.append(e)
 
         session = ACPSession(
-            agent_id="agent-1", binary="fake", args=[], cwd=".", event_sink=sink
+            agent_id="agent-1",
+            binary="fake",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            extension=get_extension("kiro_v2"),
         )
         conn = MagicMock()
         conn.set_session_mode = AsyncMock()
@@ -2809,20 +2762,6 @@ class TestTerminatedRestoreEmitsNoSuccess:
         session._proc = MagicMock(returncode=None, pid=-1)
         session._current_mode_id = "default"
         return session
-
-    async def test_set_mode_emits_no_mode_change_after_terminating(self) -> None:
-        events: list = []
-        session = self._stalled_session(events)
-        await session._sm.transition(AgentState.INITIALIZING)
-        await session._sm.transition(AgentState.IDLE)
-
-        with patch("synth_acp.acp.session._HANDSHAKE_TIMEOUT", 0.3):
-            await asyncio.wait_for(session.set_mode("plan"), timeout=10)
-
-        assert session.state == AgentState.TERMINATED
-        assert [e for e in events if isinstance(e, AgentModeChanged)] == []
-        # The recorded mode must not move either, or a later read reports the switch.
-        assert session.current_mode_id == "default"
 
     async def test_set_config_option_emits_no_change_after_terminating(self) -> None:
         events: list = []
@@ -2862,7 +2801,7 @@ class TestTerminatedRestoreEmitsNoSuccess:
         await session._sm.transition(AgentState.INITIALIZING)
         await session._sm.transition(AgentState.IDLE)
 
-        await asyncio.wait_for(session.set_mode("plan"), timeout=10)
+        await asyncio.wait_for(session.set_config_option("mode", "plan"), timeout=10)
 
         assert session.state == AgentState.IDLE
         assert [e.mode_id for e in events if isinstance(e, AgentModeChanged)] == ["plan"]
@@ -2909,46 +2848,6 @@ class TestConfigRequestsAreBounded:
         assert f"'{step}' did not respond" in errors[0].message
         assert "was terminated" in errors[0].message
         assert session.state == AgentState.TERMINATED
-
-    async def test_set_mode_stalling_on_set_session_mode(self) -> None:
-        events: list = []
-        session = self._session(events)
-        session._conn.set_session_mode = MagicMock(side_effect=lambda **_kw: self._never())
-        await self._idle(session)
-
-        with patch("synth_acp.acp.session._HANDSHAKE_TIMEOUT", 0.3):
-            await asyncio.wait_for(session.set_mode("plan"), timeout=10)
-
-        self._assert_terminated_with(events, session, "session/set_mode")
-        assert [e for e in events if isinstance(e, AgentModeChanged)] == []
-        assert session.current_mode_id == "default"
-
-    async def test_set_mode_stalling_on_the_model_preserving_call(self) -> None:
-        """set_mode preserves the current model with a second request. A timeout there is
-        the one a reader is most likely to miss, since the mode call already succeeded."""
-        events: list = []
-        session = self._session(events)
-        session._conn.set_session_model = MagicMock(side_effect=lambda **_kw: self._never())
-        await self._idle(session)
-
-        with patch("synth_acp.acp.session._HANDSHAKE_TIMEOUT", 0.3):
-            await asyncio.wait_for(session.set_mode("plan"), timeout=10)
-
-        self._assert_terminated_with(events, session, "session/set_model")
-        assert [e for e in events if isinstance(e, AgentModeChanged)] == []
-
-    async def test_set_model_stalling(self) -> None:
-        events: list = []
-        session = self._session(events)
-        session._conn.set_session_model = MagicMock(side_effect=lambda **_kw: self._never())
-        await self._idle(session)
-
-        with patch("synth_acp.acp.session._HANDSHAKE_TIMEOUT", 0.3):
-            await asyncio.wait_for(session.set_model("new-model"), timeout=10)
-
-        self._assert_terminated_with(events, session, "session/set_model")
-        assert [e for e in events if isinstance(e, AgentModelChanged)] == []
-        assert session.current_model_id == "old-model"
 
     async def test_native_set_config_option_stalling(self) -> None:
         """The native branch has its own except Exception that reports a warning and
@@ -3022,7 +2921,7 @@ class TestConfigRequestsAreBounded:
         session = self._session(events)
         await self._idle(session)
 
-        await asyncio.wait_for(session.set_mode("plan"), timeout=10)
+        await asyncio.wait_for(session.set_config_option("mode", "plan"), timeout=10)
 
         assert session.state == AgentState.IDLE
         assert [e.mode_id for e in events if isinstance(e, AgentModeChanged)] == ["plan"]
@@ -3033,7 +2932,7 @@ class TestConfigRequestsAreBounded:
         session = self._session(events)
         await self._idle(session)
 
-        await asyncio.wait_for(session.set_model("new-model"), timeout=10)
+        await asyncio.wait_for(session.set_config_option("model", "new-model"), timeout=10)
 
         assert session.state == AgentState.IDLE
         assert [e.model_id for e in events if isinstance(e, AgentModelChanged)] == ["new-model"]
@@ -3069,3 +2968,388 @@ class TestTurnRequestsStayUnbounded:
         assert "ext_method" not in wrapped
         # Guards against the assertion passing because _handshake vanished entirely.
         assert {"initialize", "new_session"} <= wrapped
+
+
+class TestStandardExtensionSession:
+    """A harness with no extension line runs on the base AcpExtension."""
+
+    def _session(self, events: list[BrokerEvent], extension: str = "standard") -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        s = ACPSession(
+            agent_id="agent-1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            extension=get_extension(extension),
+        )
+        s._session_id = "sess-1"
+        return s
+
+    @pytest.mark.parametrize("extension", ["standard", "claude", "kiro_v2"])
+    async def test_ext_method_answers_method_not_found(self, extension: str) -> None:
+        """An extension that answered an unknown agent request with anything but
+        -32601 would be read by the agent as success."""
+        session = self._session([], extension)
+        with pytest.raises(RequestError) as exc_info:
+            await session.ext_method("vendor/unknown", {"sessionId": "sess-1"})
+        assert exc_info.value.code == -32601
+
+    async def test_unknown_notification_dropped_and_steer_unsupported(self) -> None:
+        """A standard harness must not interpret Kiro's payload, and its steer must
+        not claim acceptance, or the broker would drop the message."""
+        events: list[BrokerEvent] = []
+        session = self._session(events)
+        calls: list[str] = []
+
+        async def ext_method(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            calls.append(method)
+            return {"queued": True}
+
+        session._conn = MagicMock(ext_method=ext_method)
+
+        await session.ext_notification(
+            "kiro.dev/metadata", {"sessionId": "sess-1", "contextUsagePercentage": 40.0}
+        )
+
+        assert events == []
+        assert await session.steer("hello") == SteerOutcome(status="unsupported")
+        assert calls == []
+
+
+class _SignalExtension(AcpExtension):
+    """Test double reporting fixed hints and a rejected profile."""
+
+    name: ClassVar[str] = "test-signals"
+
+    def __init__(self, hints: UpdateHints | None = None) -> None:
+        self._hints = hints or UpdateHints()
+
+    def interpret_update(self, update: Any) -> UpdateHints:
+        return self._hints
+
+    def check_profile(self, agent_mode: str, cwd: Path) -> ProfileUnavailable | None:
+        return ProfileUnavailable(requested=agent_mode, fallback="vibe", reason="cli_only_agent")
+
+
+class TestExtensionSignals:
+    """Extension signals reach the sink as existing events, under ACPSession's guards."""
+
+    def _mocks(self) -> tuple[Any, Any]:
+        conn = AsyncMock()
+        conn.initialize.return_value = MagicMock(agent_capabilities=None)
+        resp = MagicMock(session_id="sess-new", modes=None, models=None, config_options=None)
+        conn.new_session.return_value = resp
+        proc = MagicMock(returncode=0)
+        proc.wait = AsyncMock(return_value=0)
+        proc.stdin = MagicMock(is_closing=MagicMock(return_value=True))
+        return conn, proc
+
+    def _spawn(self, conn: Any, proc: Any) -> Any:
+        @asynccontextmanager
+        async def fake_spawn(*_a: Any, **_kw: Any) -> Any:
+            yield conn, proc, _StderrTail()
+
+        return fake_spawn
+
+    def _session(self, events: list[BrokerEvent], ext: AcpExtension) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        return ACPSession(
+            agent_id="agent-1",
+            binary="fake",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            agent_mode="code-researcher",
+            extension=ext,
+        )
+
+    @staticmethod
+    def _warnings(events: list[BrokerEvent]) -> list[BrokerError]:
+        return [e for e in events if isinstance(e, BrokerError) and e.severity == "warning"]
+
+    async def test_profile_unavailable_warns_once_per_run_and_launch_continues(self) -> None:
+        """A rejected profile must warn exactly once and still reach IDLE, including
+        on a restore whose load fails and falls back to a new session."""
+        events: list[BrokerEvent] = []
+        conn, proc = self._mocks()
+        session = self._session(events, _SignalExtension())
+        with patch("synth_acp.acp.session._spawn_isolated_agent", self._spawn(conn, proc)):
+            await session.run()
+
+        warnings = self._warnings(events)
+        assert len(warnings) == 1
+        assert "code-researcher" in warnings[0].message
+        assert "vibe" in warnings[0].message
+        assert "cli_only_agent" in warnings[0].message
+        idle = [e for e in events if isinstance(e, AgentStateChanged)]
+        assert AgentState.IDLE in [e.new_state for e in idle]
+
+        events.clear()
+        conn, proc = self._mocks()
+        conn.load_session.side_effect = RuntimeError("session not found")
+        session = self._session(events, _SignalExtension())
+        with patch("synth_acp.acp.session._spawn_isolated_agent", self._spawn(conn, proc)):
+            await session.run_restored("old-session")
+
+        profile_warnings = [w for w in self._warnings(events) if "code-researcher" in w.message]
+        assert len(profile_warnings) == 1
+        conn.new_session.assert_awaited_once()
+        assert AgentState.IDLE in [
+            e.new_state for e in events if isinstance(e, AgentStateChanged)
+        ]
+
+    async def test_claude_unknown_agent_warns_once_and_logs_adaptor_version(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """claude-agent-acp runs an unknown agent name as the default agent without error,
+        so the warning is the user's only signal; the logged adaptor version is how a
+        later selection regression gets traced to an adaptor upgrade."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        events: list[BrokerEvent] = []
+        conn, proc = self._mocks()
+        conn.initialize.return_value = MagicMock(
+            agent_capabilities=None,
+            agent_info=Implementation(name="@agentclientprotocol/claude-agent-acp", version="0.81.2"),
+        )
+
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="fake",
+            args=[],
+            cwd=str(tmp_path),
+            event_sink=sink,
+            agent_mode="no-such-agent",
+            extension=get_extension("claude"),
+        )
+        with (
+            caplog.at_level(logging.INFO, logger="synth_acp.acp.session"),
+            patch("synth_acp.acp.session._spawn_isolated_agent", self._spawn(conn, proc)),
+        ):
+            await session.run()
+
+        assert [w.message for w in self._warnings(events)] == [
+            "Agent profile 'no-such-agent' is unavailable (no Claude agent named "
+            "'no-such-agent' found in user, project or plugin agents); using default."
+        ]
+        assert AgentState.IDLE in [e.new_state for e in events if isinstance(e, AgentStateChanged)]
+        assert "agent-1: agent @agentclientprotocol/claude-agent-acp 0.81.2" in caplog.messages
+
+    async def test_update_signal_maps_to_usage_updated_from_the_emission_task(self) -> None:
+        """Field values must carry over unchanged, and the signal must not be awaited
+        ahead of task creation, where it would reorder chunks."""
+        events: list[BrokerEvent] = []
+        hints = UpdateHints(
+            signals=(ContextUsage(used=7, size=200, cost_amount=1.5, cost_currency="USD"),)
+        )
+        session = self._session(events, _SignalExtension(hints))
+        session._session_id = "sess-1"
+
+        await session.session_update("sess-1", _msg_chunk("hi"))
+        assert events == []
+        await session._drain_pending_emissions()
+
+        assert [e.model_dump(exclude={"timestamp"}) for e in events] == [
+            {
+                "agent_id": "agent-1",
+                "size": 200,
+                "used": 7,
+                "cost_amount": 1.5,
+                "cost_currency": "USD",
+            },
+            {"agent_id": "agent-1", "chunk": "hi"},
+        ]
+        assert [type(e) for e in events] == [UsageUpdated, MessageChunkReceived]
+
+    async def test_replayed_update_emits_nothing(self) -> None:
+        """A replayed usage signal would fire the handoff nudge on old data, and a
+        replayed chunk would duplicate the journal."""
+        signal = (ContextUsage(used=90, size=100),)
+        events: list[BrokerEvent] = []
+        session = self._session(events, _SignalExtension(UpdateHints(is_replay=True, signals=signal)))
+        session._session_id = "sess-1"
+        await session.session_update("sess-1", _msg_chunk("old"))
+        await session._drain_pending_emissions()
+        assert events == []
+
+        session = self._session(events, _SignalExtension(UpdateHints(signals=signal)))
+        session._session_id = "sess-1"
+        session._suppress_history_replay = True
+        await session.session_update("sess-1", _msg_chunk("old"))
+        await session._drain_pending_emissions()
+        assert events == []
+
+
+class TestModeSwitchReloadGate:
+    """Only an engine that drops MCP servers on a mode switch (reload_after_mode_switch)
+    gets the Kiro load_session reload. On any other harness that load replays the whole
+    history for nothing, with every other test still green."""
+
+    def _mode_session(self, events: list[BrokerEvent]) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        return ACPSession(
+            agent_id="agent-1",
+            binary="fake",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            mcp_servers=[McpServerStdio(name="synth-mcp", command="synth-mcp", args=[], env=[])],
+            agent_mode="code",
+            extension=get_extension("standard"),
+        )
+
+    async def test_launch_mode_switch_skips_reload_on_standard_extension(self) -> None:
+        events: list[BrokerEvent] = []
+        conn = AsyncMock()
+        conn.initialize.return_value = MagicMock(agent_capabilities=None)
+        conn.new_session.return_value = MagicMock(
+            session_id="sess-new",
+            modes=MagicMock(
+                available_modes=[SimpleNamespace(id="code", name="Code", description=None)],
+                current_mode_id="chat",
+            ),
+            models=None,
+            config_options=None,
+        )
+        proc = MagicMock(returncode=0)
+        proc.wait = AsyncMock(return_value=0)
+        proc.stdin = MagicMock(is_closing=MagicMock(return_value=True))
+
+        @asynccontextmanager
+        async def fake_spawn(*_a: Any, **_kw: Any) -> Any:
+            yield conn, proc, _StderrTail()
+
+        session = self._mode_session(events)
+        with patch("synth_acp.acp.session._spawn_isolated_agent", fake_spawn):
+            await session.run()
+
+        conn.set_session_mode.assert_awaited_once_with(mode_id="code", session_id="sess-new")
+        conn.load_session.assert_not_awaited()
+        assert [e.mode_id for e in events if isinstance(e, AgentModeChanged)] == ["code"]
+
+    async def test_config_mode_switch_skips_reload_on_standard_extension(self) -> None:
+        events: list[BrokerEvent] = []
+        session = self._mode_session(events)
+        conn = AsyncMock()
+        session._conn = conn
+        session._session_id = "sess-1"
+        session._has_native_config_options = False
+        await session._sm.transition(AgentState.INITIALIZING)
+        await session._sm.transition(AgentState.IDLE)
+
+        await session.set_config_option("mode", "plan")
+
+        conn.set_session_mode.assert_awaited_once_with(mode_id="plan", session_id="sess-1")
+        conn.load_session.assert_not_awaited()
+        assert [e.mode_id for e in events if isinstance(e, AgentModeChanged)] == ["plan"]
+        assert session.state == AgentState.IDLE
+
+
+class TestRestoreOrder:
+    """run_restored: session/resume when advertised, else the extension's load."""
+
+    @staticmethod
+    def _conn(*, resume: bool) -> Any:
+        from acp.schema import InitializeResponse
+
+        caps = {"sessionCapabilities": {"resume": {}}} if resume else {}
+        conn = AsyncMock()
+        conn.initialize.return_value = InitializeResponse.model_validate(
+            {"protocolVersion": 1, "agentCapabilities": caps}
+        )
+        resp = MagicMock(session_id="sess-new", modes=None, models=None, config_options=None)
+        conn.new_session.return_value = resp
+        conn.load_session.return_value = resp
+        conn.resume_session.return_value = resp
+        return conn
+
+    @staticmethod
+    def _session(events: list[BrokerEvent], extension: str) -> ACPSession:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        return ACPSession(
+            agent_id="agent-1",
+            binary="fake",
+            args=[],
+            cwd="/work",
+            event_sink=sink,
+            agent_mode="plan",
+            extension=get_extension(extension),
+        )
+
+    @staticmethod
+    async def _run(session: ACPSession, conn: Any) -> None:
+        proc = MagicMock(returncode=0)
+        proc.wait = AsyncMock(return_value=0)
+
+        @asynccontextmanager
+        async def fake_spawn(*_a: Any, **_kw: Any) -> Any:
+            yield conn, proc, _StderrTail()
+
+        with patch("synth_acp.acp.session._spawn_isolated_agent", fake_spawn):
+            await session.run_restored("sess-saved")
+
+    async def test_advertised_resume_is_used_instead_of_load(self) -> None:
+        """Silent failure: Claude keeps paying a full history replay on every restore,
+        or mcp_servers goes out as null and the resumed session has no synth-mcp."""
+        events: list[BrokerEvent] = []
+        session = self._session(events, "claude")
+        conn = self._conn(resume=True)
+
+        async def resume_session(**kwargs: Any) -> Any:
+            await session.session_update("sess-saved", _msg_chunk("old"))
+            await asyncio.sleep(0)
+            return conn.resume_session.return_value
+
+        conn.resume_session.side_effect = resume_session
+        await self._run(session, conn)
+
+        conn.load_session.assert_not_awaited()
+        conn.new_session.assert_not_awaited()
+        kwargs = conn.resume_session.await_args.kwargs
+        assert kwargs == {
+            "session_id": "sess-saved",
+            "cwd": "/work",
+            "mcp_servers": [],
+            "claudeCode": {"options": {"extraArgs": {"agent": "plan"}}},
+        }
+        assert [e for e in events if isinstance(e, MessageChunkReceived)] == []
+
+    async def test_no_resume_loads_with_the_extension_load_meta(self) -> None:
+        """Kiro v3 advertises no resume; without noReplay its load replays history."""
+        events: list[BrokerEvent] = []
+        session = self._session(events, "kiro_v3")
+        conn = self._conn(resume=False)
+        await self._run(session, conn)
+
+        conn.resume_session.assert_not_awaited()
+        assert conn.load_session.await_args.kwargs["kiro"] == {"noReplay": True}
+
+    async def test_failed_resume_falls_back_to_new_session(self) -> None:
+        """Claude answers an unknown id with -32002; the agent must still start."""
+        events: list[BrokerEvent] = []
+        session = self._session(events, "claude")
+        conn = self._conn(resume=True)
+        conn.resume_session.side_effect = RequestError(-32002, "Resource not found")
+        await self._run(session, conn)
+
+        conn.new_session.assert_awaited_once()
+        assert session.session_id == "sess-new"
+        # "plan" is not a discovered Claude agent, so the profile check adds its own
+        # warning; count only the restore warning.
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, BrokerError) and e.severity == "warning" and "starting fresh" in e.message
+        ]
+        assert len(warnings) == 1

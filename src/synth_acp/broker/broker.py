@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 
@@ -21,8 +22,7 @@ from synth_acp.broker.permissions import PermissionEngine
 from synth_acp.broker.prompt_queue import PromptQueue, QueuedItem
 from synth_acp.broker.registry import AgentRegistry
 from synth_acp.db import AgentRenameResult, configure_connection, ensure_schema_sync
-from synth_acp.discovery import DiscoveredAgent
-from synth_acp.models.agent import AgentConfig, AgentMode, AgentModel, AgentState
+from synth_acp.models.agent import AgentConfig, AgentMode, AgentModel, AgentState, DiscoveredAgent
 from synth_acp.models.commands import (
     BrokerCommand,
     CancelTurn,
@@ -33,6 +33,7 @@ from synth_acp.models.commands import (
     HoldQueue,
     LaunchAgent,
     ReleaseQueue,
+    RequestProfileSwitch,
     RespondPermission,
     RestoreSession,
     ResurrectAgent,
@@ -46,9 +47,11 @@ from synth_acp.models.config import (
     MessageKind,
     SessionConfig,
     format_handoff_nudge,
+    format_handoff_switch,
     format_mcp_message,
 )
 from synth_acp.models.events import (
+    AgentHandedOff,
     AgentStateChanged,
     AgentThoughtReceived,
     BrokerError,
@@ -57,15 +60,33 @@ from synth_acp.models.events import (
     MessageSteered,
     PermissionAutoResolved,
     PermissionRequested,
+    ProfileSwitchChanged,
     QueueItemSnapshot,
     QueueUpdated,
     ToolCallUpdated,
     TurnComplete,
     UsageUpdated,
 )
-from synth_acp.models.permissions import PermissionDecision, PermissionRule
+from synth_acp.models.permissions import (
+    PermissionDecision,
+    PermissionRule,
+    permission_rule_key,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _auto_approve_matches(pattern: str, tool_identity: str | None, title: str) -> bool:
+    """Whether one ``auto_approve_tools`` pattern approves a permission request.
+
+    With a known ``"<server>/<tool>"`` identity the pattern must equal the server
+    name or the full identity; the title is not consulted, because a shell request's
+    title is the raw command text and can contain any pattern. Without an identity
+    this falls back to the legacy substring match on the title.
+    """
+    if tool_identity is not None:
+        return pattern in (tool_identity, tool_identity.split("/", 1)[0])
+    return pattern in title
 
 
 class ChunkLossStats(BaseModel):
@@ -78,6 +99,14 @@ class ChunkLossStats(BaseModel):
     warned_agents: frozenset[str]
     armed_agents: frozenset[str]
     last_drop_at: float | None
+
+
+class _PendingSwitch(NamedTuple):
+    """A profile switch the user asked for, waiting for the agent to hand off."""
+
+    switch_id: int
+    agent_mode: str
+    instructions: str | None
 
 
 class ACPBroker:
@@ -121,6 +150,17 @@ class ACPBroker:
         # Agents already nudged to consider handoff. One nudge per agent per
         # process: PREDECESSOR-OWNED, so apply_handoff_rekey moves it.
         self._nudged_agents: set[str] = set()
+        # Profile switches requested through RequestProfileSwitch, one per agent. A
+        # switch is ARMED once the prompt carrying its request has started, so only a
+        # TurnComplete after that point means the agent saw it and did not hand off.
+        # Every read and write is synchronous: lifecycle.handoff emits into _sink while
+        # holding the agent lock, so none of this may take that lock.
+        self._pending_switches: dict[str, _PendingSwitch] = {}
+        self._armed_switches: set[int] = set()
+        self._switch_seq: int = 0
+        # Set by apply_handoff_rekey, consumed by _sink on the AgentHandedOff that
+        # follows it: agent_id -> (target, switched, request item removed).
+        self._handed_off_switches: dict[str, tuple[str, bool, bool]] = {}
         self._last_drop_at: float | None = None
         self._is_composing: Callable[[str], bool] = lambda _: False
         # One serialized tail for every agent command, so nothing can overtake an
@@ -165,10 +205,7 @@ class ACPBroker:
             case SetAgentModel(agent_id=aid, model_id=mid):
                 await lifecycle.set_config_option(aid, "model", mid)
             case SetConfigOption(agent_id=aid, config_id=cid, value=val):
-                if cid == "agent" and self._registry.get_agent_mode_target(aid) == "meta_agent":
-                    await lifecycle.set_agent(aid, str(val))
-                else:
-                    await lifecycle.set_config_option(aid, cid, val)
+                await lifecycle.set_config_option(aid, cid, val)
             case RestoreSession(broker_session_id=sid):
                 await self.restore_session(sid)
             case HoldQueue():
@@ -187,9 +224,21 @@ class ACPBroker:
                 await self._emit_queue_state(aid)
                 await self._try_drain(aid)
             case DeleteQueueItem(agent_id=aid, item_id=iid):
+                pending = self._pending_switches.get(aid)
+                deleted = next((i for i in self._prompt_queue.items(aid) if i.id == iid), None)
                 self._prompt_queue.delete(aid, iid)
+                if (
+                    pending is not None
+                    and deleted is not None
+                    and deleted.switch_id == pending.switch_id
+                ):
+                    # The user withdrew the request before it ran: no warning.
+                    self._end_switch(aid)
+                    await self._sink(ProfileSwitchChanged(agent_id=aid, pending_agent_mode=None))
                 await self._emit_queue_state(aid)
                 await self._try_drain(aid)
+            case RequestProfileSwitch(agent_id=aid, agent_mode=mode, instructions=instr):
+                await self._request_profile_switch(aid, mode, instr)
 
     # ------------------------------------------------------------------
     # Prompt queue — unified delivery for user and MCP messages
@@ -203,6 +252,7 @@ class ACPBroker:
         from_agent: str | None = None,
         *,
         steerable: bool = False,
+        switch_id: int | None = None,
     ) -> None:
         """Single entry point for all message submission (user and MCP).
 
@@ -216,6 +266,9 @@ class ACPBroker:
         behavior. Only ``_on_mcp_message`` passes True — the dynamic-child
         startup path calls ``submit_prompt(source="mcp")`` directly, bypassing
         that seam, so a child's launch prompt is never steered.
+
+        ``switch_id`` tags a profile-switch request; the switch arms when this text
+        actually starts as a prompt, whether now or later from the queue.
         """
         lifecycle = await self._ensure_lifecycle()
         session = self._registry.get_session(agent_id)
@@ -235,6 +288,7 @@ class ACPBroker:
             if idle and empty and not self._is_composing(agent_id) and (
                 await lifecycle.prompt(agent_id, text)
             ):
+                self._arm_switch(agent_id, switch_id)
                 return
 
         if steerable and not idle and await self._try_steer(agent_id, text, from_agent):
@@ -249,6 +303,7 @@ class ACPBroker:
             source=source,  # type: ignore[arg-type]
             from_agent=from_agent,
             steerable=steerable,
+            switch_id=switch_id,
         )
         self._prompt_queue.enqueue(agent_id, item)
         drained = await self._try_drain(agent_id)
@@ -262,14 +317,14 @@ class ACPBroker:
         False for ``kind == "system"`` unconditionally (join/exit notifications
         are explicitly "no action required"), false when the resolved
         ``messages_interrupt`` setting is false, and false when the agent's
-        harness declares no steer protocol.
+        harness engine cannot steer (``capabilities.steer``).
         """
         if kind == "system":
             return False
         if not self._config.settings.messages_interrupt:
             return False
         session = self._registry.get_session(agent_id)
-        return session is not None and session.steer_protocol is not None
+        return session is not None and session.capabilities.steer
 
     async def _try_steer(self, agent_id: str, text: str, from_agent: str | None) -> bool:
         """Attempt in-turn delivery. Returns True if the message was delivered.
@@ -303,7 +358,8 @@ class ACPBroker:
                 return False
             pending = self._prompt_queue.pop_steerable(agent_id)
             payload = self._format_steer_text([i.text for i in pending] + [text])
-            if not await session.steer(payload):
+            outcome = await session.steer(payload)
+            if not outcome.accepted:
                 self._prompt_queue.requeue_front(agent_id, pending)
                 return False
         await self._sink(MessageSteered(agent_id=agent_id, from_agent=from_agent, text=payload))
@@ -349,6 +405,7 @@ class ACPBroker:
         if not await lifecycle.prompt(agent_id, item.text, first_prompt=item.first_prompt):
             self._restore_refused_item(agent_id, item)
             return False
+        self._arm_switch(agent_id, item.switch_id)
         await self._emit_queue_state(agent_id)
         return True
 
@@ -369,6 +426,7 @@ class ACPBroker:
         if not await lifecycle.prompt(agent_id, item.text, first_prompt=item.first_prompt):
             self._restore_refused_item(agent_id, item)
             return False
+        self._arm_switch(agent_id, item.switch_id)
         await self._emit_queue_state(agent_id)
         return True
 
@@ -451,11 +509,13 @@ class ACPBroker:
     def get_agent_display_name(self, agent_id: str) -> str | None:
         """Return a short display name for the agent's configured mode, or None.
 
-        For harnesses where agent_mode_target is 'meta_agent' (e.g. Claude Code),
-        the config_options 'mode' category represents the permission mode, not the
-        agent. This method returns the actual agent name (short form) in that case.
+        For harnesses that switch agents by handoff (``profile_switch == "handoff"``,
+        e.g. Claude Code), the config_options 'mode' category represents the
+        permission mode, not the agent. This method returns the actual agent name
+        (short form) in that case.
         """
-        if self._registry.get_agent_mode_target(agent_id) == "meta_agent":
+        caps = self._registry.get_capabilities(agent_id)
+        if caps is not None and caps.profile_switch == "handoff":
             mode = self._registry.get_agent_mode(agent_id)
             if mode:
                 return mode.split(":")[-1]
@@ -499,8 +559,12 @@ class ACPBroker:
             conn.row_factory = sqlite3.Row
             try:
                 configure_connection(conn)
+                # Migrate first: this runs before the message bus does, and the SELECT
+                # reads harness_variant, which an older database lacks.
+                ensure_schema_sync(conn)
                 return conn.execute(
-                    "SELECT agent_id, acp_session_id, harness, agent_mode, cwd, parent "
+                    "SELECT agent_id, acp_session_id, harness, agent_mode, cwd, parent, "
+                    "harness_variant "
                     "FROM agents WHERE session_id = ? AND status IN ('restorable', 'active') "
                     "ORDER BY parent NULLS FIRST",
                     (broker_session_id,),
@@ -542,6 +606,7 @@ class ACPBroker:
                 agent_mode=row["agent_mode"],
                 cwd=row["cwd"],
                 parent=row["parent"],
+                harness_variant=row["harness_variant"],
             )
             if row["parent"]:
                 self._registry.set_parent(aid, row["parent"])
@@ -699,7 +764,11 @@ class ACPBroker:
                         )
                         return
             # Auto-resolve if a persisted rule matches
-            decision = self._permission_engine.check(event.agent_id, event.kind, self._session_id)
+            decision = self._permission_engine.check(
+                event.agent_id,
+                permission_rule_key(event.kind, event.tool_identity),
+                self._session_id,
+            )
             if decision is not None:
                 session = self._registry.get_session(event.agent_id)
                 if session:
@@ -760,6 +829,13 @@ class ACPBroker:
 
         # Journal UI-visible events for session restore.
         self._buffer_journal_event(event)
+
+        if isinstance(event, AgentStateChanged) and event.new_state == AgentState.TERMINATED:
+            await self._end_switch_on_termination(event.agent_id)
+        elif isinstance(event, AgentHandedOff):
+            await self._finish_handed_off_switch(event.agent_id)
+        elif isinstance(event, TurnComplete):
+            await self._check_switch_after_turn(event.agent_id)
 
         if isinstance(event, AgentStateChanged) and event.new_state == AgentState.IDLE:
             if self._message_bus:
@@ -988,6 +1064,18 @@ class ACPBroker:
         # AUTHORED VALUE whose KEY must not move: the queue is keyed by recipient.
         self._prompt_queue.rename_author(old, new)
 
+        # A pending profile switch ends with the handoff. The handoff command already
+        # read it (with its instructions) before this ran; result.agent_mode is the
+        # successor's, so this is where whether the switch happened is known.
+        switch, removed = self._end_switch(old)
+        if switch is not None:
+            self._handed_off_switches[old] = (
+                switch.agent_mode,
+                # A NULL successor agent_mode is the default agent, target "".
+                (result.agent_mode or "") == switch.agent_mode,
+                removed,
+            )
+
         # Already run once from _sink on the predecessor's TERMINATED event, and
         # idempotent. Reused rather than duplicated.
         self._cleanup_agent_state(old)
@@ -1018,6 +1106,197 @@ class ACPBroker:
                     first_prompt=True,
                 )
             ],
+        )
+
+    # ------------------------------------------------------------------
+    # Profile switch by agent-written handoff
+    # ------------------------------------------------------------------
+
+    def pending_profile_switch(self, agent_id: str) -> str | None:
+        """The target agent_mode of the agent's pending switch, or None.
+
+        Used by the UI when it rebuilds a feed.
+        """
+        switch = self._pending_switches.get(agent_id)
+        return switch.agent_mode if switch else None
+
+    async def _request_profile_switch(
+        self, agent_id: str, agent_mode: str, instructions: str | None
+    ) -> None:
+        """Ask the agent to hand off to ``agent_mode``, and track the switch until it ends.
+
+        The request is a prompt from 'synth' in the notification envelope, tagged with
+        the switch id and never steered, so the switch arms only when that prompt starts
+        (see ``_arm_switch``). It is not a messages row: the bus marks a row delivered
+        as soon as it is queued, which cannot tell "queued behind a busy turn" from
+        "started".
+        """
+        session = self._registry.get_session(agent_id)
+        if session is None:
+            await self._sink(
+                BrokerError(agent_id=agent_id, message=f"No session for '{agent_id}'", severity="warning")
+            )
+            return
+        pending = self._pending_switches.get(agent_id)
+        if pending is not None:
+            await self._sink(
+                BrokerError(
+                    agent_id=agent_id,
+                    message=f"A switch of '{agent_id}' to '{pending.agent_mode}' is already pending",
+                    severity="warning",
+                )
+            )
+            return
+        # "" is the harness default agent: always available, nothing to check.
+        unavailable = (
+            session.extension.check_profile(agent_mode, Path(self._registry.get_cwd(agent_id)))
+            if agent_mode
+            else None
+        )
+        if unavailable is not None:
+            await self._sink(
+                BrokerError(
+                    agent_id=agent_id,
+                    message=f"Cannot switch '{agent_id}' to '{agent_mode}': {unavailable.reason}",
+                    severity="warning",
+                )
+            )
+            return
+        # Claim with no await since the pending check above.
+        self._switch_seq += 1
+        switch = _PendingSwitch(self._switch_seq, agent_mode, instructions or None)
+        self._pending_switches[agent_id] = switch
+
+        await self._sink(ProfileSwitchChanged(agent_id=agent_id, pending_agent_mode=agent_mode))
+        settings = self._config.settings
+        body = format_handoff_switch(
+            settings.handoff_switch_template,
+            agent_id=agent_id,
+            agent_mode=agent_mode,
+            instructions=switch.instructions,
+        )
+        text = format_mcp_message(
+            settings.hooks.on_mcp_message,
+            from_agent="synth",
+            to_agent=agent_id,
+            body=body,
+            kind="notification",
+        )
+        await self.submit_prompt(
+            agent_id,
+            text,
+            source="mcp",
+            from_agent="synth",
+            steerable=False,
+            switch_id=switch.switch_id,
+        )
+
+    def _arm_switch(self, agent_id: str, switch_id: int | None) -> None:
+        """Arm the agent's pending switch if the prompt that just started carries it.
+
+        Called right after ``lifecycle.prompt`` returned True, with no await in between.
+        ``prompt`` only creates the prompt task, so the new turn's TurnComplete cannot
+        have run yet.
+        """
+        switch = self._pending_switches.get(agent_id)
+        if switch_id is not None and switch is not None and switch.switch_id == switch_id:
+            self._armed_switches.add(switch_id)
+
+    def _end_switch(self, agent_id: str) -> tuple[_PendingSwitch | None, bool]:
+        """End the agent's pending switch. Synchronous and lock-free.
+
+        Also removes the request prompt if it is still queued, so a request that never
+        ran cannot reach a successor or a resurrected agent afterwards.
+
+        Returns:
+            The switch that ended (or None), and whether a queued request was removed.
+        """
+        switch = self._pending_switches.pop(agent_id, None)
+        if switch is None:
+            return None, False
+        self._armed_switches.discard(switch.switch_id)
+        removed = False
+        for item in self._prompt_queue.items(agent_id):
+            if item.switch_id == switch.switch_id:
+                self._prompt_queue.delete(agent_id, item.id)
+                removed = True
+        return switch, removed
+
+    async def _end_switch_on_termination(self, agent_id: str) -> None:
+        """End a pending switch when its agent terminates without handing off.
+
+        During a handoff the predecessor's TERMINATED arrives first, under the original
+        id, while the handoff is in flight. It is skipped so the AgentHandedOff that
+        follows decides the outcome.
+        """
+        if agent_id not in self._pending_switches or self.handoff_in_flight(agent_id):
+            return
+        _, removed = self._end_switch(agent_id)
+        await self._sink(ProfileSwitchChanged(agent_id=agent_id, pending_agent_mode=None))
+        if removed:
+            await self._emit_queue_state(agent_id)
+
+    async def _finish_handed_off_switch(self, agent_id: str) -> None:
+        """Report the end of a switch that ``apply_handoff_rekey`` closed."""
+        outcome = self._handed_off_switches.pop(agent_id, None)
+        if outcome is None:
+            return
+        target, switched, removed = outcome
+        await self._sink(ProfileSwitchChanged(agent_id=agent_id, pending_agent_mode=None))
+        if not switched:
+            await self._sink(
+                BrokerError(
+                    agent_id=agent_id,
+                    message=(
+                        f"{agent_id} handed off without switching to '{target}'; "
+                        "pick the agent again to retry"
+                    ),
+                    severity="warning",
+                )
+            )
+        if removed:
+            await self._emit_queue_state(agent_id)
+
+    async def _check_switch_after_turn(self, agent_id: str) -> None:
+        """End an armed switch whose turn finished without a handoff, with a warning.
+
+        A handoff command the agent already issued may still be 'pending' or
+        'processing' behind the command tail, so its row is looked up first; if there is
+        one the handoff will resolve the switch. The switch id is read before that
+        await and the switch is ended only if it is unchanged afterwards.
+        """
+        switch = self._pending_switches.get(agent_id)
+        if switch is None or switch.switch_id not in self._armed_switches:
+            return
+        session_id = self._session_id
+
+        def _handoff_queued(conn: sqlite3.Connection) -> bool:
+            return (
+                conn.execute(
+                    "SELECT 1 FROM agent_commands WHERE session_id = ? AND from_agent = ? "
+                    "AND command = 'handoff' AND status IN ('pending', 'processing') LIMIT 1",
+                    (session_id, agent_id),
+                ).fetchone()
+                is not None
+            )
+
+        lifecycle = await self._ensure_lifecycle()
+        if await lifecycle._db_op(_handoff_queued):
+            return
+        current = self._pending_switches.get(agent_id)
+        if current is None or current.switch_id != switch.switch_id:
+            return
+        self._end_switch(agent_id)
+        await self._sink(ProfileSwitchChanged(agent_id=agent_id, pending_agent_mode=None))
+        await self._sink(
+            BrokerError(
+                agent_id=agent_id,
+                message=(
+                    f"{agent_id} ended its turn without handing off to '{switch.agent_mode}'; "
+                    "pick the agent again to retry"
+                ),
+                severity="warning",
+            )
         )
 
     # ------------------------------------------------------------------
@@ -1264,12 +1543,13 @@ class ACPBroker:
         return None
 
     def _should_auto_approve(self, event: PermissionRequested) -> bool:
-        """Check if the tool in the permission title matches an auto-approve pattern."""
+        """Check if the requested tool matches an auto-approve pattern."""
         patterns = self._config.settings.auto_approve_tools
         if not patterns:
             return False
-        title = event.title
-        return any(pattern in title for pattern in patterns)
+        return any(
+            _auto_approve_matches(pattern, event.tool_identity, event.title) for pattern in patterns
+        )
 
     @staticmethod
     def _find_allow_once(options: list) -> str | None:
@@ -1308,7 +1588,7 @@ class ACPBroker:
             await self._permission_engine.persist_async(
                 PermissionRule(
                     agent_id=agent_id,
-                    tool_kind=pending.kind,
+                    tool_kind=permission_rule_key(pending.kind, pending.tool_identity),
                     session_id=self._session_id,
                     decision=PermissionDecision(selected_kind),
                 )
@@ -1356,7 +1636,9 @@ class ACPBroker:
                             self._active_permission.pop(agent_id, None)
                         continue
             # Try auto-resolve by persisted rule
-            decision = self._permission_engine.check(nxt.agent_id, nxt.kind, self._session_id)
+            decision = self._permission_engine.check(
+                nxt.agent_id, permission_rule_key(nxt.kind, nxt.tool_identity), self._session_id
+            )
             if decision is not None:
                 session = self._registry.get_session(nxt.agent_id)
                 if session:
@@ -1501,7 +1783,14 @@ class ACPBroker:
             elif command == "resurrect":
                 await lifecycle.handle_resurrect_command(cmd_id, from_agent, data)
             elif command == "handoff":
-                await lifecycle.handle_handoff_command(cmd_id, from_agent, data)
+                pending = self._pending_switches.get(from_agent)
+                await lifecycle.handle_handoff_command(
+                    cmd_id,
+                    from_agent,
+                    data,
+                    pending_agent_mode=pending.agent_mode if pending else None,
+                    pending_instructions=pending.instructions if pending else None,
+                )
             else:
                 await lifecycle.update_command_status(cmd_id, "rejected", f"Unknown command: {command}")
         except Exception as exc:

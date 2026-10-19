@@ -8,6 +8,7 @@ import logging
 from synth_acp.acp.session import ACPSession
 from synth_acp.models.agent import AgentMode, AgentModel, AgentState
 from synth_acp.models.events import UsageUpdated
+from synth_acp.models.extensions import ExtensionCapabilities
 
 log = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ class AgentRegistry:
         """Return the per-agent serialization lock. Creates on first access.
 
         The lock serializes all operations that transition an agent out of IDLE.
-        Acquired internally by lifecycle.prompt(), lifecycle.set_mode(), lifecycle.set_model().
+        Acquired internally by lifecycle.prompt(), lifecycle.set_config_option().
         External callers should use lock.locked() as a non-blocking guard only.
         """
         if agent_id not in self._locks:
@@ -161,9 +162,10 @@ class AgentRegistry:
         s = self._sessions.get(agent_id)
         return s.agent_mode if s else None
 
-    def get_agent_mode_target(self, agent_id: str) -> str | None:
+    def get_capabilities(self, agent_id: str) -> ExtensionCapabilities | None:
+        """The live session's capabilities, or None when the agent has no session."""
         s = self._sessions.get(agent_id)
-        return s.agent_mode_target if s else None
+        return s.capabilities if s else None
 
     def active_count(self) -> int:
         return sum(1 for s in self._sessions.values() if s.state != AgentState.TERMINATED)

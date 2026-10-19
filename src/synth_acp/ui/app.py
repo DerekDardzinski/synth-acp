@@ -52,6 +52,7 @@ from synth_acp.models.events import (
     MessageSteered,
     PermissionRequested,
     PlanReceived,
+    ProfileSwitchChanged,
     QueueUpdated,
     SessionRestoreComplete,
     TerminalCreated,
@@ -536,6 +537,11 @@ class SynthApp(App):
             if opt_match and getattr(opt_match, "category", None) == "mode":
                 self._update_tile_mode_from_config(event.agent_id)
 
+        if isinstance(event, ProfileSwitchChanged):
+            bar = self._get_input_bar(event.agent_id)
+            if bar:
+                bar.set_pending_profile_switch(event.pending_agent_mode)
+
         if isinstance(event, UsageUpdated):
             self._update_usage_display(event)
 
@@ -863,9 +869,15 @@ class SynthApp(App):
         else:
             bar.set_disabled(disabled=False, hint=f"Message {agent_id}…")
 
+    def switches_profile_by_handoff(self, agent_id: str) -> bool:
+        """True when agent_id's harness switches agent profile by an agent-written handoff."""
+        caps = self.broker._registry.get_capabilities(agent_id)
+        return caps is not None and caps.profile_switch == "handoff"
+
     def _synthesize_agent_option(self, agent_id: str) -> SessionConfigOptionSelect | None:
         """Build a synthesized agent picker option from discovery results."""
-        if self.broker._registry.get_agent_mode_target(agent_id) != "meta_agent":
+        caps = self.broker._registry.get_capabilities(agent_id)
+        if caps is None or caps.profile_switch != "handoff":
             return None
         agents = self.broker.get_discovered_agents(agent_id)
         if not agents:
@@ -926,10 +938,12 @@ class SynthApp(App):
         return feed.input_bar if feed else None
 
     def _update_input_bar_config_options(self, agent_id: str) -> None:
-        """Push stored config options to the agent's input bar."""
+        """Push stored config options, and any pending profile switch, to the agent's input bar."""
         bar = self._get_input_bar(agent_id)
         if bar:
             bar.update_config_options(self._agent_config_options.get(agent_id, []))
+            if self.switches_profile_by_handoff(agent_id):
+                bar.set_pending_profile_switch(self.broker.pending_profile_switch(agent_id))
 
     def _update_usage_display(self, event: UsageUpdated) -> None:
         """Update usage display for the agent's tile and (if selected) input bar.
@@ -1236,7 +1250,9 @@ class SynthApp(App):
         Returns:
             True if an agent was launched, False if the modal was cancelled.
         """
-        result = await self.push_screen_wait(LaunchAgentScreen())
+        result = await self.push_screen_wait(
+            LaunchAgentScreen(harness_variant=self.config.settings.harness_variant)
+        )
         if result is not None:
             self._dynamic_agents[result.agent_id] = DynamicAgentInfo(
                 parent=None, task="", harness=result.harness, cwd=result.cwd

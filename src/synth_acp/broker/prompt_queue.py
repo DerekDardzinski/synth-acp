@@ -22,6 +22,10 @@ class QueuedItem:
     turn. It is what lets a drain identify the reserved item at the moment it hands the
     text to ``AgentLifecycle.prompt``, so that item is admitted while every other caller
     is refused until it has been delivered.
+
+    ``switch_id`` tags the item that carries a profile-switch request, so the broker can
+    tell when that request actually starts (the switch is then armed) and when the user
+    deletes it before it ran.
     """
 
     id: str = field(default_factory=lambda: f"q-{uuid4().hex[:8]}")
@@ -31,6 +35,7 @@ class QueuedItem:
     editing: bool = False
     steerable: bool = False
     first_prompt: bool = False
+    switch_id: int | None = None
     timestamp: float = field(default_factory=time.time)
 
 
