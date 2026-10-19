@@ -415,11 +415,14 @@ when the agent advertises it (Claude Code), otherwise `session/load`, where Kiro
 asked not to replay history. Any history an agent does replay during a load is
 suppressed. If the resume or load fails, the agent starts a fresh session with a warning.
 
-synth records the engine variant that created each agent's session. When the recorded
-variant differs from the configured one (for example a session created under Kiro v2,
-restored after switching to v3), synth does not hand the old session to the new engine:
-the agent starts a fresh session without its previous conversation, and synth shows a
-warning naming the agent, the recorded variant and the configured one.
+synth records the engine variant that created each agent's session, and restores each
+agent under that recorded variant rather than the configured one, because a saved
+session can only be loaded by the engine that created it. A session created under Kiro
+v2 is restored by Kiro v2 even after you switch `harness_variant` to v3; agents launched
+after the restore use the configured variant. Only when the recorded variant is one the
+harness no longer declares does the agent start a fresh session under the configured
+variant, without its previous conversation, with a warning naming the agent and both
+variants.
 
 ### Adding a Harness
 

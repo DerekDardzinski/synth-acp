@@ -2064,12 +2064,16 @@ class TestHarnessVariantTracking:
 
     @staticmethod
     def _fake_build(lc: AgentLifecycle, built: list[MagicMock]) -> Any:
-        """Patch session construction; every built session is appended to ``built``."""
+        """Patch session construction; every built session is appended to ``built``.
 
-        def _build(_cfg: object, _entry: object) -> MagicMock:
+        Each session's ``entry`` attribute is the HarnessEntry it was built with.
+        """
+
+        def _build(_cfg: object, entry: object) -> MagicMock:
             session = MagicMock(state=AgentState.INITIALIZING)
             session.run = AsyncMock()
             session.run_restored = AsyncMock()
+            session.entry = entry
             built.append(session)
             return session
 
@@ -2114,7 +2118,10 @@ class TestHarnessVariantTracking:
         assert variants["worker"] == "v3"
         assert variants[result.retired_agent_id] is None
 
-    async def test_restore_of_other_variant_starts_fresh_and_warns(self, tmp_path: Path) -> None:
+    async def test_restore_of_other_variant_uses_the_recorded_engine(
+        self, tmp_path: Path
+    ) -> None:
+        """A v2 agent restored while v3 is configured is loaded by the v2 engine."""
         events: list = []
         lc, _reg = self._lifecycle(tmp_path, events)
         built: list[MagicMock] = []
@@ -2131,15 +2138,44 @@ class TestHarnessVariantTracking:
             )
             await asyncio.sleep(0)
 
+        built[0].run_restored.assert_awaited_once_with("acp-v2")
+        built[0].run.assert_not_awaited()
+        assert built[0].entry.variant == "v2"
+        assert built[0].entry.run_cmd == "kiro-cli acp"
+        assert built[0].entry.extension == "kiro_v2"
+        assert "a" in lc._first_prompted
+        assert [e for e in events if isinstance(e, BrokerError)] == []
+
+    async def test_restore_of_undeclared_variant_starts_fresh_and_warns(
+        self, tmp_path: Path
+    ) -> None:
+        """A recorded variant the harness no longer declares falls back to the configured one."""
+        events: list = []
+        lc, _reg = self._lifecycle(tmp_path, events)
+        built: list[MagicMock] = []
+
+        with self._fake_build(lc, built):
+            await lc.restore(
+                agent_id="a",
+                acp_session_id="acp-v1",
+                harness="kiro",
+                agent_mode=None,
+                cwd=str(tmp_path),
+                parent=None,
+                harness_variant="v1",
+            )
+            await asyncio.sleep(0)
+
         built[0].run_restored.assert_not_awaited()
         built[0].run.assert_awaited_once()
+        assert built[0].entry.variant == "v3"
         # The fresh session has no conversation, so its first prompt must still get
         # the startup context.
         assert "a" not in lc._first_prompted
         warnings = [e for e in events if isinstance(e, BrokerError) and e.severity == "warning"]
         assert len(warnings) == 1
         assert "'a'" in warnings[0].message
-        assert "'v2'" in warnings[0].message
+        assert "'v1'" in warnings[0].message
         assert "'v3'" in warnings[0].message
 
     async def test_restore_of_same_variant_restores(self, tmp_path: Path) -> None:
@@ -2181,8 +2217,6 @@ class TestHarnessVariantTracking:
             await lc.resurrect("a")
             await asyncio.sleep(0)
 
-        built[0].run_restored.assert_not_awaited()
-        built[0].run.assert_awaited_once()
-        warnings = [e for e in events if isinstance(e, BrokerError) and e.severity == "warning"]
-        assert len(warnings) == 1
-        assert "'v2'" in warnings[0].message
+        built[0].run_restored.assert_awaited_once_with("acp-v2")
+        assert built[0].entry.variant == "v2"
+        assert [e for e in events if isinstance(e, BrokerError)] == []

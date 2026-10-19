@@ -168,15 +168,17 @@ def _migrate_schema_sync(conn) -> None:
     ):
         if name not in agent_cols:
             conn.execute(f"ALTER TABLE agents ADD COLUMN {name} {decl}")
-    # The engine variant that created each row's ACP session.  Every kiro row that
-    # predates the column was created by the only engine synth ran then, v2.  Only in
-    # the branch that adds the column, so a later run never rewrites a stored value.
-    # Other harnesses stay NULL, which matches an entry whose variant is None.
-    if "harness_variant" not in agent_cols:
-        conn.execute(
-            "UPDATE agents SET harness_variant = 'v2' "
-            "WHERE harness = 'kiro' AND harness_variant IS NULL"
-        )
+    # The engine variant that created each row's ACP session.  A kiro row with no
+    # variant was written by a synth that predates variants, and that synth could only
+    # run v2.  Such rows keep appearing after the column exists, because an older synth
+    # (an installed release, another checkout) shares this database, so the backfill runs
+    # on every start, not only when the column is added.  Current synth always writes a
+    # kiro variant, so this never rewrites a stored value.  Other harnesses stay NULL,
+    # which matches an entry whose variant is None.
+    conn.execute(
+        "UPDATE agents SET harness_variant = 'v2' "
+        "WHERE harness = 'kiro' AND harness_variant IS NULL"
+    )
     conn.commit()
 
     # Migrate session_embeddings: detect old single-PK schema (no agent_id column)

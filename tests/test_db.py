@@ -1263,7 +1263,7 @@ class TestHarnessVariantColumn:
     Kiro v2 session id into v3 (an empty session) or throws away a matching session.
     """
 
-    def test_migration_adds_column_and_backfills_kiro_rows_once(self) -> None:
+    def test_migration_backfills_kiro_rows_without_a_variant_on_every_run(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.executescript("""
             CREATE TABLE agents (
@@ -1289,12 +1289,14 @@ class TestHarnessVariantColumn:
         rows = "SELECT agent_id, harness_variant FROM agents ORDER BY agent_id"
         assert conn.execute(rows).fetchall() == [("c", None), ("k", "v2")]
 
-        # A later run must not rewrite a value recorded after the migration.
+        # A later run must not rewrite a value recorded after the migration, but must
+        # backfill a kiro row an older synth wrote after the column existed (it leaves
+        # the column NULL, and that synth could only run v2).
         conn.execute("UPDATE agents SET harness_variant = 'v3' WHERE agent_id = 'k'")
         conn.execute(
             "INSERT INTO agents (agent_id, session_id, registered, harness) "
             "VALUES ('k2', 's', 1, 'kiro')"
         )
         ensure_schema_sync(conn)
-        assert conn.execute(rows).fetchall() == [("c", None), ("k", "v3"), ("k2", None)]
+        assert conn.execute(rows).fetchall() == [("c", None), ("k", "v3"), ("k2", "v2")]
         conn.close()

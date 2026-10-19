@@ -178,8 +178,12 @@ Optional (`pip install synth-acp[search]`):
   only the native `set_config_option` path is used
 - Restore: `session/resume` when advertised (Claude), else `session/load` with the
   extension's load `_meta`. `agents.harness_variant` in synth.db records the variant that
-  created each session; restore starts fresh with a warning when it differs from the
-  configured variant (existing kiro rows are backfilled as `v2`)
+  created each session; restore and resurrect build the session from that recorded
+  variant (`AgentLifecycle._restore_entry`), not the configured one, so a v2 session is
+  loaded by v2 after switching to v3. New launches and handoff successors use the
+  configured variant. Only a recorded variant the TOML no longer declares falls back to
+  the configured one, starting fresh with a warning (existing kiro rows are backfilled
+  as `v2`)
 
 **Codex** (`codex.toml`):
 - `run_cmd = "codex-acp"` (npm `@agentclientprotocol/codex-acp`, verified on 2.0.0; it runs its

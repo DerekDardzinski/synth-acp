@@ -30,7 +30,7 @@ from synth_acp.db import (
     rename_agent_sync,
 )
 from synth_acp.discovery import discover_agents
-from synth_acp.harnesses import load_harness_registry
+from synth_acp.harnesses import UnknownHarnessVariantError, load_harness_registry
 from synth_acp.models.agent import AgentConfig, AgentState, DiscoveredAgent, HandoffResult
 from synth_acp.models.config import (
     HarnessEntry,
@@ -1055,6 +1055,27 @@ class AgentLifecycle:
         except Exception:
             log.debug("Failed to persist acp_session_id for %s", agent_id, exc_info=True)
 
+    def _restore_entry(self, harness: str, recorded_variant: str | None) -> HarnessEntry | None:
+        """Harness entry to restore an agent with: its recorded variant when resolvable.
+
+        Args:
+            harness: The agent's harness short name.
+            recorded_variant: The variant stored with the agent's row, or None.
+
+        Returns:
+            The entry for ``recorded_variant`` when it differs from the configured one and
+            the harness still declares it; otherwise the configured entry (None for an
+            unknown harness).
+        """
+        configured = next((e for e in self._harness_registry if e.short_name == harness), None)
+        if configured is None or recorded_variant is None or recorded_variant == configured.variant:
+            return configured
+        try:
+            registry = load_harness_registry({harness: recorded_variant})
+        except UnknownHarnessVariantError:
+            return configured
+        return next((e for e in registry if e.short_name == harness), configured)
+
     async def restore(
         self,
         agent_id: str,
@@ -1067,12 +1088,14 @@ class AgentLifecycle:
     ) -> None:
         """Restore a previously-running agent from saved state (no SQLite insert).
 
-        ``harness_variant`` is the engine variant stored with the agent's row.  When it
-        differs from the configured one, the saved ACP session belongs to another engine
-        (a v2 session id loaded into Kiro v3 silently yields an empty session), so this
-        starts a fresh session instead and warns.
+        ``harness_variant`` is the engine variant stored with the agent's row.  The agent
+        is restored under that variant, not the configured one, because a saved ACP
+        session can only be loaded by the engine that created it (a v2 session id loaded
+        into Kiro v3 silently yields an empty session).  Only when the recorded variant
+        can no longer be resolved does this fall back to the configured variant, start a
+        fresh session and warn.
         """
-        entry = next((e for e in self._harness_registry if e.short_name == harness), None)
+        entry = self._restore_entry(harness, harness_variant)
         if not entry:
             await self._sink(
                 BrokerError(agent_id=agent_id, message=f"Cannot restore: unknown harness '{harness}'")
@@ -1104,8 +1127,9 @@ class AgentLifecycle:
                     agent_id=agent_id,
                     message=(
                         f"Agent '{agent_id}' was recorded under {harness} variant "
-                        f"'{harness_variant}' but '{entry.variant}' is configured; "
-                        "starting a fresh session without its previous conversation."
+                        f"'{harness_variant}', which {harness} no longer declares; "
+                        f"starting a fresh '{entry.variant}' session without its "
+                        "previous conversation."
                     ),
                     severity="warning",
                 )
