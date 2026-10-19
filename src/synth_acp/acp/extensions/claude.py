@@ -2,11 +2,12 @@
 
 Agent selection rides on ``_meta.claudeCode.options.extraArgs.agent`` on every session
 op, which the adaptor passes to the Claude CLI as ``--agent <name>``; switching agents
-forks the session.  ``options.agent`` is not used: claude-agent-acp 0.77.0 and later
+uses a Synth handoff because the main-thread agent is fixed at session creation.  ``options.agent`` is not used: claude-agent-acp 0.77.0 and later
 delete it.  The adaptor accepts an unknown agent name silently, so ``check_profile``
 validates the name against the discovered agents.  Tool calls made by a subagent
-carry ``_meta.claudeCode.parentToolUseId``.  Profiles are discovered from the user,
-project, managed and plugin agent directories.
+carry ``_meta.claudeCode.parentToolUseId``.  In-turn steering uses the adaptor's
+``_session/steering`` extension with host-owned idle fallback. Profiles are discovered
+from the user, project, managed and plugin agent directories.
 """
 
 from __future__ import annotations
@@ -20,15 +21,21 @@ import yaml
 
 from synth_acp.acp.extensions.base import AcpExtension, SessionOp
 from synth_acp.models.agent import DiscoveredAgent
-from synth_acp.models.extensions import ExtensionCapabilities, ProfileUnavailable, UpdateHints
+from synth_acp.models.extensions import (
+    ExtensionCapabilities,
+    ProfileUnavailable,
+    SteerOutcome,
+    UpdateHints,
+)
 
 log = logging.getLogger(__name__)
 
+
 class ClaudeExtension(AcpExtension):
-    """claude-agent-acp: agent selection via _meta, agent switch by fork."""
+    """claude-agent-acp: agent selection via _meta, profile switch by handoff, steering."""
 
     name = "claude"
-    capabilities = ExtensionCapabilities(profile_switch="handoff")
+    capabilities = ExtensionCapabilities(steer=True, profile_switch="handoff")
 
     def session_meta(self, op: SessionOp, agent_mode: str | None) -> dict[str, Any]:
         """``{"claudeCode": {"options": {"extraArgs": {"agent": agent_mode}}}}`` for every op.
@@ -51,6 +58,31 @@ class ClaudeExtension(AcpExtension):
             return UpdateHints()
         parent = claude_meta.get("parentToolUseId")
         return UpdateHints(parent_tool_call_id=parent if isinstance(parent, str) else None)
+
+    async def steer(self, conn: Any, session_id: str, text: str) -> SteerOutcome:
+        """Inject text through claude-agent-acp's ``_session/steering`` extension.
+
+        ``idleBehavior: promptRequired`` keeps an idle-race message owned by synth rather
+        than letting the adaptor start an untracked detached turn. The ACP SDK prepends
+        the leading underscore to the method name.
+        """
+        result = await conn.ext_method(
+            "session/steering",
+            {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": text}],
+                "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+            },
+        )
+        outcome = result.get("outcome") if isinstance(result, dict) else None
+        if outcome == "injected":
+            return SteerOutcome(status="delivered")
+        if outcome == "startedNewTurn":
+            # Not expected with promptRequired, but older adaptors may ignore the option.
+            return SteerOutcome(status="started_turn")
+        # promptRequired/noRunningTurn means the adaptor did not consume the text;
+        # failed or malformed results also stay synth-owned for safe fallback.
+        return SteerOutcome(status="dropped")
 
     def discover_profiles(self, cwd: Path) -> list[DiscoveredAgent]:
         """Claude Code agents from the user, project, managed and plugin directories."""

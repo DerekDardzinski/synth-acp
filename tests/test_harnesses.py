@@ -18,16 +18,16 @@ class TestLoadHarnessRegistry:
             assert entry.binary_names
             assert entry.run_cmd
 
-    def test_steering_declared_only_for_kiro_and_codex(self) -> None:
-        """Steering is opt-in per harness (Kiro and Codex); a stray declaration would
-        steer a harness whose payload shape differs and silently fail with -32602."""
+    def test_steering_declared_only_for_supported_harnesses(self) -> None:
+        """Steering is opt-in per harness; a stray declaration would call a payload
+        shape the adaptor does not serve and silently fall back to the queue."""
         by_short_name = {
             e.short_name: get_extension(e.extension).capabilities.steer
             for e in load_harness_registry()
         }
         assert by_short_name["kiro"] is True
         assert by_short_name["codex"] is True
-        assert by_short_name["claude"] is False
+        assert by_short_name["claude"] is True
         assert by_short_name["opencode"] is False
         assert by_short_name["gemini"] is False
 

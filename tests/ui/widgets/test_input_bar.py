@@ -770,3 +770,60 @@ class TestProfileSwitchByHandoff:
         mock_app.broker.handle.assert_called_once_with(
             SetConfigOption(agent_id="test-agent", config_id="agent", value="probe-heron")
         )
+
+
+class TestSteerOrQueue:
+    """While the agent is busy, Submit splits into Steer and Queue, and Shift+Enter steers."""
+
+    async def _mounted(self, can_steer: bool):
+        from textual.app import App, ComposeResult
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield InputBar("agent-1", "agent-1", "kiro", cwd=".")
+
+        app = _App()
+        return app, patch.object(InputBar, "_can_steer", return_value=can_steer)
+
+    async def test_busy_bar_offers_steer_and_queue_only_when_harness_can_steer(self) -> None:
+        """Offering Steer on Claude would send a steer that cannot be delivered; hiding
+        Queue while busy would leave the user no way to queue with the mouse."""
+        for can_steer in (True, False):
+            app, can = await self._mounted(can_steer)
+            with can:
+                async with app.run_test(headless=True, size=(120, 40)) as pilot:
+                    bar = app.query_one(InputBar)
+                    bar.set_busy(True)
+                    await pilot.pause()
+                    shown = {b: bar.query_one(f"#{b}").display
+                             for b in ("submit-btn", "steer-btn", "queue-btn")}
+                    assert shown == {"submit-btn": False, "steer-btn": can_steer, "queue-btn": True}
+                    bar.set_busy(False)
+                    await pilot.pause()
+                    assert bar.query_one("#submit-btn").display is True
+                    assert bar.query_one("#steer-btn").display is False
+                    assert bar.query_one("#queue-btn").display is False
+
+    async def test_shift_enter_sends_a_steer_and_enter_does_not(self) -> None:
+        """The key mapping is the whole user-facing contract: Shift+Enter steers, plain
+        Enter keeps queueing as before."""
+        from textual.app import App, ComposeResult
+
+        posted: list[bool] = []
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield InputBar("agent-1", "agent-1", "kiro", cwd=".")
+
+            def on_prompt_text_area_submitted(self, message: PromptTextArea.Submitted) -> None:
+                posted.append(message.steer)
+
+        app = _App()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            ta = app.query_one("#prompt-input", PromptTextArea)
+            ta.focus()
+            for key in ("shift+enter", "enter"):
+                ta.load_text("x")
+                await pilot.press(key)
+                await pilot.pause()
+        assert posted == [True, False]

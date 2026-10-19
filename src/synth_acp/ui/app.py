@@ -35,6 +35,7 @@ from synth_acp.models.commands import (
     EditQueueItem,
     LaunchAgent,
     RespondPermission,
+    SteerQueueItem,
     TerminateAgent,
 )
 from synth_acp.models.config import SessionConfig
@@ -617,7 +618,7 @@ class SynthApp(App):
         elif isinstance(event, HookFired):
             await feed.add_hook_notification(event.hook_name)
         elif isinstance(event, MessageSteered):
-            await feed.add_steered_message(event.from_agent, event.text)
+            await feed.add_steered_message(event.from_agent, event.text, source=event.source)
         elif isinstance(event, UserPromptSubmitted):
             await feed.add_prompt(event.text)
         elif isinstance(event, BrokerError):
@@ -698,6 +699,19 @@ class SynthApp(App):
             self.run_worker(
                 self.broker.handle(
                     DeleteQueueItem(agent_id=self.selected_agent, item_id=message.item_id)
+                )
+            )
+
+    def on_prompt_queue_steer_requested(self, message: object) -> None:
+        """Forward a queue item's Steer button press to the broker."""
+        from synth_acp.ui.widgets.prompt_queue import PromptQueue
+
+        if not isinstance(message, PromptQueue.SteerRequested):
+            return
+        if self.selected_agent:
+            self.run_worker(
+                self.broker.handle(
+                    SteerQueueItem(agent_id=self.selected_agent, item_id=message.item_id)
                 )
             )
 
@@ -819,7 +833,7 @@ class SynthApp(App):
         elif isinstance(event, HookFired):
             await feed.add_hook_notification(event.hook_name)
         elif isinstance(event, MessageSteered):
-            await feed.add_steered_message(event.from_agent, event.text)
+            await feed.add_steered_message(event.from_agent, event.text, source=event.source)
         elif isinstance(event, UserPromptSubmitted):
             await feed.add_prompt(event.text)
         elif isinstance(event, SessionRestoreComplete):
@@ -867,6 +881,20 @@ class SynthApp(App):
             bar.set_disabled(disabled=True, hint=hint)
         else:
             bar.set_disabled(disabled=False, hint=f"Message {agent_id}…")
+
+    def can_steer(self, agent_id: str) -> bool:
+        """True when a user can safely inject text into this agent's running turn.
+
+        Claude adaptor 0.70.0 can hang if steered while permission is pending; the
+        broker has the same guard for agent messages and races after this UI check.
+        """
+        caps = self.broker._registry.get_capabilities(agent_id)
+        if caps is None or caps.steer is not True:
+            return False
+        return not (
+            self.broker.get_agent_harness(agent_id) == "claude"
+            and self.broker.is_permission_pending(agent_id)
+        )
 
     def switches_profile_by_handoff(self, agent_id: str) -> bool:
         """True when agent_id's harness switches agent profile by an agent-written handoff."""

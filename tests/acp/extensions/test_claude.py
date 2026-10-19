@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
 from synth_acp.acp.extensions.claude import ClaudeExtension
-from synth_acp.models.extensions import ProfileUnavailable
+from synth_acp.models.extensions import ProfileUnavailable, SteerOutcome
 
 
 class TestSessionMeta:
@@ -19,6 +20,45 @@ class TestSessionMeta:
         for op in ("new", "fork", "resume", "load"):
             assert ext.session_meta(op, "probe-parrot") == expected
         assert ext.session_meta("new", None) == {}
+
+
+class TestSteer:
+    @pytest.mark.parametrize(
+        ("answer", "expected"),
+        [
+            ({"outcome": "injected"}, SteerOutcome(status="delivered")),
+            ({"outcome": "startedNewTurn"}, SteerOutcome(status="started_turn")),
+            (
+                {"outcome": "promptRequired", "reason": "noRunningTurn"},
+                SteerOutcome(status="dropped"),
+            ),
+            ({"outcome": "unknown"}, SteerOutcome(status="dropped")),
+        ],
+    )
+    async def test_steer_uses_host_owned_idle_fallback_and_maps_outcome(
+        self, answer: dict[str, str], expected: SteerOutcome
+    ) -> None:
+        """The message must never become an untracked detached turn when the active
+        turn ends before the request lands; promptRequired leaves it owned by synth."""
+        conn = AsyncMock()
+        conn.ext_method.return_value = answer
+
+        outcome = await ClaudeExtension().steer(conn, "session-1", "change course")
+
+        assert outcome == expected
+        conn.ext_method.assert_awaited_once_with(
+            "session/steering",
+            {
+                "sessionId": "session-1",
+                "prompt": [{"type": "text", "text": "change course"}],
+                "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+            },
+        )
+
+    def test_capabilities_enable_steering_and_keep_handoff_profile_switch(self) -> None:
+        caps = ClaudeExtension.capabilities
+        assert caps.steer is True
+        assert caps.profile_switch == "handoff"
 
 
 class TestCheckProfile:

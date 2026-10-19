@@ -51,6 +51,7 @@ from synth_acp.models.commands import (
     RespondPermission,
     SendPrompt,
     SetAgentMode,
+    SteerQueueItem,
 )
 from synth_acp.models.config import GlobalConfig, SessionConfig
 from synth_acp.models.events import (
@@ -1234,14 +1235,223 @@ class TestInTurnSteering:
         self._busy_session(broker)
         assert broker._steer_eligible("agent-1", "chat") is False
 
-    async def test_steer_eligible_rejects_harness_without_protocol(
+    async def test_harness_without_protocol_is_not_steer_eligible(
         self, tmp_path: Path
     ) -> None:
-        """Claude's steering takes a different payload shape and would fail with
-        -32602; opencode and gemini have none at all."""
+        """OpenCode and Gemini expose no steering request; trying one would fail and
+        silently fall back to the queue."""
         broker = _make_broker("agent-1", tmp_path=tmp_path)
-        self._busy_session(broker, extension="claude")
+        self._busy_session(broker, extension="standard")
         assert broker._steer_eligible("agent-1", "chat") is False
+
+
+class TestUserSteering:
+    """The user chooses Steer: inject into the running turn, bypassing queued prompts,
+    and never mix user and agent messages in one steer."""
+
+    _helpers = TestInTurnSteering()
+
+    async def _broker(self, tmp_path: Path, settings: dict | None = None) -> ACPBroker:
+        config = SessionConfig.model_validate({"project": "t", "settings": settings or {}})
+        broker = ACPBroker(
+            config=config,
+            initial_agent=AgentConfig(agent_id="agent-1", harness="kiro"),
+            db_path=tmp_path / "synth.db",
+        )
+        lifecycle = await broker._ensure_lifecycle()
+        lifecycle._first_prompted.add("agent-1")
+        return broker
+
+    async def test_user_steer_bypasses_queued_prompt_and_ignores_messages_interrupt(
+        self, tmp_path: Path
+    ) -> None:
+        """The user's case: 'Now check X' is queued for after the turn, then a steer
+        must reach the CURRENT turn at once. messages_interrupt=false governs agent
+        messages only, so it must not turn the user's explicit Steer into a queue."""
+        broker = await self._broker(tmp_path, {"messages_interrupt": False})
+        fake = self._helpers._busy_session(broker)
+        await broker.handle(SendPrompt(agent_id="agent-1", text="Now check X"))
+
+        await broker.handle(SendPrompt(agent_id="agent-1", text="skip that test", steer=True))
+
+        fake.steer.assert_awaited_once_with("skip that test")
+        assert [i.text for i in broker._prompt_queue.items("agent-1")] == ["Now check X"]
+        steered = self._helpers._steered(broker)
+        assert [(e.source, e.from_agent, e.text) for e in steered] == [
+            ("user", None, "skip that test")
+        ]
+
+    async def test_backlog_is_steered_in_runs_split_by_source(self, tmp_path: Path) -> None:
+        """[user, agent, agent, user, user, agent] queued, then a user steer, is five
+        steers. One combined steer would present an agent's words as the user's, or
+        the user's as an agent's. The queued prompt for a later turn stays put."""
+        broker = await self._broker(tmp_path)
+        fake = self._helpers._busy_session(broker)
+        layout = [("user", "u1"), ("mcp", "a1"), ("mcp", "a2"), ("user", "u2"),
+                  ("user", "u3"), ("mcp", "a3")]
+        for source, text in layout:
+            broker._prompt_queue.enqueue(
+                "agent-1",
+                QueuedItem(text=text, source=source, steerable=True,  # type: ignore[arg-type]
+                           from_agent="agent-a" if source == "mcp" else None),
+            )
+        broker._prompt_queue.enqueue("agent-1", QueuedItem(text="later turn", source="user"))
+
+        await broker.handle(SendPrompt(agent_id="agent-1", text="u4", steer=True))
+
+        assert [c.args[0] for c in fake.steer.await_args_list] == [
+            "u1",
+            "# Message 1\n\na1\n\n# Message 2\n\na2",
+            "# Message 1\n\nu2\n\n# Message 2\n\nu3",
+            "a3",
+            "u4",
+        ]
+        assert [e.source for e in self._helpers._steered(broker)] == ["user", "mcp", "user", "mcp", "user"]
+        assert [i.text for i in broker._prompt_queue.items("agent-1")] == ["later turn"]
+
+    async def test_refused_run_requeues_it_and_later_runs_at_the_front(
+        self, tmp_path: Path
+    ) -> None:
+        """When the second run is refused, the first stays delivered (no duplicate),
+        the refused run and the rest return ahead of the later-turn prompt in order,
+        and the user is told their steer was queued rather than silently losing it."""
+        broker = await self._broker(tmp_path)
+        fake = self._helpers._busy_session(broker)
+        fake.steer.side_effect = [_QUEUED, SteerOutcome(status="dropped")]
+        broker._prompt_queue.enqueue("agent-1", QueuedItem(text="later turn", source="user"))
+        broker._prompt_queue.enqueue("agent-1", QueuedItem(text="u1", source="user", steerable=True))
+        broker._prompt_queue.enqueue("agent-1", QueuedItem(text="a1", source="mcp", steerable=True))
+
+        await broker.handle(SendPrompt(agent_id="agent-1", text="u2", steer=True))
+
+        assert fake.steer.await_count == 2
+        items = broker._prompt_queue.items("agent-1")
+        assert [(i.text, i.steerable) for i in items] == [
+            ("a1", True), ("u2", True), ("later turn", False),
+        ]
+        events = []
+        while not broker._event_queue.empty():
+            events.append(broker._event_queue.get_nowait())
+        assert [e.text for e in events if isinstance(e, MessageSteered)] == ["u1"]
+        assert any(
+            isinstance(e, BrokerError) and "did not accept the steer" in e.message for e in events
+        )
+
+    async def test_refused_steer_still_runs_before_the_later_turn_prompt(
+        self, tmp_path: Path
+    ) -> None:
+        """The user's example with a refusal (Kiro v3 answers queued:false when a cancel
+        races the steer): 'Now check X' is queued for later, the steer is refused. When
+        the turn ends, the steer must be sent first; queued at the back, the unrelated
+        task would run before the correction meant for the turn that just ended."""
+        broker = await self._broker(tmp_path)
+        fake = self._helpers._busy_session(broker, steer_result=SteerOutcome(status="dropped"))
+        await broker.handle(SendPrompt(agent_id="agent-1", text="Now check X"))
+        await broker.handle(SendPrompt(agent_id="agent-1", text="skip that test", steer=True))
+
+        fake.session._sm._state = AgentState.IDLE
+        assert await broker._try_drain("agent-1")
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        fake.prompt.assert_awaited_once()
+        assert [c.args[0] for c in fake.prompt.await_args_list] == ["skip that test"]
+        assert [i.text for i in broker._prompt_queue.items("agent-1")] == ["Now check X"]
+
+    async def test_steering_a_queued_item_injects_it_and_leaves_the_rest(
+        self, tmp_path: Path
+    ) -> None:
+        """The queue's Steer button: the chosen item goes into the running turn as a
+        user steer, and the other queued prompt keeps waiting for the next turn."""
+        broker = await self._broker(tmp_path)
+        fake = self._helpers._busy_session(broker)
+        await broker.handle(SendPrompt(agent_id="agent-1", text="Now check X"))
+        await broker.handle(SendPrompt(agent_id="agent-1", text="skip that test"))
+        target = broker._prompt_queue.items("agent-1")[1].id
+
+        await broker.handle(SteerQueueItem(agent_id="agent-1", item_id=target))
+
+        fake.steer.assert_awaited_once_with("skip that test")
+        assert [i.text for i in broker._prompt_queue.items("agent-1")] == ["Now check X"]
+        assert [e.source for e in self._helpers._steered(broker)] == ["user"]
+
+    async def test_queued_item_steer_is_refused_for_items_that_must_run_as_prompts(
+        self, tmp_path: Path
+    ) -> None:
+        """An item being edited would send half-typed text; a profile-switch request
+        steered would never arm the switch. Both must stay queued, untouched."""
+        broker = await self._broker(tmp_path)
+        fake = self._helpers._busy_session(broker)
+        broker._prompt_queue.enqueue("agent-1", QueuedItem(id="q-edit", text="draft"))
+        broker._prompt_queue.mark_editing("agent-1", "q-edit")
+        broker._prompt_queue.enqueue("agent-1", QueuedItem(id="q-switch", text="switch", switch_id=1))
+
+        await broker.handle(SteerQueueItem(agent_id="agent-1", item_id="q-edit"))
+        await broker.handle(SteerQueueItem(agent_id="agent-1", item_id="q-switch"))
+
+        fake.steer.assert_not_awaited()
+        assert [i.id for i in broker._prompt_queue.items("agent-1")] == ["q-edit", "q-switch"]
+
+    async def test_queued_item_steer_after_the_turn_ended_runs_it_next(
+        self, tmp_path: Path
+    ) -> None:
+        """If the turn ends between the press and the steer, the item must not be lost
+        and must not drop to the back: the user wanted it now, so it runs next."""
+        broker = await self._broker(tmp_path)
+        fake = self._helpers._busy_session(broker)
+        broker._prompt_queue.enqueue("agent-1", QueuedItem(id="q-1", text="first"))
+        broker._prompt_queue.enqueue("agent-1", QueuedItem(id="q-2", text="steer me"))
+        real = broker._try_steer
+
+        async def turn_ends_first(*args, **kwargs):
+            fake.session._sm._state = AgentState.IDLE
+            return await real(*args, **kwargs)
+
+        with patch.object(broker, "_try_steer", side_effect=turn_ends_first):
+            await broker.handle(SteerQueueItem(agent_id="agent-1", item_id="q-2"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        fake.steer.assert_not_awaited()
+        assert [c.args[0] for c in fake.prompt.await_args_list] == ["steer me"]
+        assert [i.id for i in broker._prompt_queue.items("agent-1")] == ["q-1"]
+
+    async def test_claude_steer_waits_while_permission_is_pending(
+        self, tmp_path: Path
+    ) -> None:
+        """claude-agent-acp 0.70.0 injects at priority now during permission, which
+        cancels the card and can leave session/prompt hanging. User and agent steers
+        must stay queued until the permission resolves; newer adaptors tolerate this
+        conservative compatibility behavior."""
+        broker = await self._broker(tmp_path)
+        broker._registry._harnesses["agent-1"] = "claude"
+        fake = self._helpers._busy_session(
+            broker, extension="claude", state=AgentState.AWAITING_PERMISSION
+        )
+
+        await broker.handle(SendPrompt(agent_id="agent-1", text="user steer", steer=True))
+        await broker._on_mcp_message("agent-1", "agent steer", "agent-a", "chat")
+
+        fake.steer.assert_not_awaited()
+        assert [(i.text, i.source, i.steerable) for i in broker._prompt_queue.items("agent-1")] == [
+            ("user steer", "user", True),
+            ("[Message from agent-a]: agent steer", "mcp", True),
+        ]
+
+    async def test_user_steer_on_harness_without_steering_is_queued(
+        self, tmp_path: Path
+    ) -> None:
+        """On OpenCode or Gemini there is no extension request to call, so the prompt
+        must queue as an ordinary prompt instead."""
+        broker = await self._broker(tmp_path)
+        fake = self._helpers._busy_session(broker, extension="standard")
+
+        await broker.handle(SendPrompt(agent_id="agent-1", text="hi", steer=True))
+
+        fake.steer.assert_not_awaited()
+        assert [(i.text, i.steerable) for i in broker._prompt_queue.items("agent-1")] == [
+            ("hi", False)
+        ]
 
 
 class TestSinkLockGuard:

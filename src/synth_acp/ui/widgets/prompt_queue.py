@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widgets import Button, Tab, Tabs, TextArea
 from textual.widgets.markdown import Markdown
@@ -40,6 +41,13 @@ class PromptQueue(Vertical):
 
     class DeleteRequested(Message):
         """User wants to delete a queue item."""
+
+        def __init__(self, item_id: str) -> None:
+            self.item_id = item_id
+            super().__init__()
+
+    class SteerRequested(Message):
+        """User wants a queue item injected into the running turn instead of waiting."""
 
         def __init__(self, item_id: str) -> None:
             self.item_id = item_id
@@ -91,6 +99,7 @@ class PromptQueue(Vertical):
         self._items: list[QueueItemSnapshot] = []
         self._active_id: str | None = None
         self._editing_id: str | None = None  # locally tracked edit state
+        self._can_steer = False
         self.display = False
 
     def compose(self) -> ComposeResult:
@@ -98,8 +107,12 @@ class PromptQueue(Vertical):
         with Horizontal(classes="queue-content"):
             yield Markdown("", classes="queue-display")
         with Horizontal(classes="queue-actions"):
+            yield Button("Steer ⇥", id="queue-steer-btn", classes="info-bar-right")
             yield Button("Edit ✎", id="queue-edit-btn", classes="info-bar-right")
             yield Button("Delete ✕", id="queue-delete-btn", classes="info-bar-right")
+
+    def on_mount(self) -> None:
+        self._apply_steer_visibility()
 
     def reconcile(self, items: list[QueueItemSnapshot]) -> None:
         """Reconcile widget state from a broker queue snapshot.
@@ -151,6 +164,18 @@ class PromptQueue(Vertical):
         self._show_item(active_item)
         self.display = True
 
+    def set_can_steer(self, can_steer: bool) -> None:
+        """Show the Steer button only while the agent is busy on a harness that can steer."""
+        self._can_steer = can_steer
+        self._apply_steer_visibility()
+
+    def _apply_steer_visibility(self) -> None:
+        try:
+            button = self.query_one("#queue-steer-btn", Button)
+        except NoMatches:
+            return
+        button.display = self._can_steer and self._editing_id is None
+
     @property
     def has_items(self) -> bool:
         """Whether queue has any items."""
@@ -181,6 +206,7 @@ class PromptQueue(Vertical):
         else:
             content.mount(Markdown(item.text, classes="queue-display"))
             edit_btn.label = "Edit ✎"
+        self._apply_steer_visibility()
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         """Handle tab switch — show new item."""
@@ -212,6 +238,9 @@ class PromptQueue(Vertical):
                 item = next((i for i in self._items if i.id == self._active_id), None)
                 if item:
                     self._show_item(item)
+        elif event.button.id == "queue-steer-btn":
+            if self._active_id and self._editing_id is None:
+                self.post_message(self.SteerRequested(item_id=self._active_id))
         elif event.button.id == "queue-delete-btn":
             if self._active_id:
                 self.post_message(self.DeleteRequested(item_id=self._active_id))

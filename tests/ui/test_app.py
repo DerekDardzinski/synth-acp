@@ -1734,3 +1734,18 @@ class TestPendingProfileSwitchLabel:
             await app.select_agent("agent-2")
             await pilot.pause()
             assert "→ probe-heron pending" in self._label(app, "agent-2")
+
+
+class TestCanSteer:
+    def test_claude_permission_hides_steer_but_other_harness_permission_does_not(self) -> None:
+        """Claude adaptor 0.70.0 can hang if steered during permission; Kiro's
+        protocol has no such restriction, so the compatibility guard is Claude-only."""
+        app = _make_app("agent-1")
+        app.broker._registry.get_capabilities.return_value = ExtensionCapabilities(steer=True)
+        app.broker.is_permission_pending = MagicMock(return_value=True)
+
+        app.broker.get_agent_harness.return_value = "claude"
+        assert app.can_steer("agent-1") is False
+
+        app.broker.get_agent_harness.return_value = "kiro"
+        assert app.can_steer("agent-1") is True

@@ -21,6 +21,13 @@ class HelpScreen(ModalScreen[None]):
         with Vertical(id="help-container"):
             yield Static(self._build_bindings_text(), id="help-bindings")
             yield Static(
+                "[bold]Prompt[/bold]\n"
+                "  enter        Send; while the agent is busy, queue for the next turn\n"
+                "  shift+enter  While busy, steer: inject into the running turn\n"
+                "  ctrl+j       New line",
+                id="help-prompt",
+            )
+            yield Static(
                 "[bold]Layout[/bold]\n"
                 "  Left sidebar: agent list and MCP button\n"
                 "  Right panel: conversation feed or MCP messages",

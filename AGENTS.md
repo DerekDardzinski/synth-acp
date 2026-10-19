@@ -139,6 +139,12 @@ Optional (`pip install synth-acp[search]`):
 - `executable_env_var = "CLAUDE_CODE_EXECUTABLE"` — injects detected binary path
 - `clear_env_vars = ["CLAUDECODE"]` — clears stale env vars in subprocess
 - Returns `config_options` with mode (permission), model, and effort (model-dependent)
+- In-turn steering uses `_session/steering` with `idleBehavior: promptRequired`, so a
+  turn-end race leaves the text unconsumed for synth to deliver as a prompt rather than
+  starting an untracked detached turn. Live-verified on claude-agent-acp 0.70.0 and 0.90.0
+- While a Claude permission request is open, synth queues steering messages instead of
+  injecting them. This keeps compatibility with adaptor 0.70.0, whose immediate steer
+  can cancel the permission card and leave the prompt hanging; 0.71.0 fixed the adaptor
 - `set_config_option()` response returns full updated config_options (effort may disappear on model switch)
 - Agent names for plugins: `<plugin-name>:<agent-name>` (e.g., `local-SHScienceAgentKit-all:code-planner`)
 

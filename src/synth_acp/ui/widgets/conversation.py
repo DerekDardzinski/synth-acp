@@ -470,7 +470,7 @@ class ConversationFeed(Vertical):
         elif isinstance(event, HookFired):
             await self._add_hook_notification_impl(event.hook_name)
         elif isinstance(event, MessageSteered):
-            await self._add_steered_message_impl(event.from_agent, event.text)
+            await self._add_steered_message_impl(event.from_agent, event.text, event.source)
         elif isinstance(event, UserPromptSubmitted):
             await self._add_prompt_impl(event.text)
 
@@ -1252,7 +1252,9 @@ class ConversationFeed(Vertical):
             self._plan_block = block
             await target.mount(block)
 
-    async def add_steered_message(self, from_agent: str | None, text: str) -> None:
+    async def add_steered_message(
+        self, from_agent: str | None, text: str, *, source: str = "mcp"
+    ) -> None:
         """Render a steered inter-agent message inside the RUNNING turn.
 
         A steered message is injected into a turn that is already in flight, so it
@@ -1262,11 +1264,14 @@ class ConversationFeed(Vertical):
         Args:
             from_agent: Sender agent ID, or None when unattributed.
             text: The message text as it was sent to the harness.
+            source: ``"user"`` for a user steer, ``"mcp"`` for agent messages.
         """
         async with self.exclusive_render():
-            await self._add_steered_message_impl(from_agent, text)
+            await self._add_steered_message_impl(from_agent, text, source)
 
-    async def _add_steered_message_impl(self, from_agent: str | None, text: str) -> None:
+    async def _add_steered_message_impl(
+        self, from_agent: str | None, text: str, source: str = "mcp"
+    ) -> None:
         """Mount the steered-message block into the current turn."""
         target = await self._mount_target()
         if target is None:
@@ -1279,7 +1284,8 @@ class ConversationFeed(Vertical):
             await container.mount(Markdown(text, open_links=False))
             await container.mount(
                 Static(
-                    f"[dim]◈ {escape(from_agent or 'agent')} → {escape(self._agent_id)}"
+                    f"[dim]◈ {'you (steer)' if source == 'user' else escape(from_agent or 'agent')}"
+                    f" → {escape(self._agent_id)}"
                     f"  {ts}[/dim]",
                     classes="bubble-ts",
                 )

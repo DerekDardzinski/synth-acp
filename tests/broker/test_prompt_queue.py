@@ -29,9 +29,10 @@ class TestPopSteerable:
         assert q.pop_steerable("agent-1") == []
         assert [i.text for i in q.items("agent-1")] == ["a", "b"]
 
-    def test_pop_steerable_stops_at_ineligible_item(self) -> None:
-        """A queued user prompt or system notification must never ride along in a
-        steer payload — being queued does not make a prohibited class eligible."""
+    def test_pop_steerable_bypasses_ineligible_items_and_leaves_them_in_place(self) -> None:
+        """A steer is for the running turn, so it passes over a prompt queued for a
+        later turn. Stopping there would hold the steer until the turn it was meant to
+        change had ended; consuming the prompt would send it into the wrong turn."""
         q = PromptQueue()
         q.enqueue("agent-1", QueuedItem(id="a", text="a", steerable=True))
         q.enqueue("agent-1", QueuedItem(id="user", text="typed by user", steerable=False))
@@ -39,8 +40,8 @@ class TestPopSteerable:
 
         popped = q.pop_steerable("agent-1")
 
-        assert [i.text for i in popped] == ["a"]
-        assert [i.text for i in q.items("agent-1")] == ["typed by user", "c"]
+        assert [i.text for i in popped] == ["a", "c"]
+        assert [i.text for i in q.items("agent-1")] == ["typed by user"]
 
 
 class TestRequeueFront:

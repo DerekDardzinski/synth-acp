@@ -31,10 +31,16 @@ class ResurrectAgent(BrokerCommand):
 
 
 class SendPrompt(BrokerCommand):
-    """Send a user prompt to an agent."""
+    """Send a user prompt to an agent.
+
+    ``steer`` asks for the text to be injected into the agent's running turn, ahead of
+    any queued prompts. It applies only while the agent is busy on a harness that can
+    steer; otherwise the prompt is delivered or queued as usual.
+    """
 
     agent_id: str
     text: str
+    steer: bool = False
 
 
 class RespondPermission(BrokerCommand):
@@ -144,6 +150,13 @@ class CommitQueueEdit(BrokerCommand):
 
 class DeleteQueueItem(BrokerCommand):
     """User deleted a queued item."""
+
+    agent_id: str
+    item_id: str
+
+
+class SteerQueueItem(BrokerCommand):
+    """User moved a queued item out of the queue to steer it into the running turn."""
 
     agent_id: str
     item_id: str

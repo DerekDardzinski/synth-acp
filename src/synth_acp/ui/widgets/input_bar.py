@@ -222,10 +222,10 @@ class PromptTextArea(TextArea):
             self.post_message(self.PickerKey(event.key))
             return
 
-        if event.key == "enter":
+        if event.key in ("enter", "shift+enter"):
             event.prevent_default()
             event.stop()
-            self.post_message(PromptTextArea.Submitted(self))
+            self.post_message(PromptTextArea.Submitted(self, steer=event.key == "shift+enter"))
             return
         if event.key == "ctrl+j":
             event.prevent_default()
@@ -247,8 +247,10 @@ class PromptTextArea(TextArea):
     class Submitted(Message):
         """Posted when the user submits the prompt."""
 
-        def __init__(self, text_area: PromptTextArea) -> None:
+        def __init__(self, text_area: PromptTextArea, *, steer: bool = False) -> None:
             self.text_area = text_area
+            self.steer = steer
+            """True for Shift+Enter or the Steer button: inject into the running turn."""
             super().__init__()
 
 
@@ -664,6 +666,8 @@ class InputBar(Vertical):
                 classes="info-bar-left",
             )
             yield Button("Submit ⏎", id="submit-btn", classes="info-bar-right")
+            yield Button("Steer ⇧⏎", id="steer-btn", classes="info-bar-right")
+            yield Button("Queue ⏎", id="queue-btn", classes="info-bar-right")
             yield Button("Drain Queue ▶", id="drain-btn", classes="info-bar-right")
             yield Button("Cancel ■", id="cancel-btn", classes="info-bar-right cancel-btn")
         yield Static("", id="cwd-label", classes="info-cwd")
@@ -918,11 +922,18 @@ class InputBar(Vertical):
 
     # --- Existing functionality ---
 
-    @on(Button.Pressed, "#submit-btn")
+    @on(Button.Pressed, "#submit-btn, #queue-btn, #steer-btn")
     def _on_submit_click(self, event: Button.Pressed) -> None:
         event.stop()
         ta = self.query_one("#prompt-input", PromptTextArea)
-        ta.post_message(PromptTextArea.Submitted(ta))
+        ta.post_message(PromptTextArea.Submitted(ta, steer=event.button.id == "steer-btn"))
+
+    def _can_steer(self) -> bool:
+        """True when this agent's harness can inject text into a running turn."""
+        from synth_acp.ui.app import SynthApp
+
+        app = self.app
+        return isinstance(app, SynthApp) and app.can_steer(self._agent_id)
 
     @on(Button.Pressed, "#cancel-btn")
     def _on_cancel_click(self, event: Button.Pressed) -> None:
@@ -989,12 +1000,21 @@ class InputBar(Vertical):
         """
         try:
             submit = self.query_one("#submit-btn")
+            steer = self.query_one("#steer-btn")
+            queue = self.query_one("#queue-btn")
             cancel = self.query_one("#cancel-btn")
             drain = self.query_one("#drain-btn")
             activity = self.query_one(ActivityBar)
         except NoMatches:
             return
         submit.display = not self._busy
+        # While busy, Submit splits into Steer (inject now) and Queue (next turn).
+        steer.display = self._busy and self._can_steer()
+        queue.display = self._busy
+        from synth_acp.ui.widgets.prompt_queue import PromptQueue
+
+        for prompt_queue in self.query(PromptQueue):
+            prompt_queue.set_can_steer(bool(steer.display))
         cancel.display = self._busy
         drain.display = False
         activity.active = self._busy
@@ -1027,7 +1047,9 @@ class InputBar(Vertical):
                 app.run_worker(feed.run_shell_command(command))
             return
 
-        app.run_worker(app.broker.handle(SendPrompt(agent_id=self._agent_id, text=text)))
+        app.run_worker(
+            app.broker.handle(SendPrompt(agent_id=self._agent_id, text=text, steer=message.steer))
+        )
 
     def set_disabled(self, disabled: bool, hint: str) -> None:  # noqa: ARG002
         """Enable or disable the input.

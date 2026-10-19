@@ -144,15 +144,18 @@ class HookFired(BrokerEvent):
 
 
 class MessageSteered(BrokerEvent):
-    """An inter-agent message was injected into the agent's running turn.
+    """A user or inter-agent message was injected into the agent's running turn.
 
     A steered message sends no prompt, so no UserPromptSubmitted is emitted for
     it. This event is the only record that it was delivered, and the UI renders
-    it inside the turn it arrived in.
+    it inside the turn it arrived in. ``source`` is ``"user"`` for a user steer and
+    ``"mcp"`` for agent messages; journaled events written before it existed are agent
+    messages, hence the default.
     """
 
     from_agent: str | None
     text: str
+    source: Literal["user", "mcp"] = "mcp"
 
 
 class QueueItemSnapshot(BaseModel, frozen=True):

@@ -14,9 +14,9 @@ class QueuedItem:
 
     ``steerable`` records whether THIS item may be injected into a running turn.
     It is decided by the broker when the item is queued and cannot be recovered
-    later: the queue stores rendered text, not the message kind, so a user prompt
-    and a system notification are indistinguishable from an eligible chat body
-    once queued. Both are prohibited from being steered.
+    later: the queue stores rendered text, not the message kind. True for an agent
+    message eligible to steer and for a user message the user chose to steer; false
+    for a prompt the user chose to queue and for a system notification.
 
     ``first_prompt`` marks the one item a handoff reserves as its successor's opening
     turn. It is what lets a drain identify the reserved item at the moment it hands the
@@ -69,31 +69,35 @@ class PromptQueue:
         return item
 
     def pop_steerable(self, agent_id: str) -> list[QueuedItem]:
-        """Pop every LEADING item that may be steered, in queue order.
+        """Pop every steerable item, in queue order, passing over the rest.
 
-        Stops at the first item that is flagged ``editing`` or is not
-        ``steerable``, leaving it and everything behind it queued. The editing
-        rule matches what ``can_drain``/``pop`` already apply to the front item.
-        The steerable rule keeps user prompts and system notifications out of a
-        steer payload: a message class that is prohibited from being steered on
-        arrival is still prohibited once it is sitting in the queue.
+        A steer is meant for the RUNNING turn, so it bypasses items that are not
+        ``steerable`` -- prompts the user chose to queue for a later turn, and system
+        notifications -- and leaves them where they are.
 
-        Returns ``[]`` when the front item is either being edited or not
-        steerable.
+        Stops at the first steerable item flagged ``editing``, leaving it and every
+        steerable item behind it queued, so half-typed text is never sent and queued
+        steers behind it keep their order. A NEW steer is still sent while an item is
+        being edited, so it can arrive ahead of the edited one.
         """
         queue = self._queues.get(agent_id)
         if not queue:
             return []
-        stop = len(queue)
-        for i, item in enumerate(queue):
-            if item.editing or not item.steerable:
-                stop = i
-                break
-        if stop == 0:
+        popped: list[QueuedItem] = []
+        kept: list[QueuedItem] = []
+        blocked = False
+        for item in queue:
+            if item.steerable and not blocked and not item.editing:
+                popped.append(item)
+                continue
+            if item.steerable and item.editing:
+                blocked = True
+            kept.append(item)
+        if not popped:
             return []
-        popped = queue[:stop]
-        del queue[:stop]
-        if not queue:
+        if kept:
+            self._queues[agent_id] = kept
+        else:
             del self._queues[agent_id]
         return popped
 

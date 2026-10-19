@@ -139,7 +139,7 @@ When `.synth.json` exists, its settings override global config. Fields not set i
 |-------|---------------|-------------|
 | `communication_mode` | `"LOCAL"` | `MESH` (all agents visible) or `LOCAL` (family only) |
 | `auto_approve_tools` | `["synth-mcp"]` | Tool name patterns to auto-approve without prompting. When the harness reports the tool's identity (`<server>/<tool>`, Kiro v3 MCP tools), a pattern must equal the server name (`synth-mcp`) or the full identity (`synth-mcp/send_message`); a prefix such as `synth` no longer matches. Otherwise the pattern is matched as a substring of the permission title |
-| `messages_interrupt` | `true` | Deliver inter-agent messages into a running turn instead of waiting for it to end. Kiro and Codex only; other harnesses always wait for the turn to end |
+| `messages_interrupt` | `true` | Deliver inter-agent messages into a running turn instead of waiting for it to end. Claude, Kiro and Codex only; other harnesses always wait for the turn to end. Applies to agent messages only; a user steer (Shift+Enter) works either way |
 | `handoff_nudge` | `true` | Send an agent a one-time message suggesting it call `handoff` once its context window passes `handoff_nudge_threshold` |
 | `handoff_nudge_threshold` | `0.5` | Fraction of the context window that triggers the nudge. Must be greater than 0 and at most 1 |
 | `handoff_nudge_template` | see below | Nudge body. Slots: `{agent_id}`, `{used}`, `{nudge_threshold}`. `{used}` and `{nudge_threshold}` render as whole percents (e.g. `62%`) |
@@ -212,8 +212,8 @@ The nudge fires at most once per agent per synth run. An agent that hands off ge
 successor with an empty context, and the successor is nudgeable again in its turn.
 
 The nudge is delivered as an ordinary inter-agent message from the sender `synth`, so it
-appears in the conversation transcript exactly like any other message — mid-turn on Kiro
-and Codex (where in-turn steering is supported), or at the next idle point on other harnesses. It is
+appears in the conversation transcript exactly like any other message — mid-turn on Claude,
+Kiro and Codex (where in-turn steering is supported), or at the next idle point on other harnesses. It is
 a suggestion: the agent decides whether to act on it.
 
 Usage data comes from whatever the harness reports. Claude Code reports token counts.
@@ -312,6 +312,11 @@ first-class `options.agent` was removed in 0.77.0; `extraArgs.agent` works on bo
   ends its turn without handing off, or hands off without `agent_mode`, the switch is
   dropped with a warning; pick the agent again to retry. Kiro switches in place with
   `set_session_mode`.
+- **In-turn steering:** Shift+Enter, the Steer button and eligible inter-agent
+  messages use `_session/steering`. Synth asks the adaptor to leave a turn-end race
+  unconsumed so it can deliver the text as a normal prompt. While a permission request
+  is open, synth queues the steer for compatibility with adaptor 0.70.0; 0.71.0 fixed
+  the adaptor to defer it safely.
 - Sessions created on claude-agent-acp 0.77.0 or later by an older synth, which sent
   `options.agent`, ran as the default agent, and restoring them keeps the default agent.
 
@@ -484,6 +489,8 @@ Messages are delivered to idle agents between turns. MCP-delivered inter-agent m
 
 | Key | Action |
 |-----|--------|
+| `Enter` | Send the prompt; while the agent is busy, queue it for the next turn |
+| `Shift+Enter` | While the agent is busy, steer: inject the text into the running turn, ahead of queued prompts (Claude, Kiro and Codex) |
 | `Tab` | Cycle agent focus |
 | `m` | MCP messages panel |
 | `l` | Launch agent |

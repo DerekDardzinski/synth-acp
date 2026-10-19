@@ -12,7 +12,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict
 
@@ -41,6 +41,7 @@ from synth_acp.models.commands import (
     SetAgentMode,
     SetAgentModel,
     SetConfigOption,
+    SteerQueueItem,
     TerminateAgent,
 )
 from synth_acp.models.config import (
@@ -74,6 +75,17 @@ from synth_acp.models.permissions import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _runs_by_source(items: list[QueuedItem]) -> list[list[QueuedItem]]:
+    """Split items into consecutive runs of the same ``source``, keeping order."""
+    runs: list[list[QueuedItem]] = []
+    for item in items:
+        if runs and runs[-1][0].source == item.source:
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+    return runs
 
 
 def _auto_approve_matches(pattern: str, tool_identity: str | None, title: str) -> bool:
@@ -194,8 +206,10 @@ class ACPBroker:
             case ResurrectAgent(agent_id=aid):
                 await self._start_message_bus()
                 await lifecycle.resurrect(aid)
-            case SendPrompt(agent_id=aid, text=text):
-                await self.submit_prompt(aid, text, source="user")
+            case SendPrompt(agent_id=aid, text=text, steer=steer):
+                await self.submit_prompt(
+                    aid, text, source="user", steerable=steer and self._user_steer_eligible(aid)
+                )
             case RespondPermission(agent_id=aid, request_id=rid, option_id=oid):
                 await self._resolve_permission(aid, rid, oid)
             case CancelTurn(agent_id=aid):
@@ -237,6 +251,8 @@ class ACPBroker:
                     await self._sink(ProfileSwitchChanged(agent_id=aid, pending_agent_mode=None))
                 await self._emit_queue_state(aid)
                 await self._try_drain(aid)
+            case SteerQueueItem(agent_id=aid, item_id=iid):
+                await self._steer_queued(aid, iid)
             case RequestProfileSwitch(agent_id=aid, agent_mode=mode, instructions=instr):
                 await self._request_profile_switch(aid, mode, instr)
 
@@ -259,13 +275,21 @@ class ACPBroker:
         Delivery rules checked at decision time (no stale flags):
         - User message: deliver directly if IDLE (queue items wait)
         - MCP message: deliver if IDLE + queue empty + user not composing
-        - Steerable MCP message on a not-IDLE agent: inject into the running turn
+        - Steerable message on a not-IDLE agent: inject into the running turn,
+          bypassing queued prompts
         - Otherwise: enqueue, attempt drain
 
         ``steerable`` defaults False so every existing caller keeps today's
-        behavior. Only ``_on_mcp_message`` passes True — the dynamic-child
+        behavior. ``_on_mcp_message`` passes True for eligible agent messages, and
+        ``SendPrompt(steer=True)`` passes it for a user steer -- the dynamic-child
         startup path calls ``submit_prompt(source="mcp")`` directly, bypassing
-        that seam, so a child's launch prompt is never steered.
+        both, so a child's launch prompt is never steered.
+
+        A steer the harness refuses is queued at the front, still steerable, behind
+        only the refused backlog and ahead of prompts queued for a later turn, so the
+        next steer carries it or the IDLE drain sends it first; a user steer also gets a
+        warning. A user steer never attempted because the agent had already gone IDLE
+        is an ordinary prompt.
 
         ``switch_id`` tags a profile-switch request; the switch arms when this text
         actually starts as a prompt, whether now or later from the queue.
@@ -291,11 +315,29 @@ class ACPBroker:
                 self._arm_switch(agent_id, switch_id)
                 return
 
-        if steerable and not idle and await self._try_steer(agent_id, text, from_agent):
-            # An accepted steer is the delivery of record. Enqueueing the same
-            # text as well would deliver it twice, because Kiro holds a steer
-            # sent to an idle session and rides it along with the next prompt.
-            return
+        if steerable and not idle:
+            result = await self._try_steer(agent_id, text, source, from_agent)
+            if result == "steered":
+                # An accepted steer is the delivery of record. Enqueueing the same
+                # text as well would deliver it twice, because Kiro holds a steer
+                # sent to an idle session and rides it along with the next prompt.
+                return
+            if result == "requeued":
+                # Refused by the harness: _try_steer already put the text at the front,
+                # behind only the refused backlog, ahead of prompts for a later turn.
+                if source == "user":
+                    await self._warn_unsteered(agent_id)
+                if not await self._try_drain(agent_id):
+                    await self._emit_queue_state(agent_id)
+                return
+            # Not attempted: the agent went IDLE before the steer, or a handoff's first
+            # prompt is reserved. A user's text is then an ordinary prompt.
+            if source == "user":
+                session = self._registry.get_session(agent_id)
+                if session is not None and session.state == AgentState.IDLE and (
+                    await lifecycle.prompt(agent_id, text)
+                ):
+                    return
 
         # Enqueue and attempt immediate drain
         item = QueuedItem(
@@ -310,6 +352,54 @@ class ACPBroker:
         if not drained:
             # Item is sitting in queue — notify UI
             await self._emit_queue_state(agent_id)
+
+    async def _steer_queued(self, agent_id: str, item_id: str) -> None:
+        """Take one queued item out of the queue and steer it into the running turn.
+
+        Ignored unless the agent is busy on a harness that can steer, and for an item
+        that is being edited, carries a profile-switch request, or is a handoff's
+        reserved first prompt: those must run as prompts. Steered with the same rules
+        as a Shift+Enter steer. When no steer is attempted because the turn ended
+        meanwhile, the item returns to the FRONT of the queue, so it runs next.
+        """
+        session = self._registry.get_session(agent_id)
+        if (
+            session is None
+            or session.state == AgentState.IDLE
+            or not self._user_steer_eligible(agent_id)
+        ):
+            return
+        item = next((i for i in self._prompt_queue.items(agent_id) if i.id == item_id), None)
+        if item is None or item.editing or item.switch_id is not None or item.first_prompt:
+            return
+        self._prompt_queue.delete(agent_id, item_id)
+        result = await self._try_steer(agent_id, item.text, item.source, item.from_agent)
+        if result == "not_attempted":
+            self._prompt_queue.requeue_front(agent_id, [item])
+        elif result == "requeued" and item.source == "user":
+            await self._warn_unsteered(agent_id)
+        if result == "steered" or not await self._try_drain(agent_id):
+            await self._emit_queue_state(agent_id)
+
+    def _user_steer_eligible(self, agent_id: str) -> bool:
+        """Whether a user steer may be attempted: the harness engine can steer.
+
+        ``messages_interrupt`` does not apply; it governs agent messages only.
+        """
+        session = self._registry.get_session(agent_id)
+        return session is not None and session.capabilities.steer
+
+    async def _warn_unsteered(self, agent_id: str) -> None:
+        await self._sink(
+            BrokerError(
+                agent_id=agent_id,
+                message=(
+                    f"{agent_id} did not accept the steer, so synth queued it at the front, "
+                    "ahead of prompts queued for a later turn."
+                ),
+                severity="warning",
+            )
+        )
 
     def _steer_eligible(self, agent_id: str, kind: MessageKind) -> bool:
         """Whether this message may be steered into a running turn.
@@ -326,16 +416,30 @@ class ACPBroker:
         session = self._registry.get_session(agent_id)
         return session is not None and session.capabilities.steer
 
-    async def _try_steer(self, agent_id: str, text: str, from_agent: str | None) -> bool:
-        """Attempt in-turn delivery. Returns True if the message was delivered.
+    async def _try_steer(
+        self, agent_id: str, text: str, source: str, from_agent: str | None
+    ) -> Literal["steered", "requeued", "not_attempted"]:
+        """Attempt in-turn delivery of ``text`` and every queued steerable item.
 
-        Builds the payload from any already-queued items that are themselves
-        steerable, PLUS ``text``, so a steer that follows a previously failed one
-        carries the backlog. A queued user prompt or system notification is never
-        included: those classes are prohibited from being steered, and being
-        queued does not make them eligible. On success the included items are
-        consumed and the steered event is emitted. On failure the queue is
-        restored and the caller enqueues normally.
+        Delivers every already-queued steerable item, PLUS ``text``, so a steer that
+        follows a previously failed one carries the backlog. Items that are not
+        steerable -- prompts the user queued for a later turn, system notifications --
+        are passed over and stay queued.
+
+        User and agent messages are never mixed in one steer. The items are split into
+        runs wherever the source changes, and each run is sent as its own steer, in
+        order: ``[user, agent, agent, user, user, agent, user]`` is five steers. Each
+        accepted run is consumed and emits its own ``MessageSteered``.
+
+        Returns ``"steered"`` when every run, ``text`` included, was accepted.
+
+        Returns ``"requeued"`` at the first refused run: that run, every later run and
+        ``text`` itself go back to the FRONT of the queue, in order, as steerable items.
+        The front, not their old positions or the back: they were meant for the running
+        turn, so they stay ahead of prompts queued for a later one, whatever the timing.
+
+        Returns ``"not_attempted"`` when no steer was sent (no session, already IDLE, or
+        a reserved first prompt). Nothing was popped or queued; the caller decides.
 
         Holds ``self._registry.agent_lock(agent_id)`` across the whole attempt.
         Without it an IDLE transition can drain the queue between building the
@@ -347,7 +451,16 @@ class ACPBroker:
         async with self._registry.agent_lock(agent_id):
             session = self._registry.get_session(agent_id)
             if session is None or session.state == AgentState.IDLE:
-                return False
+                return "not_attempted"
+            # claude-agent-acp 0.70.0 always injects at priority "now". During a
+            # permission request that cancels the card and can leave session/prompt
+            # hanging. Version 0.71.0 fixed the adaptor, but synth supports older
+            # installs, so defer on every Claude version until the permission resolves.
+            if (
+                session.state == AgentState.AWAITING_PERMISSION
+                and self._registry.get_harness(agent_id) == "claude"
+            ):
+                return "not_attempted"
             if self._first_prompt_reserved(agent_id):
                 # Refused before anything is popped, so the caller's normal enqueue path
                 # preserves the text. Rechecked HERE rather than at entry because a steer
@@ -355,17 +468,33 @@ class ACPBroker:
                 # parked on this lock -- and session.steer needs only a session id, which
                 # a successor has while it is still INITIALIZING, so it would inject text
                 # ahead of the reserved first prompt.
-                return False
+                return "not_attempted"
             pending = self._prompt_queue.pop_steerable(agent_id)
-            payload = self._format_steer_text([i.text for i in pending] + [text])
-            outcome = await session.steer(payload)
-            if not outcome.accepted:
-                self._prompt_queue.requeue_front(agent_id, pending)
-                return False
-        await self._sink(MessageSteered(agent_id=agent_id, from_agent=from_agent, text=payload))
-        if pending:
+            new = QueuedItem(text=text, source=source, from_agent=from_agent, steerable=True)  # type: ignore[arg-type]
+            runs = _runs_by_source([*pending, new])
+            steered: list[MessageSteered] = []
+            result: Literal["steered", "requeued"] = "steered"
+            for n, run in enumerate(runs):
+                payload = self._format_steer_text([i.text for i in run])
+                outcome = await session.steer(payload)
+                if not outcome.accepted:
+                    self._prompt_queue.requeue_front(agent_id, [i for r in runs[n:] for i in r])
+                    result = "requeued"
+                    break
+                senders = {i.from_agent for i in run}
+                steered.append(
+                    MessageSteered(
+                        agent_id=agent_id,
+                        from_agent=senders.pop() if len(senders) == 1 else None,
+                        text=payload,
+                        source=run[0].source,
+                    )
+                )
+        for event in steered:
+            await self._sink(event)
+        if pending and result == "steered":
             await self._emit_queue_state(agent_id)
-        return True
+        return result
 
     def _format_steer_text(self, bodies: list[str]) -> str:
         """Join message bodies for one steer call.
