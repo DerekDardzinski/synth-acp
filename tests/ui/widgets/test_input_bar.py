@@ -301,6 +301,7 @@ class TestConfigOptionPickers:
     def _make_input_bar(self) -> InputBar:
         """Create an InputBar with mocked internals for picker testing."""
         bar = InputBar.__new__(InputBar)
+        bar._extra_options = []
         bar._agent_id = "test-agent"
         bar._agent_name = "Test Agent"
         bar._harness = "kiro"
@@ -352,11 +353,49 @@ class TestConfigOptionPickers:
             ]
             bar.update_config_options(options)
 
-        # 3 pickers (boolean filtered out), ordered: mode(0), model(1), thought_level(2)
-        assert len(mounted_pickers) == 3
-        assert mounted_pickers[0].id == "picker-mode"
-        assert mounted_pickers[1].id == "picker-model"
-        assert mounted_pickers[2].id == "picker-effort"
+        # Inline: the reserved categories only, ordered mode(0), model(1), thought_level(2)
+        inline = [p for p in mounted_pickers if isinstance(p, _PickerLabel)]
+        assert [p.id for p in inline] == ["picker-mode", "picker-model", "picker-effort"]
+        # The boolean is not dropped: it waits behind "⋯ 1 more"
+        assert [o.id for o in bar._extra_options] == ["verbose"]
+
+    def test_unreserved_options_go_behind_more_in_agent_order(self) -> None:
+        """Kiro v3's three uncategorized options must reach the modal in Kiro's order,
+        and none may be drawn inline (that is what overflowed a split window)."""
+        from unittest.mock import MagicMock, patch
+
+        from textual.css.query import NoMatches
+
+        bar = self._make_input_bar()
+        container = MagicMock()
+        mounted: list = []
+        container.mount = lambda w, **_kw: mounted.append(w)
+        container.children = []
+        container.query_one = MagicMock(side_effect=NoMatches())
+        on_off = [("on", "On"), ("off", "Off")]
+        with patch.object(bar, "query_one", return_value=container):
+            bar.update_config_options([
+                self._make_select_option("mode", "Mode", "mode", "a", [("a", "A")]),
+                self._make_select_option("memoryReflection", "Memory reflection", None, "on", on_off),
+                self._make_select_option("model", "Model", "model", "m", [("m", "M")]),
+                self._make_select_option("autopilot", "Autopilot", None, "on", on_off),
+                self._make_select_option("contentCollection", "Content", "_custom", "on", on_off),
+            ])
+
+        assert [p.id for p in mounted if isinstance(p, _PickerLabel)] == ["picker-mode", "picker-model"]
+        assert [o.id for o in bar._extra_options] == ["memoryReflection", "autopilot", "contentCollection"]
+        more = next(w for w in mounted if w.id == "picker-more")
+        assert more.display is True
+
+    def test_boolean_value_change_reaches_the_modal_copy(self) -> None:
+        """A boolean change must update the copy the modal opens from, or the modal
+        shows the old value and Apply would send it back."""
+        bar = self._make_input_bar()
+        bar._extra_options = [
+            SessionConfigOptionBoolean(id="verbose", name="Verbose", type="boolean", current_value=True)
+        ]
+        bar.update_config_option_value("verbose", False)
+        assert bar._extra_options[0].current_value is False
 
     def test_update_config_option_value_updates_picker(self) -> None:
         """update_config_option_value calls set_current on the correct picker."""

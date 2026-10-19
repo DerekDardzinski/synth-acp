@@ -13,7 +13,6 @@ from typing import ClassVar
 from acp.schema import (
     SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
-    SessionConfigSelectGroup,
 )
 from rich.text import Text
 from textual import events, on
@@ -29,6 +28,7 @@ from textual.widgets.option_list import Option
 
 from synth_acp.models.commands import CancelTurn, RequestProfileSwitch, SendPrompt, SetConfigOption
 from synth_acp.ui.file_discovery import FileEntry, discover_files, estimate_tokens, filter_files
+from synth_acp.ui.screens.config_options import select_items
 from synth_acp.ui.widgets.choice_bar import Choice, ChoiceBar
 from synth_acp.ui.widgets.gradient_bar import ActivityBar
 
@@ -401,6 +401,30 @@ class _PickerLabel(Static):
         popup.focus()
 
 
+_MORE_PICKER_ID = "picker-more"
+
+
+class _MoreOptionsLabel(Static):
+    """``⋯ N more`` label after the inline pickers; opens the ConfigOptionsScreen."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__("", **kwargs)
+        self.display = False
+
+    def set_count(self, count: int) -> None:
+        """Show ``⋯ count more``, or hide the label when count is 0."""
+        self.display = count > 0
+        if count:
+            self.update(f"[dim]⋯ {count} more[/]")
+
+    def on_click(self) -> None:
+        """Open the modal for the remaining options."""
+        for ancestor in self.ancestors:
+            if isinstance(ancestor, InputBar):
+                ancestor.open_config_options()
+                return
+
+
 class InputBar(Vertical):
     """Bottom input bar for sending prompts to agents.
 
@@ -428,6 +452,8 @@ class InputBar(Vertical):
         self._busy = False
         self._disabled = False
         self._slash_commands: list[object] = []
+        self._extra_options: list[SessionConfigOptionSelect | SessionConfigOptionBoolean] = []
+        """Config options not shown inline, in the agent's order; edited in a modal."""
         self._file_cache: list[FileEntry] = []
         self._file_cache_time: float = 0.0
         self._file_picker: _FilePickerPopup | None = None
@@ -664,56 +690,84 @@ class InputBar(Vertical):
     # --- Config option pickers ---
 
     _CATEGORY_ORDER: ClassVar[dict[str, int]] = {"agent": -1, "mode": 0, "model": 1, "thought_level": 2}
+    """Inline picker order. Only these categories are inline: ``agent`` is synth's
+    synthesized profile picker, the rest are ACP-reserved categories. Every other option,
+    select or boolean, is edited in the ConfigOptionsScreen behind ``⋯ N more``."""
 
     def update_config_options(self, options: list[SessionConfigOptionSelect | SessionConfigOptionBoolean]) -> None:
-        """Rebuild pickers from config options. Only select-type options get pickers.
+        """Rebuild inline pickers for the reserved categories and count the rest.
 
         Uses a diff approach: updates existing pickers in place, removes stale
         ones, and adds new ones. This avoids the Textual DuplicateIds bug that
         occurs when remove_children() (async) hasn't completed before mount()
         adds widgets with the same IDs.
         """
-        select_opts = [o for o in options if isinstance(o, SessionConfigOptionSelect)]
-        select_opts.sort(key=lambda o: self._CATEGORY_ORDER.get(o.category or "", 99))
+        inline = [
+            o
+            for o in options
+            if isinstance(o, SessionConfigOptionSelect) and (o.category or "") in self._CATEGORY_ORDER
+        ]
+        inline.sort(key=lambda o: self._CATEGORY_ORDER[o.category or ""])
+        inline_ids = {o.id for o in inline}
+        # The agent's own order, as the ACP spec asks clients to keep.
+        self._extra_options = [o for o in options if o.id not in inline_ids]
         try:
             container = self.query_one("#config-pickers", Horizontal)
         except Exception:
             return
 
-        # Build desired state: ordered list of (id, opt)
-        desired = {f"picker-{opt.id}": opt for opt in select_opts}
+        desired = {f"picker-{opt.id}": opt for opt in inline}
 
         # Remove pickers that are no longer in the desired set
         for child in list(container.children):
-            if child.id and child.id not in desired:
+            if child.id and child.id not in desired and child.id != _MORE_PICKER_ID:
                 child.remove()
 
-        # Update existing or add new pickers in order
+        try:
+            more: _MoreOptionsLabel | None = container.query_one(f"#{_MORE_PICKER_ID}", _MoreOptionsLabel)
+        except NoMatches:
+            more = None
+
+        # Update existing or add new pickers in order, always ahead of the "more" label
         for picker_id, opt in desired.items():
-            items: list[tuple[str, str]] = []
-            for entry in opt.options:
-                if isinstance(entry, SessionConfigSelectGroup):
-                    for sub in entry.options:
-                        items.append((sub.value, sub.name))
-                else:
-                    items.append((entry.value, entry.name))
-
-            # Disambiguate entries that share the same display name
-            name_counts: dict[str, int] = {}
-            for _, name in items:
-                name_counts[name] = name_counts.get(name, 0) + 1
-            items = [
-                (val, f"{name} ({val})" if name_counts.get(name, 1) > 1 else name)
-                for val, name in items
-            ]
-
+            items = select_items(opt)
             try:
                 existing = container.query_one(f"#{picker_id}", _PickerLabel)
                 existing.set_items(items, opt.current_value)
-            except Exception:
+            except NoMatches:
                 picker = _PickerLabel(opt.name, id=picker_id, classes="info-bar-picker")
-                container.mount(picker)
+                if more is not None:
+                    container.mount(picker, before=more)
+                else:
+                    container.mount(picker)
                 picker.set_items(items, opt.current_value)
+
+        if more is None:
+            more = _MoreOptionsLabel(id=_MORE_PICKER_ID, classes="info-bar-picker")
+            container.mount(more)
+        more.set_count(len(self._extra_options))
+
+    def open_config_options(self) -> None:
+        """Open the modal for the options not shown inline; apply what the user changes."""
+        from synth_acp.ui.screens.config_options import ConfigOptionsScreen
+
+        if not self._extra_options:
+            return
+
+        def _apply(changes: dict[str, str | bool] | None) -> None:
+            for config_id, value in (changes or {}).items():
+                self._send_config_option(config_id, value)
+
+        self.app.push_screen(ConfigOptionsScreen(self._agent_id, list(self._extra_options)), _apply)
+
+    def _send_config_option(self, config_id: str, value: str | bool) -> None:
+        from synth_acp.ui.app import SynthApp
+
+        app = self.app
+        if isinstance(app, SynthApp):
+            app.run_worker(
+                app.broker.handle(SetConfigOption(agent_id=self._agent_id, config_id=config_id, value=value))
+            )
 
     def set_pending_profile_switch(self, agent_mode: str | None) -> None:
         """Show agent_mode as the pending switch target on the agent picker, or clear it."""
@@ -722,8 +776,14 @@ class InputBar(Vertical):
         except NoMatches:
             pass
 
-    def update_config_option_value(self, config_id: str, value: str) -> None:
-        """Update a single picker's current value."""
+    def update_config_option_value(self, config_id: str, value: str | bool) -> None:
+        """Update a single option's current value, inline or behind ``⋯ N more``."""
+        for i, opt in enumerate(self._extra_options):
+            if opt.id == config_id:
+                self._extra_options[i] = opt.model_copy(update={"current_value": value})
+                return
+        if not isinstance(value, str):
+            return
         try:
             self.query_one(f"#picker-{config_id}", _PickerLabel).set_current(value)
         except Exception:

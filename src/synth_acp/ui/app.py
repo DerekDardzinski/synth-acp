@@ -528,10 +528,9 @@ class SynthApp(App):
                 if opt.id == event.config_id and hasattr(opt, "current_value"):
                     options[i] = opt.model_copy(update={"current_value": event.value})
                     break
-            if isinstance(event.value, str):
-                bar = self._get_input_bar(event.agent_id)
-                if bar:
-                    bar.update_config_option_value(event.config_id, event.value)
+            bar = self._get_input_bar(event.agent_id)
+            if bar:
+                bar.update_config_option_value(event.config_id, event.value)
             # Update tile mode if the changed option is the mode category
             opt_match = next((o for o in options if o.id == event.config_id), None)
             if opt_match and getattr(opt_match, "category", None) == "mode":

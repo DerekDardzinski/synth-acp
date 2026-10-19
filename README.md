@@ -328,6 +328,8 @@ Synth dynamically renders configuration pickers based on what the harness advert
 | OpenCode | None |
 | Gemini CLI | None |
 
+Only options in the ACP-reserved categories (`mode`, `model`, `thought_level`) and the agent-profile picker appear inline. Any other option the harness returns, such as Kiro v3's Autopilot or Memory reflection, sits behind a `⋯ N more` label that opens a modal.
+
 The effort level picker appears only for models that support it (e.g., Opus, Sonnet). Switching to Haiku removes the effort picker automatically.
 
 ### Kiro CLI v3 Engine

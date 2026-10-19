@@ -434,12 +434,12 @@ MarkdownFence Label { width: 1fr; text-wrap: wrap; }
 Footer { background: $background; color: $text-muted; }
 
 /* ── Modal screens ── */
-LaunchAgentScreen, HelpScreen {
+LaunchAgentScreen, HelpScreen, ConfigOptionsScreen {
     background: rgba(0, 0, 0, 0.65);
     align: center middle;
 }
 
-#launch-container, #help-container {
+#launch-container, #help-container, #config-options-container {
     width: 60;
     height: auto;
     max-height: 80%;
@@ -481,6 +481,21 @@ LaunchAgentScreen, HelpScreen {
     width: 1fr;
     margin: 1 0 0 0;
 }
+
+/* ── Config options modal (same look as Launch Agent) ── */
+#config-options-container { overflow-y: auto; }
+#config-options-title {
+    text-style: bold;
+    color: $primary;
+    margin: 0 0 1 0;
+    text-align: center;
+    width: 1fr;
+}
+#config-options-container .field-label { margin: 1 0 0 0; color: $text-muted; }
+#config-options-container Select { width: 1fr; }
+#config-options-container .config-option-row { height: auto; }
+#config-options-container .config-option-row .field-label { width: 1fr; }
+#config-options-apply { width: 1fr; margin: 1 0 0 0; }
 
 /* ── Session Picker modal ── */
 SessionPickerScreen {
