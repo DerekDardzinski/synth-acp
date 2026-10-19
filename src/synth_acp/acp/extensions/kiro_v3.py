@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,13 @@ _SHELL_TYPE_REQUEST = "kiro/terminal/shell_type"
 _PROFILE_NOT_FOUND = "kiro/customAgent/not_found"
 _PROFILE_CONFIG_ERROR = "kiro/customAgent/config_error"
 
+# v3 filters every MCP tool, including those of client-passed servers, through the
+# agent profile's ``tools`` list, so a profile that does not name ``@synth-mcp`` hides
+# synth's tools.  The engine always admits the tools of servers named in this
+# comma-separated variable, read once at engine start (kiro-cli 2.29.1, KAS bundle
+# ``acp-server.js``: ``mandatoryMcpServers``).  Undocumented; re-check on Kiro upgrades.
+_MANDATORY_MCPS_VAR = "ASBX_KIRO_MANDATORY_MCPS"
+
 # Kiro reports context fullness as a percentage and no token counts, so usage is
 # expressed as used/100; every consumer reads only the ratio (see kiro_v2).
 _PERCENT_SCALE = 100
@@ -60,6 +67,21 @@ class KiroV3Extension(AcpExtension):
         if op == "load":
             return {"kiro": {"noReplay": True}}
         return {}
+
+    def subprocess_env(self, env: Mapping[str, str], mcp_servers: Sequence[str]) -> dict[str, str]:
+        """Append synth's MCP servers to ``ASBX_KIRO_MANDATORY_MCPS``.
+
+        Appends rather than sets, so servers the user or their tooling already made
+        mandatory stay mandatory.  Names already present are not repeated.  Under a
+        strict ``harness_env`` allowlist that does not inherit the variable, the child
+        would not see the parent's value either, so ``env`` alone is the right base.
+        """
+        out = dict(env)
+        names = [n.strip() for n in out.get(_MANDATORY_MCPS_VAR, "").split(",") if n.strip()]
+        names += [s for s in mcp_servers if s not in names]
+        if names:
+            out[_MANDATORY_MCPS_VAR] = ",".join(names)
+        return out
 
     def interpret_update(self, update: Any) -> UpdateHints:
         """Read the replay marker and context_usage readings from ``_meta.kiro``."""

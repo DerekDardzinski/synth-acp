@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -35,6 +36,15 @@ class AcpExtension:
         The SDK places them in ``_meta``. Default ``{}``.
         """
         return {}
+
+    def subprocess_env(self, env: Mapping[str, str], mcp_servers: Sequence[str]) -> dict[str, str]:
+        """Environment overrides for the agent subprocess, adjusted for this engine.
+
+        ``env`` is what synth already resolved from the user's ``harness_env`` policy;
+        ``mcp_servers`` names the MCP servers synth passes on session creation.  Return
+        the complete overrides, not a delta.  Default: ``env`` unchanged.
+        """
+        return dict(env)
 
     def interpret_update(self, update: Any) -> UpdateHints:
         """Read proprietary data from one session/update payload.

@@ -161,6 +161,10 @@ Optional (`pip install synth-acp[search]`):
   `context_usage` session_info_updates, maps `_kiro/customAgent/not_found` / `config_error`
   to a warning, and maps steer `queued: false` to `dropped` so the broker queues the message.
   No MCP reload after a mode switch (v3 keeps the servers)
+- v3 filters client-passed MCP servers through the profile's `tools` list, so a profile
+  without `@synth-mcp` hides every synth tool. `KiroV3Extension.subprocess_env` appends
+  `synth-mcp` to `ASBX_KIRO_MANDATORY_MCPS` (comma-separated, existing entries kept),
+  which v3 always admits (kiro-cli 2.29.1; undocumented, re-check on Kiro upgrades)
 - v3 rejects profiles that use `allowedTools` / `toolsSettings` (reason `cli_only_agent`,
   all SHScienceAgentKit profiles) and falls back to mode `vibe`; synth shows a warning
 - v3 returns native `configOptions` and no `models`; `session/set_model` fails (-32603), so

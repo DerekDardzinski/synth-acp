@@ -337,7 +337,8 @@ class ACPSession:
             event_sink: Receives every BrokerEvent this session emits.
             mcp_servers: MCP servers passed on session/new and session/load.
             agent_mode: Configured agent profile, or None.
-            env: Environment overrides for the subprocess.
+            env: Environment overrides for the subprocess, passed through the
+                extension's ``subprocess_env`` before use.
             extension: The harness engine's ACP extension; None means
                 ``get_extension("standard")``.
         """
@@ -360,7 +361,7 @@ class ACPSession:
         self._capabilities: Any = None
         self._agent_mode = agent_mode
         self._ext = extension if extension is not None else get_extension("standard")
-        self._env = env
+        self._env = self._ext.subprocess_env(env or {}, [s.name for s in self._mcp_servers]) or None
         self._available_modes: list[AgentMode] = []
         self._current_mode_id: str | None = None
         self._available_models: list[AgentModel] = []

@@ -348,6 +348,10 @@ Differences on v3:
   requested profile, the fallback and the reason. The launch continues.
 - Context usage is reported as a percentage, as on v2.
 - A mode switch keeps the MCP servers connected, so synth does not reload the session.
+- v3 shows an agent only the MCP tools its profile's `tools` list names. So that every
+  profile gets the synth-mcp tools, synth appends `synth-mcp` to the
+  `ASBX_KIRO_MANDATORY_MCPS` environment variable of the v3 subprocess, keeping any
+  servers already listed there.
 - Restore loads the session without replaying its history (see below).
 - v3 starts your global `~/.kiro` MCP servers and steering files in every session, so N
   agents run N copies of each global MCP server.

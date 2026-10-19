@@ -54,6 +54,23 @@ class TestSessionOptions:
         assert ext.session_meta("fork", "plan") == {}
 
 
+class TestSubprocessEnv:
+    """v3 hides an MCP server's tools unless the agent profile names it or the server is
+    listed in ASBX_KIRO_MANDATORY_MCPS (kiro-cli 2.29.1)."""
+
+    def test_synth_servers_become_mandatory(self) -> None:
+        """Without the variable, profiles lacking @synth-mcp silently lose every synth tool."""
+        env = KiroV3Extension().subprocess_env({"HOME": "/home/u"}, ["synth-mcp"])
+        assert env == {"HOME": "/home/u", "ASBX_KIRO_MANDATORY_MCPS": "synth-mcp"}
+
+    def test_existing_value_is_appended_to_without_duplicates(self) -> None:
+        """Overwriting would silently drop servers the user's tooling made mandatory."""
+        env = KiroV3Extension().subprocess_env(
+            {"ASBX_KIRO_MANDATORY_MCPS": "corp-mcp, synth-mcp"}, ["synth-mcp", "extra-mcp"]
+        )
+        assert env == {"ASBX_KIRO_MANDATORY_MCPS": "corp-mcp,synth-mcp,extra-mcp"}
+
+
 class TestInterpretUpdate:
     def test_replay_marker_sets_is_replay(self) -> None:
         update = UserMessageChunk.model_validate(

@@ -704,6 +704,31 @@ class TestAgentModeTarget:
         assert call_kwargs["claudeCode"] == {"options": {"extraArgs": {"agent": "plan"}}}
         mock_conn.set_session_mode.assert_not_called()
 
+    async def test_spawn_env_goes_through_the_extension(self) -> None:
+        """The v3 extension's env must reach the subprocess. Silent failure: the hook
+        exists but is never applied, and v3 agents still lose every synth-mcp tool."""
+
+        async def sink(_event: BrokerEvent) -> None:
+            return None
+
+        session = ACPSession(
+            agent_id="test",
+            binary="kiro-cli",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            mcp_servers=[McpServerStdio(name="synth-mcp", command="synth-mcp", args=[], env=[])],
+            env={"ASBX_KIRO_MANDATORY_MCPS": "corp-mcp"},
+            extension=get_extension("kiro_v3"),
+        )
+
+        with patch(
+            "synth_acp.acp.session._spawn_isolated_agent", side_effect=asyncio.CancelledError
+        ) as spawn, pytest.raises(asyncio.CancelledError):
+            await session.run()
+
+        assert spawn.call_args.kwargs["env"] == {"ASBX_KIRO_MANDATORY_MCPS": "corp-mcp,synth-mcp"}
+
     async def test_run_restored_fallback_passes_meta(
         self, events: list[BrokerEvent], mock_conn: Any, mock_proc: Any
     ) -> None:
