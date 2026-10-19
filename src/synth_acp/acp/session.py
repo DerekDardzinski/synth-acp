@@ -11,7 +11,7 @@ import signal
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from acp.client.connection import ClientSideConnection
 from acp.exceptions import RequestError
@@ -86,6 +86,7 @@ from synth_acp.models.extensions import (
     ProfileUnavailable,
     Signal,
     SteerOutcome,
+    TurnActivity,
     UpdateHints,
 )
 from synth_acp.terminal.manager import Command, TerminalProcess
@@ -103,6 +104,11 @@ _PIPE_LIMIT = 8 * 1024 * 1024  # 8 MiB — agent tool responses can be large
 
 _STEER_ACCEPTANCE_TIMEOUT = 10.0
 """Seconds to wait for the harness's deterministic steering acceptance response."""
+
+_ADOPTED_TURN_START_TIMEOUT = 5.0
+"""Seconds a turn the harness started with a steer (``started_turn``) may take to report
+``TurnActivity(active=True)``.  With no report in that time the agent goes IDLE, so a
+steer the harness handled without running a turn cannot leave the agent BUSY forever."""
 
 _HANDSHAKE_TIMEOUT = 60.0
 """Seconds to wait for one handshake request before declaring the agent dead.
@@ -348,6 +354,9 @@ class ACPSession:
         self._permission_futures: dict[str, asyncio.Future[str]] = {}
         self._tool_kinds: dict[str, str] = {}
         """Kind of each live tool call by toolCallId, for permission requests without one."""
+        self._tool_fields: dict[str, dict[str, Any]] = {}
+        """``title`` and ``raw_input`` of each live tool call by toolCallId, for permission
+        requests that omit them (Codex MCP permissions carry only id, kind and status)."""
         self._capabilities: Any = None
         self._agent_mode = agent_mode
         self._ext = extension if extension is not None else get_extension("standard")
@@ -360,6 +369,19 @@ class ACPSession:
         self._has_native_config_options: bool = False
         self._suppress_history_replay: bool = False
         self._pending_emissions: set[asyncio.Task[None]] = set()
+        self._prompt_in_flight: bool = False
+        """synth's own session/prompt is awaiting its PromptResponse."""
+        self._steers_in_flight: int = 0
+        self._steers_settled: asyncio.Event = asyncio.Event()
+        """Set while no steer is awaiting its answer; a finishing prompt waits on it."""
+        self._steers_settled.set()
+        self._harness_active: bool = False
+        """Last TurnActivity since the own prompt's response returned."""
+        self._adopted_turn: Literal["starting", "running"] | None = None
+        """A turn synth did not prompt but keeps the agent BUSY for: ``"starting"`` after a
+        ``started_turn`` steer until the harness reports activity, ``"running"`` once it
+        has, until the harness reports the turn ended."""
+        self._adopted_start_timer: asyncio.Task[None] | None = None
         self._terminals: dict[str, TerminalProcess] = {}
         self._terminal_count: int = 0
         self._on_session_created: Callable[[str, str], Awaitable[None]] | None = None
@@ -705,6 +727,7 @@ class ACPSession:
 
         finally:
             self._shutting_down = True
+            self._cancel_adopted_start_timer()
             for task in self._pending_emissions:
                 if not task.done():
                     task.cancel()
@@ -928,6 +951,7 @@ class ACPSession:
             await self._event_sink(BrokerError(agent_id=self.agent_id, message=f"Agent error: {e}"))
         finally:
             self._shutting_down = True
+            self._cancel_adopted_start_timer()
             for task in self._pending_emissions:
                 if not task.done():
                     task.cancel()
@@ -944,15 +968,49 @@ class ACPSession:
             self._permission_futures.clear()
             await self._sm.force_terminal()
 
+    @property
+    def in_adopted_turn(self) -> bool:
+        """The agent is BUSY with a turn the harness runs on its own, not a synth prompt."""
+        return self._adopted_turn is not None
+
+    @property
+    def prompt_claimed(self) -> bool:
+        """The agent is reserved for, or running, a synth prompt.
+
+        Set to True by the caller that checked IDLE, with no await in between, so a
+        turn the harness starts on its own cannot be adopted between that check and
+        ``prompt()``'s BUSY transition: an activity report processed after the claim is
+        taken as this prompt's own.  ``prompt()`` clears it; a caller that claimed and
+        then does not call ``prompt()`` sets it back to False.
+        """
+        return self._prompt_in_flight
+
+    @prompt_claimed.setter
+    def prompt_claimed(self, claimed: bool) -> None:
+        self._prompt_in_flight = claimed
+
     async def prompt(self, text: str) -> None:
-        """Send a prompt to the agent."""
+        """Send a prompt to the agent.  Takes the prompt claim if the caller did not."""
         if not self._conn or not self._session_id:
+            self._prompt_in_flight = False
             return
-        await self._sm.transition(AgentState.BUSY)
+        try:
+            await self._sm.transition(AgentState.BUSY)
+        except BaseException:
+            # A refused transition (e.g. a config change took the agent out of IDLE after
+            # the caller's claim) must not leave the claim set, which would disable turn
+            # adoption until the next prompt finishes.
+            self._prompt_in_flight = False
+            raise
+        self._prompt_in_flight = True
         try:
             response = await self._conn.prompt(
                 session_id=self._session_id, prompt=[text_block(text)]
             )
+            # Cleared before the drain, so a harness-started turn's activity processed
+            # during the drain is not mistaken for this prompt's.
+            self._prompt_in_flight = False
+            self._harness_active = False
             await self._drain_pending_emissions()
             await self._event_sink(
                 TurnComplete(
@@ -969,11 +1027,25 @@ class ACPSession:
                 )
             )
         finally:
-            if self.state == AgentState.BUSY:
-                await self._sm.transition(AgentState.IDLE)
-            elif self.state == AgentState.AWAITING_PERMISSION and not self._permission_futures:
-                await self._sm.transition(AgentState.BUSY)
-                await self._sm.transition(AgentState.IDLE)
+            self._prompt_in_flight = False
+            # A steer still awaiting its answer may yet report that the harness started
+            # a turn of its own; going IDLE first would let a queued prompt merge into it.
+            if self._steers_in_flight:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._steers_settled.wait(), timeout=_STEER_ACCEPTANCE_TIMEOUT
+                    )
+            if self._adopted_turn is None:
+                await self._settle_idle()
+
+    async def _settle_idle(self) -> None:
+        """Move a finished turn to IDLE, through BUSY when a resolved permission left it
+        AWAITING_PERMISSION; leave it alone while a permission is still pending."""
+        if self.state == AgentState.BUSY:
+            await self._sm.transition(AgentState.IDLE)
+        elif self.state == AgentState.AWAITING_PERMISSION and not self._permission_futures:
+            await self._sm.transition(AgentState.BUSY)
+            await self._sm.transition(AgentState.IDLE)
 
     async def _end_session_on_config_timeout(
         self, exc: HandshakeTimeoutError, what: str
@@ -1241,6 +1313,9 @@ class ACPSession:
     async def steer(self, text: str) -> SteerOutcome:
         """Inject text into the agent's RUNNING turn via the extension's steer hook.
 
+        A ``"started_turn"`` answer marks an adopted turn (the agent stays or becomes
+        BUSY) before a prompt waiting on this steer's answer is released.
+
         Args:
             text: The message body to inject, sent to the harness unchanged.
 
@@ -1255,6 +1330,20 @@ class ACPSession:
         ``RequestError`` is not a ``ConnectionError`` subclass, so it is caught
         explicitly.
         """
+        self._steers_in_flight += 1
+        self._steers_settled.clear()
+        try:
+            outcome = await self._request_steer(text)
+            if outcome.status == "started_turn":
+                await self._adopt_steered_turn()
+            return outcome
+        finally:
+            self._steers_in_flight -= 1
+            if not self._steers_in_flight:
+                self._steers_settled.set()
+
+    async def _request_steer(self, text: str) -> SteerOutcome:
+        """The steer request itself, under its acceptance timeout; see ``steer``."""
         if not self._conn or not self._session_id:
             return SteerOutcome(status="failed")
 
@@ -1324,6 +1413,71 @@ class ACPSession:
             outcome.status,
         )
         return outcome
+
+    async def _adopt_steered_turn(self) -> None:
+        """Keep the agent BUSY for the turn a ``started_turn`` steer made the harness start.
+
+        ``"running"`` at once when the harness already reported activity after synth's own
+        prompt returned; otherwise ``"starting"`` with a start timeout.
+        """
+        self._cancel_adopted_start_timer()
+        if self._harness_active and not self._prompt_in_flight:
+            self._adopted_turn = "running"
+        else:
+            self._adopted_turn = "starting"
+            self._adopted_start_timer = asyncio.create_task(self._expire_adopted_start())
+        if self.state == AgentState.IDLE:
+            await self._sm.transition(AgentState.BUSY)
+
+    async def _expire_adopted_start(self) -> None:
+        """End a ``"starting"`` adopted turn that never reported activity, with no TurnComplete."""
+        await asyncio.sleep(_ADOPTED_TURN_START_TIMEOUT)
+        if self._adopted_turn != "starting":
+            return
+        self._adopted_turn = None
+        log.info(
+            "%s: harness-started turn reported no activity within %ss; treating it as ended",
+            self.agent_id,
+            _ADOPTED_TURN_START_TIMEOUT,
+        )
+        if not self._prompt_in_flight:
+            await self._settle_idle()
+
+    def _cancel_adopted_start_timer(self) -> None:
+        if self._adopted_start_timer is not None and not self._adopted_start_timer.done():
+            self._adopted_start_timer.cancel()
+        self._adopted_start_timer = None
+
+    async def _on_turn_activity(self, active: bool) -> None:
+        """Track a turn the harness reports, whether or not synth prompted it.
+
+        Runs inside the emission task, in arrival order.  An active report on an IDLE
+        agent with no own prompt adopts the turn (IDLE -> BUSY); its end report emits
+        TurnComplete and goes IDLE.  Reports during synth's own prompt are ignored: that
+        prompt's PromptResponse ends its turn.  No drain here, because this runs inside
+        an emission task and the drain would await it.
+        """
+        if active:
+            self._harness_active = True
+            if self._adopted_turn == "starting":
+                self._adopted_turn = "running"
+                self._cancel_adopted_start_timer()
+            elif (
+                self._adopted_turn is None
+                and not self._prompt_in_flight
+                and self.state == AgentState.IDLE
+            ):
+                self._adopted_turn = "running"
+                await self._sm.transition(AgentState.BUSY)
+            return
+        self._harness_active = False
+        if self._adopted_turn != "running":
+            return
+        self._adopted_turn = None
+        if self._prompt_in_flight:
+            return
+        await self._event_sink(TurnComplete(agent_id=self.agent_id, stop_reason="end_turn"))
+        await self._settle_idle()
 
     async def terminate(self) -> None:
         """Terminate the agent and all its children via process group kill.
@@ -1430,7 +1584,7 @@ class ACPSession:
         if self._suppress_history_replay or hints.is_replay:
             return
 
-        self._record_tool_kind(update)
+        self._record_tool_call(update)
 
         # No await may execute between the end of the UsageUpdate branch and
         # task creation below.  The SDK dispatches one task per notification
@@ -1524,6 +1678,8 @@ class ACPSession:
                     cost_currency=sig.cost_currency,
                 )
             )
+        elif isinstance(sig, TurnActivity):
+            await self._on_turn_activity(sig.active)
         elif isinstance(sig, ProfileUnavailable):
             fallback = sig.fallback or "the harness default"
             await self._event_sink(
@@ -1743,8 +1899,8 @@ class ACPSession:
         if future and not future.done():
             future.set_result(option_id)
 
-    def _record_tool_kind(self, update: Any) -> None:
-        """Remember a tool call's kind by toolCallId until the call completes or fails.
+    def _record_tool_call(self, update: Any) -> None:
+        """Remember a tool call's kind, title and raw_input by toolCallId until it completes or fails.
 
         Runs synchronously in ``session_update``, not in the emission task: the SDK
         dispatches ``request_permission`` as its own task, which can run before the
@@ -1754,8 +1910,17 @@ class ACPSession:
             return
         if update.status in ("completed", "failed"):
             self._tool_kinds.pop(update.tool_call_id, None)
-        elif update.kind:
+            self._tool_fields.pop(update.tool_call_id, None)
+            return
+        if update.kind:
             self._tool_kinds[update.tool_call_id] = update.kind
+        fields: dict[str, Any] = {}
+        if update.title:
+            fields["title"] = update.title
+        if update.raw_input is not None:
+            fields["raw_input"] = update.raw_input
+        if fields:
+            self._tool_fields.setdefault(update.tool_call_id, {}).update(fields)
 
     async def request_permission(
         self,
@@ -1776,7 +1941,16 @@ class ACPSession:
         request_id = tool_call.tool_call_id or ""
         # Some harnesses (Kiro v3) omit toolCall.kind here; the earlier tool_call has it.
         kind = tool_call.kind or self._tool_kinds.get(request_id) or "other"
-        hints = self._ext.permission_hints(tool_call, dict(kwargs))
+        # Codex MCP permissions omit title and rawInput; the earlier tool_call has them.
+        # Only missing fields are filled, so the request's own values win.
+        cached = self._tool_fields.get(request_id, {})
+        fill = {k: v for k, v in cached.items() if getattr(tool_call, k) is None}
+        filled = tool_call.model_copy(update=fill) if fill else tool_call
+        hints = self._ext.permission_hints(filled, dict(kwargs))
+        # The filled title is shown only for an identified tool.  Without an identity the
+        # broker falls back to a substring match on the title, and a cached shell title
+        # is the command text, which could then auto-approve a command naming a pattern.
+        title = filled.title if hints.tool_identity is not None else tool_call.title
         await self._sm.transition(AgentState.AWAITING_PERMISSION)
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._permission_futures[request_id] = future
@@ -1784,7 +1958,7 @@ class ACPSession:
             PermissionRequested(
                 agent_id=self.agent_id,
                 request_id=request_id,
-                title=tool_call.title or "",
+                title=title or "",
                 kind=kind,
                 options=list(options),
                 tool_identity=hints.tool_identity,

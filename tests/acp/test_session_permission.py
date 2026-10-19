@@ -133,9 +133,11 @@ class _IdentityExtension(AcpExtension):
 
     def __init__(self) -> None:
         self.seen_meta: list[dict[str, Any]] = []
+        self.seen_tool_calls: list[Any] = []
 
     def permission_hints(self, tool_call: Any, meta: dict[str, Any]) -> PermissionHints:
         self.seen_meta.append(meta)
+        self.seen_tool_calls.append(tool_call)
         return PermissionHints(tool_identity="probe-echo/echo")
 
 
@@ -236,3 +238,74 @@ class TestPermissionToolIdentity:
         )
         assert pe.tool_identity == "probe-echo/echo"
         assert ext.seen_meta == [{"kiro": {"toolId": "x"}}]
+
+    async def test_title_and_raw_input_filled_from_earlier_tool_call(
+        self, session: ACPSession, events: list[BrokerEvent], ext: _IdentityExtension
+    ) -> None:
+        """Silent failure: an MCP permission that omits title and rawInput (Codex)
+        reaches the extension with no identity and the UI shows an empty title."""
+        raw_input = {"server": "synth-mcp", "tool": "list_agents", "arguments": {}}
+        await session.session_update(
+            "sess-1",
+            ToolCallStart(
+                tool_call_id="call-1",
+                title="mcp.synth-mcp.list_agents",
+                kind="execute",
+                status="in_progress",
+                raw_input=raw_input,
+                session_update="tool_call",
+            ),
+        )
+        pe = await self._request(
+            session,
+            events,
+            ToolCallUpdate(tool_call_id="call-1", kind="execute", status="pending"),
+        )
+        assert pe.title == "mcp.synth-mcp.list_agents"
+        assert ext.seen_tool_calls[-1].raw_input == raw_input
+
+    async def test_request_values_win_and_cache_dropped_on_terminal_status(
+        self, session: ACPSession, events: list[BrokerEvent]
+    ) -> None:
+        """Silent failure: a cached title relabels a request that carries its own, or a
+        finished call's fields relabel a later request and the cache never shrinks."""
+        await session.session_update(
+            "sess-1",
+            ToolCallStart(
+                tool_call_id="call-2", title="ls -la", kind="execute", session_update="tool_call"
+            ),
+        )
+        own = await self._request(
+            session, events, ToolCallUpdate(tool_call_id="call-2", title="Run command")
+        )
+        await session.session_update(
+            "sess-1",
+            ToolCallProgress(
+                tool_call_id="call-2", status="completed", session_update="tool_call_update"
+            ),
+        )
+        after = await self._request(session, events, ToolCallUpdate(tool_call_id="call-2"))
+        assert (own.title, after.title) == ("Run command", "")
+        assert session._tool_fields == {}
+
+    async def test_filled_title_not_used_without_identity(self, events: list[BrokerEvent]) -> None:
+        """Silent failure: with no identity the broker substring-matches the title, so a
+        cached shell title such as "echo synth-mcp" would be auto-approved."""
+
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(agent_id="test", binary="echo", args=[], cwd=".", event_sink=sink)
+        session._session_id = "sess-1"
+        session._sm._state = AgentState.BUSY
+        await session.session_update(
+            "sess-1",
+            ToolCallStart(
+                tool_call_id="call-3",
+                title="echo synth-mcp",
+                kind="execute",
+                session_update="tool_call",
+            ),
+        )
+        pe = await self._request(session, events, ToolCallUpdate(tool_call_id="call-3"))
+        assert (pe.title, pe.tool_identity) == ("", None)

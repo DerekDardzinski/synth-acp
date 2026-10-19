@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from synth_acp.acp.extensions.base import AcpExtension
 from synth_acp.acp.extensions.claude import ClaudeExtension
+from synth_acp.acp.extensions.codex import CodexExtension
 from synth_acp.acp.extensions.kiro_v2 import KiroV2Extension
 from synth_acp.acp.extensions.kiro_v3 import KiroV3Extension
 
@@ -53,5 +54,6 @@ def get_extension(name: str) -> AcpExtension:
 
 register_extension(AcpExtension)
 register_extension(ClaudeExtension)
+register_extension(CodexExtension)
 register_extension(KiroV2Extension)
 register_extension(KiroV3Extension)

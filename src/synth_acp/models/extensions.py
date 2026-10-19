@@ -49,7 +49,13 @@ class ProfileUnavailable(BaseModel, frozen=True):
     reason: str
 
 
-Signal = ContextUsage | ProfileUnavailable
+class TurnActivity(BaseModel, frozen=True):
+    """The harness reports a turn it is running started (active=True) or ended (active=False), whether or not synth started it."""
+
+    active: bool
+
+
+Signal = ContextUsage | ProfileUnavailable | TurnActivity
 """Closed union: a new kind needs a new model plus its mapping in ACPSession."""
 
 
@@ -75,10 +81,16 @@ class PermissionHints(BaseModel, frozen=True):
 class SteerOutcome(BaseModel, frozen=True):
     """Result of one attempt to deliver text into a running turn."""
 
-    status: Literal["delivered", "queued", "dropped", "prompt_required", "unsupported", "failed"]
+    status: Literal[
+        "delivered", "queued", "dropped", "prompt_required", "unsupported", "failed", "started_turn"
+    ]
     message_id: str | None = None
 
     @property
     def accepted(self) -> bool:
-        """True for 'delivered' and 'queued': the harness owns delivery, so synth must NOT also enqueue the text."""
-        return self.status in ("delivered", "queued")
+        """True for 'delivered', 'queued' and 'started_turn': the harness owns delivery, so synth must NOT also enqueue the text.
+
+        ``started_turn`` means the harness found no running turn and started one of its
+        own with the text; ACPSession keeps the agent BUSY until that turn ends.
+        """
+        return self.status in ("delivered", "queued", "started_turn")

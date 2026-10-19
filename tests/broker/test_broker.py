@@ -12,6 +12,7 @@ import time
 import warnings
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, ClassVar, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,6 +23,7 @@ from acp.schema import (
     AgentMessageChunk,
     AgentPlanUpdate,
     AgentThoughtChunk,
+    AllowedOutcome,
     McpServerStdio,
     PermissionOption,
     PlanEntry,
@@ -30,6 +32,7 @@ from acp.schema import (
     TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
+    ToolCallUpdate,
     UsageUpdate,
 )
 
@@ -49,7 +52,7 @@ from synth_acp.models.commands import (
     SendPrompt,
     SetAgentMode,
 )
-from synth_acp.models.config import SessionConfig
+from synth_acp.models.config import GlobalConfig, SessionConfig
 from synth_acp.models.events import (
     AgentHandedOff,
     AgentStateChanged,
@@ -58,6 +61,7 @@ from synth_acp.models.events import (
     BrokerEvent,
     MessageChunkReceived,
     MessageSteered,
+    PermissionAutoResolved,
     PermissionRequested,
     PlanReceived,
     ProfileSwitchChanged,
@@ -841,6 +845,131 @@ class TestInTurnSteering:
         fake.prompt.assert_not_awaited()
         assert [e.text for e in self._steered(broker)] == ["[Message from agent-a]: hello"]
 
+    async def test_started_turn_steer_is_not_requeued(self, tmp_path: Path) -> None:
+        """Codex answers startedNewTurn when it runs the text in a turn of its own;
+        also enqueueing it would deliver the message twice."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        lifecycle = await broker._ensure_lifecycle()
+        lifecycle._first_prompted.add("agent-1")
+        fake = self._busy_session(
+            broker, extension="codex", steer_result=SteerOutcome(status="started_turn")
+        )
+
+        await broker._on_mcp_message("agent-1", "hello", "agent-a", "chat")
+
+        assert broker._prompt_queue.is_empty("agent-1")
+        fake.prompt.assert_not_awaited()
+        assert [e.text for e in self._steered(broker)] == ["[Message from agent-a]: hello"]
+
+    @staticmethod
+    async def _codex_idle_session(broker: ACPBroker) -> tuple[ACPSession, list[str]]:
+        """Real IDLE Codex session registered in broker; returns it and the prompts sent."""
+        lifecycle = await broker._ensure_lifecycle()
+        lifecycle._first_prompted.add("agent-1")
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=broker._sink,
+            extension=get_extension("codex"),
+        )
+        session._session_id = "sess-1"
+        session._sm._state = AgentState.IDLE
+        prompted: list[str] = []
+
+        async def prompt(**kwargs: Any) -> Any:
+            prompted.append(kwargs["prompt"][0].text)
+            return MagicMock(stop_reason="end_turn")
+
+        session._conn = MagicMock(prompt=prompt)
+        broker._registry._sessions["agent-1"] = session
+        return session, prompted
+
+    @staticmethod
+    async def _thread_status(session: ACPSession, status_type: str) -> None:
+        await session.session_update(
+            "sess-1",
+            SessionInfoUpdate.model_validate(
+                {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {"codex": {"threadStatus": {"type": status_type}}},
+                }
+            ),
+        )
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    @staticmethod
+    def _errors(broker: ACPBroker) -> list[str]:
+        return [
+            e.message
+            for e in list(broker._event_queue._queue)  # type: ignore[attr-defined]
+            if isinstance(e, BrokerError)
+        ]
+
+    async def test_turn_adopted_while_prompt_waits_for_lock_is_queued_not_lost(
+        self, tmp_path: Path
+    ) -> None:
+        """Silent failure: a harness turn adopted after submit_prompt saw IDLE but before
+        lifecycle.prompt runs made session.prompt raise busy -> busy, so the prompt the
+        UI showed as submitted was never sent. It must wait in the queue instead."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        session, prompted = await self._codex_idle_session(broker)
+
+        async with broker._registry.agent_lock("agent-1"):
+            submit = asyncio.create_task(broker.submit_prompt("agent-1", "question"))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert not submit.done()
+            await self._thread_status(session, "active")
+            assert session.state == AgentState.BUSY
+        await asyncio.wait_for(submit, timeout=1.0)
+
+        assert [i.text for i in broker._prompt_queue.items("agent-1")] == ["question"]
+        assert prompted == []
+        assert self._errors(broker) == []
+
+        await self._thread_status(session, "idle")
+        assert prompted == ["question"]
+        assert broker._prompt_queue.is_empty("agent-1")
+
+    async def test_activity_after_the_claim_is_the_prompts_own(self, tmp_path: Path) -> None:
+        """The other order: once lifecycle.prompt has claimed the IDLE agent, an active
+        report before the prompt task runs must not adopt a turn and break the prompt."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        session, prompted = await self._codex_idle_session(broker)
+
+        submit = asyncio.create_task(broker.submit_prompt("agent-1", "question"))
+        await self._thread_status(session, "active")
+        await asyncio.wait_for(submit, timeout=1.0)
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+        assert prompted == ["question"]
+        assert session.state == AgentState.IDLE
+        assert session.in_adopted_turn is False
+        assert self._errors(broker) == []
+
+    async def test_prompt_queued_during_adopted_turn_waits_for_turn_end(
+        self, tmp_path: Path
+    ) -> None:
+        """A prompt sent into a turn Codex started itself merges into it and is never
+        answered (measured), so it must wait in the queue until that turn ends."""
+        broker = _make_broker("agent-1", tmp_path=tmp_path)
+        session, prompted = await self._codex_idle_session(broker)
+        thread_status = partial(self._thread_status, session)
+
+        await thread_status("active")
+        assert session.state == AgentState.BUSY
+        await broker.submit_prompt("agent-1", "next question")
+        assert [i.text for i in broker._prompt_queue.items("agent-1")] == ["next question"]
+        assert prompted == []
+
+        await thread_status("idle")
+        assert prompted == ["next question"]
+        assert broker._prompt_queue.is_empty("agent-1")
+
     async def test_failed_steer_falls_back_to_queue_and_drains_once(
         self, tmp_path: Path
     ) -> None:
@@ -1304,6 +1433,72 @@ class TestToolIdentityPermissions:
             "ex-2": "ex-2-always",
         }
         assert "slack-1" in broker._pending_permissions
+
+    async def test_codex_mcp_permission_without_identity_is_auto_approved(
+        self, tmp_path: Path
+    ) -> None:
+        """Silent failure: Codex MCP permissions carry no title and no rawInput, so
+        without the earlier tool_call's fields every synth-mcp call prompts the user."""
+        broker = _make_broker("a1", tmp_path=tmp_path)
+        default_patterns = GlobalConfig().auto_approve_tools
+        assert default_patterns == ["synth-mcp"]
+        object.__setattr__(broker._config.settings, "auto_approve_tools", default_patterns)
+        requested: list[PermissionRequested] = []
+
+        async def sink(event: BrokerEvent) -> None:
+            if isinstance(event, PermissionRequested):
+                requested.append(event)
+            await broker._sink(event)
+
+        session = ACPSession(
+            agent_id="a1",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            extension=get_extension("codex"),
+        )
+        session._session_id = "sess-1"
+        session._sm._state = AgentState.BUSY
+        broker._registry._sessions["a1"] = session
+        await session.session_update(
+            "sess-1",
+            ToolCallStart(
+                tool_call_id="call_de0a",
+                kind="execute",
+                title="mcp.synth-mcp.list_agents",
+                status="in_progress",
+                raw_input={"server": "synth-mcp", "tool": "list_agents", "arguments": {}},
+                session_update="tool_call",
+            ),
+        )
+        options = [
+            PermissionOption(option_id="allow_once", name="Allow", kind="allow_once"),
+            PermissionOption(
+                option_id="allow_session", name="Allow for this session", kind="allow_always"
+            ),
+            PermissionOption(option_id="allow_always", name="Always allow", kind="allow_always"),
+            PermissionOption(option_id="cancel", name="Cancel", kind="reject_once"),
+        ]
+
+        response = await asyncio.wait_for(
+            session.request_permission(
+                options,
+                "sess-1",
+                ToolCallUpdate(tool_call_id="call_de0a", kind="execute", status="pending"),
+                is_mcp_tool_approval=True,
+            ),
+            timeout=1.0,
+        )
+
+        assert [(r.tool_identity, r.title) for r in requested] == [
+            ("synth-mcp/list_agents", "mcp.synth-mcp.list_agents")
+        ]
+        assert response.outcome == AllowedOutcome(option_id="allow_once", outcome="selected")
+        queued = [broker._event_queue.get_nowait() for _ in range(broker._event_queue.qsize())]
+        assert [
+            e.request_id for e in queued if isinstance(e, PermissionAutoResolved)
+        ] == ["call_de0a"]
 
 
 class TestListRestorableSessions:

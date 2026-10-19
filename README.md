@@ -139,7 +139,7 @@ When `.synth.json` exists, its settings override global config. Fields not set i
 |-------|---------------|-------------|
 | `communication_mode` | `"LOCAL"` | `MESH` (all agents visible) or `LOCAL` (family only) |
 | `auto_approve_tools` | `["synth-mcp"]` | Tool name patterns to auto-approve without prompting. When the harness reports the tool's identity (`<server>/<tool>`, Kiro v3 MCP tools), a pattern must equal the server name (`synth-mcp`) or the full identity (`synth-mcp/send_message`); a prefix such as `synth` no longer matches. Otherwise the pattern is matched as a substring of the permission title |
-| `messages_interrupt` | `true` | Deliver inter-agent messages into a running turn instead of waiting for it to end. Kiro only; other harnesses always wait for the turn to end |
+| `messages_interrupt` | `true` | Deliver inter-agent messages into a running turn instead of waiting for it to end. Kiro and Codex only; other harnesses always wait for the turn to end |
 | `handoff_nudge` | `true` | Send an agent a one-time message suggesting it call `handoff` once its context window passes `handoff_nudge_threshold` |
 | `handoff_nudge_threshold` | `0.5` | Fraction of the context window that triggers the nudge. Must be greater than 0 and at most 1 |
 | `handoff_nudge_template` | see below | Nudge body. Slots: `{agent_id}`, `{used}`, `{nudge_threshold}`. `{used}` and `{nudge_threshold}` render as whole percents (e.g. `62%`) |
@@ -159,7 +159,7 @@ run interactively in this same shell, so handing it a smaller environment than a
 invocation gets is a difference you did not ask for and cannot see.
 
 Set `harness_env` in `~/.synth/config.json` at the top level, or in `.synth.json` under
-`settings`. Keys are harness short names (`claude`, `kiro`, `opencode`, `gemini`):
+`settings`. Keys are harness short names (`claude`, `kiro`, `codex`, `opencode`, `gemini`):
 
 ```json
 {
@@ -213,7 +213,7 @@ successor with an empty context, and the successor is nudgeable again in its tur
 
 The nudge is delivered as an ordinary inter-agent message from the sender `synth`, so it
 appears in the conversation transcript exactly like any other message — mid-turn on Kiro
-(where in-turn steering is supported), or at the next idle point on other harnesses. It is
+and Codex (where in-turn steering is supported), or at the next idle point on other harnesses. It is
 a suggestion: the agent decides whether to act on it.
 
 Usage data comes from whatever the harness reports. Claude Code reports token counts.
@@ -290,6 +290,7 @@ The `--agent-mode` flag has different semantics per harness:
 |---------|---------------------|---------|
 | Kiro | Agent config name. v2 engine: passed as the `--agent` CLI flag + `set_session_mode`. v3 engine: passed as `_meta.kiro.modeId` on session creation + `set_session_mode` (v3 rejects `--agent`) | `plan`, `code-planner` |
 | Claude Code | Agent name (passed by the `claude` extension as `_meta.claudeCode.options.extraArgs.agent`, which the adaptor turns into the Claude CLI's `--agent` flag; the agent picker switches agents by handoff, see below) | `local-SHScienceAgentKit-all:code-planner` |
+| Codex | Codex mode id, applied with `set_session_mode` | `read-only`, `workspace-write`, `agent`, `agent-full-access` |
 | OpenCode | Not supported | — |
 | Gemini CLI | Not supported | — |
 
@@ -323,6 +324,7 @@ Synth dynamically renders configuration pickers based on what the harness advert
 | Kiro (v2 engine) | Mode (agents), Model |
 | Kiro (v3 engine) | Whatever v3 advertises: Mode, Model, Effort, and v3's own options (e.g. thinking, autopilot) |
 | Claude Code | Mode (permission), Model, Effort |
+| Codex | Mode, Collaboration mode, Model, Reasoning effort |
 | OpenCode | None |
 | Gemini CLI | None |
 
@@ -349,6 +351,35 @@ Differences on v3:
 - Restore loads the session without replaying its history (see below).
 - v3 starts your global `~/.kiro` MCP servers and steering files in every session, so N
   agents run N copies of each global MCP server.
+
+### Codex
+
+The `codex` harness runs the `codex-acp` adaptor (verified on 2.0.0). Install it with:
+
+```bash
+npm install -g @agentclientprotocol/codex-acp
+```
+
+- **Auth** comes from your existing Codex login and `~/.codex/config.toml`. synth never
+  calls ACP `authenticate`; if Codex needs a login, run `codex login` outside synth.
+- The adaptor runs the Codex binary bundled with it, not a `codex` on your PATH.
+- `agent_mode` is a Codex mode id: `read-only`, `workspace-write`, `agent` (Codex's
+  default) or `agent-full-access`. Codex has no agent profiles.
+- **In-turn steering**: an inter-agent message sent while the agent is busy is steered
+  into the running turn. When the turn has already ended, Codex starts a turn of its own
+  with the message instead ("startedNewTurn"), and synth gets no reply for it. synth
+  keeps the agent busy through such a turn, following Codex's thread-status updates,
+  and delivers queued prompts only after it ends. If Codex reports no activity within
+  5 seconds of starting the turn, synth treats it as ended. Cancel works on these turns
+  as on any other.
+- **synth-mcp auto-approval**: Codex's MCP permission requests carry no tool name, so
+  synth takes the tool identity (`synth-mcp/<tool>`) from the earlier tool call with the
+  same id. Codex asks for MCP permission in `read-only` and `workspace-write`; in
+  `agent` mode it runs its own review model call instead of asking.
+- Codex starts your global `~/.codex` MCP servers in every session, so N agents run N
+  copies of each.
+- Restore uses `session/resume`, which keeps the conversation. Codex resets mode, model
+  and reasoning effort on resume; synth re-applies `agent_mode` but not picker changes.
 
 ### Session Restore
 

@@ -393,7 +393,14 @@ class AgentLifecycle:
                 # Refused, silently: the successor's handoff message has not been
                 # delivered yet, and this text is preserved by its caller.
                 return False
-            if session.state != AgentState.IDLE:
+            # Check and claim with no await in between, so a turn the harness starts
+            # on its own cannot slip in before the prompt task marks the agent BUSY.
+            # `is True` because test doubles answer any attribute with a truthy mock.
+            if session.state != AgentState.IDLE or session.in_adopted_turn is True:
+                if session.in_adopted_turn is True:
+                    # The harness started a turn after the caller saw IDLE; refused
+                    # silently, and the caller keeps the text queued until it ends.
+                    return False
                 await self._sink(
                     BrokerError(
                         agent_id=agent_id,
@@ -402,36 +409,41 @@ class AgentLifecycle:
                     )
                 )
                 return False
-            if agent_id not in self._first_prompted:
-                self._first_prompted.add(agent_id)
-                hook = self._config.settings.hooks.on_agent_startup
-                if hook.active:
-                    context = load_startup_context()
-                    rendered = render_template(
-                        context,
-                        {
-                            "agent_id": agent_id,
-                            "parent_id": "",
-                            "task": "",
-                            "harness": self._registry.get_harness(agent_id),
-                            "available_agents": format_available_agents(
-                                self.get_discovered_agents(agent_id)
-                            ),
-                        },
-                    )
-                    log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)
-                    text = rendered + text
-                    await self._sink(HookFired(agent_id=agent_id, hook_name="on_agent_startup"))
-            # Inject file contents for @path references
-            text = self._inject_file_refs(agent_id, text)
-            # Awaited BEFORE the prompt task exists, so no chunk can be journaled
-            # ahead of the prompt that caused it.
-            await self._sink(UserPromptSubmitted(agent_id=agent_id, text=received))
-            self._tasks[f"prompt-{agent_id}"] = self._make_prompt_task(agent_id, session.prompt(text))
-            # Cleared only now, after an actual submission: clearing before the state
-            # check would drop the handoff message and its reservation together.
-            self._reserved_first_prompt.pop(agent_id, None)
-            return True
+            session.prompt_claimed = True
+            try:
+                if agent_id not in self._first_prompted:
+                    self._first_prompted.add(agent_id)
+                    hook = self._config.settings.hooks.on_agent_startup
+                    if hook.active:
+                        context = load_startup_context()
+                        rendered = render_template(
+                            context,
+                            {
+                                "agent_id": agent_id,
+                                "parent_id": "",
+                                "task": "",
+                                "harness": self._registry.get_harness(agent_id),
+                                "available_agents": format_available_agents(
+                                    self.get_discovered_agents(agent_id)
+                                ),
+                            },
+                        )
+                        log.debug("on_agent_startup hook fired for %s:\n%s", agent_id, rendered)
+                        text = rendered + text
+                        await self._sink(HookFired(agent_id=agent_id, hook_name="on_agent_startup"))
+                # Inject file contents for @path references
+                text = self._inject_file_refs(agent_id, text)
+                # Awaited BEFORE the prompt task exists, so no chunk can be journaled
+                # ahead of the prompt that caused it.
+                await self._sink(UserPromptSubmitted(agent_id=agent_id, text=received))
+                self._tasks[f"prompt-{agent_id}"] = self._make_prompt_task(agent_id, session.prompt(text))
+                # Cleared only now, after an actual submission: clearing before the state
+                # check would drop the handoff message and its reservation together.
+                self._reserved_first_prompt.pop(agent_id, None)
+                return True
+            except BaseException:
+                session.prompt_claimed = False
+                raise
 
     def _inject_file_refs(self, agent_id: str, text: str) -> str:
         """Parse @path references and prepend file contents as XML blocks."""

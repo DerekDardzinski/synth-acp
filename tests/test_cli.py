@@ -301,6 +301,16 @@ class TestDetectInstalledHarnesses:
         result = _detect_installed_harnesses()
         assert result == []
 
+    def test_detect_installed_harnesses_finds_codex(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Codex must be offered by auto-detect when only its adaptor is installed."""
+        monkeypatch.setattr(
+            "shutil.which", lambda b: "/opt/bin/codex-acp" if b == "codex-acp" else None
+        )
+        result = _detect_installed_harnesses()
+        assert [(entry.short_name, path) for entry, path in result] == [
+            ("codex", "/opt/bin/codex-acp")
+        ]
+
 
 class TestApplyGlobalSettings:
     """Tests for _apply_global_settings."""

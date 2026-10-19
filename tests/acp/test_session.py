@@ -30,13 +30,16 @@ from acp.schema import (
     FileEditToolCallContent,
     Implementation,
     McpServerStdio,
+    PermissionOption,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
+    SessionInfoUpdate,
     SessionNotification,
     TextContentBlock,
     ToolCallLocation as AcpToolCallLocation,
     ToolCallProgress,
     ToolCallStart,
+    ToolCallUpdate,
     UsageUpdate,
 )
 
@@ -49,7 +52,7 @@ from synth_acp.acp.session import (
     _StderrTail,
 )
 from synth_acp.diagnostics import LoopLagSampler
-from synth_acp.models.agent import AgentState
+from synth_acp.models.agent import AgentState, InvalidTransitionError
 from synth_acp.models.events import (
     AgentModeChanged,
     AgentModelChanged,
@@ -2096,6 +2099,235 @@ class TestSteer:
 
         assert await session.steer("hello") == SteerOutcome(status="unsupported")
         assert called is False
+
+
+class TestAdoptedTurns:
+    """Turns the harness runs on its own keep the agent BUSY until they end (Codex)."""
+
+    class _Conn:
+        """Fake connection whose prompt and steer answers are released by the test."""
+
+        def __init__(self) -> None:
+            self.prompt_release = asyncio.Event()
+            self.steer_release = asyncio.Event()
+            self.steer_outcome = "startedNewTurn"
+            self.steer_calls = 0
+            self.cancel = AsyncMock()
+
+        async def prompt(self, **kwargs: Any) -> Any:
+            await self.prompt_release.wait()
+            return MagicMock(stop_reason="end_turn")
+
+        async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            self.steer_calls += 1
+            await self.steer_release.wait()
+            return {"outcome": self.steer_outcome}
+
+    def _session(self, events: list[BrokerEvent]) -> tuple[ACPSession, TestAdoptedTurns._Conn]:
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(
+            agent_id="test",
+            binary="echo",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            extension=get_extension("codex"),
+        )
+        session._session_id = "sess-1"
+        session._sm._state = AgentState.IDLE
+        conn = self._Conn()
+        session._conn = conn
+        return session, conn
+
+    @staticmethod
+    async def _status(session: ACPSession, status_type: str) -> None:
+        """Deliver a measured Codex threadStatus update and let its emission run."""
+        await session.session_update(
+            "sess-1",
+            SessionInfoUpdate.model_validate(
+                {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {"codex": {"threadStatus": {"type": status_type, "activeFlags": []}}},
+                }
+            ),
+        )
+        await _pump_until(lambda: not session._pending_emissions)
+
+    @staticmethod
+    def _trace(events: list[BrokerEvent]) -> list[str]:
+        out: list[str] = []
+        for e in events:
+            if isinstance(e, AgentStateChanged):
+                out.append(e.new_state.name)
+            elif isinstance(e, TurnComplete):
+                out.append(f"TurnComplete:{e.stop_reason}")
+        return out
+
+    async def test_refused_busy_transition_releases_the_prompt_claim(self) -> None:
+        """Silent failure: the claim stays set after a refused BUSY transition, so later
+        harness-started turns are never adopted and the broker prompts into them."""
+        events: list[BrokerEvent] = []
+        session, _ = self._session(events)
+        session._sm._state = AgentState.CONFIGURING
+        session.prompt_claimed = True
+
+        with pytest.raises(InvalidTransitionError):
+            await session.prompt("hello")
+
+        assert session.prompt_claimed is False
+        session._sm._state = AgentState.IDLE
+        await self._status(session, "active")
+        assert self._trace(events) == ["BUSY"]
+
+    async def test_harness_reported_turn_on_idle_agent(self) -> None:
+        """Silent failure: a turn Codex starts itself looks IDLE, so the broker prompts
+        into it and the prompt merges into that turn (measured)."""
+        events: list[BrokerEvent] = []
+        session, _ = self._session(events)
+
+        await self._status(session, "active")
+        assert self._trace(events) == ["BUSY"]
+        await self._status(session, "idle")
+        assert self._trace(events) == ["BUSY", "TurnComplete:end_turn", "IDLE"]
+
+    async def test_own_prompt_idle_before_response_is_ignored(self) -> None:
+        """Silent failure: the idle Codex sends just before the PromptResponse ends the
+        turn early, giving a second TurnComplete and an IDLE a queued prompt can race."""
+        events: list[BrokerEvent] = []
+        session, conn = self._session(events)
+
+        turn = asyncio.create_task(session.prompt("go"))
+        await _pump_until(lambda: session.state == AgentState.BUSY)
+        await self._status(session, "active")
+        await self._status(session, "idle")
+        assert self._trace(events) == ["BUSY"]
+
+        conn.prompt_release.set()
+        await asyncio.wait_for(turn, timeout=1.0)
+        assert self._trace(events) == ["BUSY", "TurnComplete:end_turn", "IDLE"]
+
+    async def _race_steer_past_response(
+        self, session: ACPSession, conn: TestAdoptedTurns._Conn, events: list[BrokerEvent]
+    ) -> tuple[asyncio.Task[None], asyncio.Task[SteerOutcome]]:
+        """Own prompt returns while a steer is still awaiting its answer."""
+        turn = asyncio.create_task(session.prompt("go"))
+        await _pump_until(lambda: session.state == AgentState.BUSY)
+        steer = asyncio.create_task(session.steer("[Message from a]: hi"))
+        await _pump_until(lambda: conn.steer_calls == 1)
+        await self._status(session, "idle")
+        conn.prompt_release.set()
+        await _pump_until(lambda: "TurnComplete:end_turn" in self._trace(events))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        # Rule 2: the finishing prompt waits for the steer answer instead of going IDLE.
+        assert not turn.done()
+        assert session.state == AgentState.BUSY
+        return turn, steer
+
+    async def test_started_turn_after_response_holds_busy(self) -> None:
+        """Silent failure: the finishing prompt goes IDLE before the steer answers
+        startedNewTurn, and the queued prompt merges into Codex's detached turn."""
+        events: list[BrokerEvent] = []
+        session, conn = self._session(events)
+        turn, steer = await self._race_steer_past_response(session, conn, events)
+
+        conn.steer_release.set()
+        assert (await asyncio.wait_for(steer, timeout=1.0)).status == "started_turn"
+        await asyncio.wait_for(turn, timeout=1.0)
+        assert self._trace(events) == ["BUSY", "TurnComplete:end_turn"]
+
+        await self._status(session, "active")
+        await self._status(session, "idle")
+        assert self._trace(events) == [
+            "BUSY",
+            "TurnComplete:end_turn",
+            "TurnComplete:end_turn",
+            "IDLE",
+        ]
+
+    async def test_started_turn_after_active_already_arrived(self) -> None:
+        """Silent failure: the adopted turn waits for an active report that already
+        came, and times out to IDLE while the detached turn is still running."""
+        events: list[BrokerEvent] = []
+        session, conn = self._session(events)
+        turn, steer = await self._race_steer_past_response(session, conn, events)
+
+        await self._status(session, "active")
+        conn.steer_release.set()
+        await asyncio.wait_for(steer, timeout=1.0)
+        await asyncio.wait_for(turn, timeout=1.0)
+        assert session._adopted_start_timer is None
+
+        await self._status(session, "idle")
+        assert self._trace(events) == [
+            "BUSY",
+            "TurnComplete:end_turn",
+            "TurnComplete:end_turn",
+            "IDLE",
+        ]
+
+    async def test_started_turn_without_activity_times_out(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Silent failure: a steer Codex handles without running a turn leaves the
+        agent BUSY forever."""
+        events: list[BrokerEvent] = []
+        session, conn = self._session(events)
+        conn.steer_release.set()
+
+        with (
+            patch("synth_acp.acp.session._ADOPTED_TURN_START_TIMEOUT", 0.01),
+            caplog.at_level(logging.INFO, logger="synth_acp.acp.session"),
+        ):
+            assert (await session.steer("hi")).status == "started_turn"
+            assert session.state == AgentState.BUSY
+            timer = session._adopted_start_timer
+            assert timer is not None
+            await asyncio.wait_for(timer, timeout=1.0)
+
+        assert self._trace(events) == ["BUSY", "IDLE"]
+        assert any("reported no activity within 0.01s" in r.getMessage() for r in caplog.records)
+
+    async def test_adopted_turn_ends_from_awaiting_permission_with_none_pending(self) -> None:
+        """Silent failure: a permission cancelled during an adopted turn leaves the agent
+        AWAITING_PERMISSION with nothing pending, and the turn's end must still reach
+        IDLE; checking only for BUSY strands the agent there."""
+        events: list[BrokerEvent] = []
+        session, _ = self._session(events)
+        await self._status(session, "active")
+        options = [PermissionOption(kind="allow_once", name="Allow", option_id="allow_once")]
+        request = asyncio.create_task(
+            session.request_permission(options, "sess-1", ToolCallUpdate(tool_call_id="tc-1"))
+        )
+        await _pump_until(lambda: "tc-1" in session._permission_futures)
+        session._permission_futures["tc-1"].cancel()
+        await asyncio.wait_for(request, timeout=1.0)
+        assert (session.state, session._permission_futures) == (
+            AgentState.AWAITING_PERMISSION,
+            {},
+        )
+
+        await self._status(session, "idle")
+        assert self._trace(events) == [
+            "BUSY",
+            "AWAITING_PERMISSION",
+            "TurnComplete:end_turn",
+            "BUSY",
+            "IDLE",
+        ]
+
+    async def test_cancel_adopted_turn_sends_session_cancel(self) -> None:
+        """Silent failure: an adopted turn cannot be stopped from synth."""
+        events: list[BrokerEvent] = []
+        session, conn = self._session(events)
+
+        await self._status(session, "active")
+        await session.cancel()
+        conn.cancel.assert_awaited_once_with(session_id="sess-1")
+        await self._status(session, "idle")
+        assert self._trace(events) == ["BUSY", "TurnComplete:end_turn", "IDLE"]
 
 
 class TestRename:

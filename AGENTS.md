@@ -31,7 +31,7 @@ src/synth_acp/
 ├── embeddings.py       # Standalone embedding module for semantic session search
 ├── harnesses.py        # Harness registry loader (TOML + harness_variant → HarnessEntry)
 ├── data/
-│   └── harnesses/      # Harness TOML definitions (kiro.toml, claude.toml, opencode.toml, gemini.toml)
+│   └── harnesses/      # Harness TOML definitions (kiro.toml, claude.toml, codex.toml, opencode.toml, gemini.toml)
 ├── models/
 │   ├── agent.py        # AgentState enum, AgentConfig, DiscoveredAgent
 │   ├── config.py       # SessionConfig, HooksConfig (parsed from .synth.json)
@@ -47,6 +47,7 @@ src/synth_acp/
 │       ├── __init__.py # Explicit registry: get_extension, register_extension
 │       ├── base.py     # AcpExtension — plain standard ACP (the "standard" extension)
 │       ├── claude.py   # ClaudeExtension — claudeCode _meta, handoff to switch agent, discovery
+│       ├── codex.py    # CodexExtension — _session/steering, threadStatus → TurnActivity, MCP identity
 │       ├── kiro_v2.py  # KiroV2Extension — kiro.dev/metadata usage, session/steer, discovery
 │       └── kiro_v3.py  # KiroV3Extension — _meta.kiro modeId/noReplay, context_usage, shell_type
 ├── broker/
@@ -168,6 +169,32 @@ Optional (`pip install synth-acp[search]`):
   extension's load `_meta`. `agents.harness_variant` in synth.db records the variant that
   created each session; restore starts fresh with a warning when it differs from the
   configured variant (existing kiro rows are backfilled as `v2`)
+
+**Codex** (`codex.toml`):
+- `run_cmd = "codex-acp"` (npm `@agentclientprotocol/codex-acp`, verified on 2.0.0; it runs its
+  bundled Codex, not one on PATH), `extension = "codex"`. Auth comes from the user's Codex login;
+  synth never calls `authenticate`
+- `agent_mode` = Codex mode id (`read-only`, `workspace-write`, `agent`, `agent-full-access`)
+  through the standard `set_session_mode` path; no profiles to discover
+- `CodexExtension`: steering via `ext_method("session/steering", {sessionId, prompt: [text block]})`,
+  outcome `injected` → `delivered`, `startedNewTurn` → `started_turn` (accepted, not re-queued),
+  anything else → `failed`; `_meta.codex.threadStatus` on `session_info_update` → `TurnActivity`
+  (`active` → True; `idle` / `systemError` / `notLoaded` → False); MCP permission identity from
+  rawInput `{server, tool}`, or from an `mcp.<server>.<tool>` title only when the request is
+  flagged `is_mcp_tool_approval`
+- Adopted turns (generic, in ACPSession): a `TurnActivity(True)` on an IDLE agent with no own
+  prompt moves it BUSY until `TurnActivity(False)`, which emits TurnComplete and goes IDLE; a
+  finishing prompt waits (bounded by `_STEER_ACCEPTANCE_TIMEOUT`) for an in-flight steer answer;
+  a `started_turn` steer keeps the agent BUSY until active-then-idle, or IDLE with no
+  TurnComplete if no active arrives within `_ADOPTED_TURN_START_TIMEOUT` (5 s). Activity during
+  synth's own prompt is ignored (Codex sends idle just before the PromptResponse). Without
+  this a queued prompt sent into a Codex-started turn merges into it and is never answered
+- Codex MCP permission requests carry only `{toolCallId, kind, status}`; ACPSession fills title
+  and rawInput from the earlier tool_call with that id (generic cache, dropped at
+  completed/failed). The filled title reaches `PermissionRequested.title` only when the
+  extension found an identity, so the title substring fallback never sees a cached shell command
+- Restore: `session/resume` (advertised), zero replay; Codex resets mode/model/effort on open
+- Global `~/.codex` MCP servers load in every session
 
 **OpenCode** (`opencode.toml`):
 - `run_cmd = "opencode acp"` — simple ACP mode

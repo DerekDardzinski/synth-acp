@@ -1,0 +1,6 @@
+identity = "codex"
+name = "Codex"
+short_name = "codex"
+binary_names = ["codex-acp"]
+run_cmd = "codex-acp"
+extension = "codex"
