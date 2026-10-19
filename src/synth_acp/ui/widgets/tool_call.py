@@ -19,6 +19,7 @@ from textual.widget import Widget
 from textual.widgets import Label, Markdown, Rule, Static
 
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
+from synth_acp.ui.ids import widget_id
 from synth_acp.ui.widgets.copy_button import CopyButton
 from synth_acp.ui.widgets.diff_view import DiffView
 from synth_acp.ui.widgets.expandable_section import ExpandableSection
@@ -158,7 +159,7 @@ class ToolCallBlock(Vertical, can_focus=False):
         text_content: str | None = None,
         terminal_id: str | None = None,
     ) -> None:
-        super().__init__(id=f"tool-{tool_call_id}")
+        super().__init__(id=widget_id("tool", tool_call_id))
         self._tool_call_id = tool_call_id
         self._title = title
         self._kind = kind

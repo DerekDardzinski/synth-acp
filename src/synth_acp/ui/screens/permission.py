@@ -8,6 +8,7 @@ from acp.schema import PermissionOption
 from textual.binding import Binding
 from textual.message import Message
 
+from synth_acp.ui.ids import widget_id
 from synth_acp.ui.widgets.choice_bar import Choice, ChoiceBar
 
 _KIND_KEYS: dict[str, str] = {
@@ -61,12 +62,12 @@ class PermissionBar(ChoiceBar):
     def __init__(self, agent_id: str, request_id: str, title: str, options: list[PermissionOption], *, position: str = "") -> None:
         cancel_id = next((opt.option_id for opt in options if opt.kind == "reject_once"), "")
         super().__init__(
-            bar_id=f"perm-{request_id}",
+            bar_id=widget_id("perm", request_id),
             title=title,
             choices=_choices(options),
             cancel_id=cancel_id,
             position=position,
-            id=f"perm-{request_id}",
+            id=widget_id("perm", request_id),
         )
         self._agent_id = agent_id
         self._request_id = request_id
