@@ -84,6 +84,7 @@ def _mock_process() -> MagicMock:
     proc.on_exit = None
     proc.resize_pty = MagicMock()
     proc.return_code = None
+    proc.get_output = MagicMock(return_value=("", False))
     return proc
 
 

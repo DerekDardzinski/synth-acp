@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -81,6 +82,8 @@ class Terminal(ScrollView, can_focus=False):
         self._alternate_screen = False
         self._terminal_render_cache: LRUCache[tuple, Strip] = LRUCache(1024)
         self._write_to_stdin: Callable[[str], Awaitable] | None = None
+        self._replayed = asyncio.Event()
+        """Set once output from before mount has been written; live output waits on it."""
 
     @staticmethod
     async def _noop_stdin(text: str) -> None:
@@ -171,13 +174,39 @@ class Terminal(ScrollView, can_focus=False):
         self.refresh()
 
     def on_mount(self) -> None:
-        """Wire up process callbacks and set initial size."""
+        """Wire up process callbacks, replay earlier output, and set initial size.
+
+        The widget is often mounted after the process has produced output, or after it
+        has exited: the ToolCallBlock that hosts it can arrive later than the terminal.
+        Output from before the mount went only to the process buffer, so it is replayed
+        here. The snapshot is taken in the same synchronous step that installs the
+        callbacks, so every chunk is in exactly one of the two, and live chunks wait
+        for the replay so they are written after it.
+        """
         self.anchor()
         width, height = self.scrollable_content_region.size
         self.update_size(width, height)
+        earlier_output, _truncated = self._process.get_output()
         self._process.on_output = self._handle_output
         self._process.on_exit = self._handle_exit
         self._process.resize_pty(width, height)
+        self.run_worker(self._replay(earlier_output), group="terminal-replay")
+
+    async def _replay(self, earlier_output: str) -> None:
+        """Write output produced before mount, then finalize if the process already exited.
+
+        Args:
+            earlier_output: The process buffer as it was at mount.
+        """
+        try:
+            if earlier_output:
+                await self.write(earlier_output)
+        finally:
+            self._replayed.set()
+        # on_exit was not installed when the process exited, so finalize here.
+        return_code = self._process.return_code
+        if return_code is not None and not self._finalized:
+            self._do_finalize(return_code)
 
     async def _handle_output(self, text: str) -> None:
         """Async callback for TerminalProcess output.
@@ -185,6 +214,7 @@ class Terminal(ScrollView, can_focus=False):
         Args:
             text: Decoded text from the PTY.
         """
+        await self._replayed.wait()
         await self.write(text)
 
     def _handle_exit(self, return_code: int | None) -> None:
