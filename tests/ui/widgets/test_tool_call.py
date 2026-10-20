@@ -16,7 +16,12 @@ from synth_acp.models.config import SessionConfig
 from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.app import SynthApp
 from synth_acp.ui.widgets.conversation import ConversationFeed
-from synth_acp.ui.widgets.tool_call import DiffState, ToolCallBlock, _extract_raw_output_text
+from synth_acp.ui.widgets.tool_call import (
+    DiffState,
+    ToolCallBlock,
+    _extract_raw_output_text,
+    _highlight_output,
+)
 
 
 def _make_config() -> SessionConfig:
@@ -132,6 +137,15 @@ class TestToolCallBlockContent:
             assert len(block.query("#tc-text")) == 0
             label = block.query_one("#tc-text-output-label", Label)
             assert label.content.plain == output
+
+    def test_highlight_output_keeps_lines_ending_in_crlf(self) -> None:
+        """PTY output ends every line with CRLF and every line must survive.
+
+        Rich 15's Text.from_ansi treats the CR as a carriage return that discards the
+        line before it, so without normalization only the last line rendered.
+        """
+        lines = _highlight_output("line one\r\nline two\r\n").plain.splitlines()
+        assert lines == ["line one", "line two"]
 
     async def test_other_kind_json_text_gets_json_highlighting(self) -> None:
         """JSON output is highlighted as JSON: keys and string values get distinct styles."""

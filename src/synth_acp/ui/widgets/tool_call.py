@@ -36,12 +36,18 @@ def _highlight_output(text: str) -> Content:
     the JSON highlighter (keys, strings, numbers); anything else gets the repr
     highlighter (numbers, paths, URLs, booleans).
 
+    ``\\r\\n`` is normalized to ``\\n`` first. Output captured from a PTY (Kiro v3 runs
+    shell commands through terminal/create) ends every line with ``\\r\\n``, and Rich
+    15's ``Text.from_ansi`` treats that ``\\r`` as a carriage return that discards the
+    line before it, so every line but the last rendered empty.
+
     Args:
         text: Raw tool output.
 
     Returns:
         Highlighted Content.
     """
+    text = text.replace("\r\n", "\n")
     rich_text = Text.from_ansi(text)
     try:
         json.loads(text)
