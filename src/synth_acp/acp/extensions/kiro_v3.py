@@ -24,6 +24,8 @@ from synth_acp.models.agent import DiscoveredAgent
 from synth_acp.models.extensions import (
     ContextUsage,
     ExtensionCapabilities,
+    McpServerState,
+    McpStatus,
     PermissionHints,
     ProfileUnavailable,
     Signal,
@@ -37,6 +39,11 @@ log = logging.getLogger(__name__)
 _SHELL_TYPE_REQUEST = "kiro/terminal/shell_type"
 _PROFILE_NOT_FOUND = "kiro/customAgent/not_found"
 _PROFILE_CONFIG_ERROR = "kiro/customAgent/config_error"
+# A full snapshot of every MCP server, sent repeatedly as servers connect.  Measured on
+# kiro-cli with six servers: the first snapshot (all "connecting") arrives during
+# session/new, session/new returns about 0.3 s later, and the last server reaches
+# "connected" about 4.7 s after that.
+_MCP_STATUS = "kiro/mcp/status"
 
 # v3 filters every MCP tool, including those of client-passed servers, through the
 # agent profile's ``tools`` list, so a profile that does not name ``@synth-mcp`` hides
@@ -54,7 +61,7 @@ class KiroV3Extension(AcpExtension):
     """kiro-cli v3 engine: _meta.kiro session options, context_usage updates, session/steer."""
 
     name = "kiro_v3"
-    capabilities = ExtensionCapabilities(steer=True, no_replay_load=True)
+    capabilities = ExtensionCapabilities(steer=True, no_replay_load=True, waits_for_mcp_status=True)
 
     def session_meta(self, op: SessionOp, agent_mode: str | None) -> dict[str, Any]:
         """``kiro.modeId`` on session/new, ``kiro.noReplay`` on session/load.
@@ -109,7 +116,9 @@ class KiroV3Extension(AcpExtension):
         reasonCode, error}} is how v3 reports a profile it will not use, most often
         reasonCode ``cli_only_agent`` for a profile with allowedTools or toolsSettings.
         ``customAgent/config_error`` {path, reasonCode, error} reports a profile file
-        v3 could not load.  Malformed params give no signal and a log warning.
+        v3 could not load.  ``mcp/status`` {sessionId, servers: [{name, status,
+        errorMessage?}]} is a full MCP server snapshot, mapped onto McpStatus.
+        Malformed params give no signal and a log warning.
         """
         if method == _PROFILE_NOT_FOUND:
             requested = params.get("requestedAgent")
@@ -124,6 +133,12 @@ class KiroV3Extension(AcpExtension):
                 log.warning("Malformed %s params: %r", method, params)
                 return ()
             return (ProfileUnavailable(requested=requested, fallback=fallback, reason=reason),)
+        if method == _MCP_STATUS:
+            status = _mcp_status(params)
+            if status is None:
+                log.warning("Malformed %s params: %r", method, params)
+                return ()
+            return (status,)
         if method == _PROFILE_CONFIG_ERROR:
             path = params.get("path")
             reason = _skip_reason(params)
@@ -191,6 +206,32 @@ def _context_usage_from_meta(kiro_meta: Mapping[str, Any]) -> ContextUsage | Non
     if not math.isfinite(pct) or not 0 <= pct <= _PERCENT_SCALE:
         return None
     return ContextUsage(size=_PERCENT_SCALE, used=round(pct))
+
+
+def _mcp_status(params: Mapping[str, Any]) -> McpStatus | None:
+    """McpStatus from ``mcp/status`` params, or None when ``servers`` is malformed.
+
+    An entry without a string ``name`` and ``status`` makes the whole snapshot
+    malformed rather than being skipped: a snapshot missing a server could read as
+    settled while that server is still connecting.
+    """
+    servers = params.get("servers")
+    if not isinstance(servers, list):
+        return None
+    states: list[McpServerState] = []
+    for entry in servers:
+        if not isinstance(entry, dict):
+            return None
+        name, status = entry.get("name"), entry.get("status")
+        if not isinstance(name, str) or not isinstance(status, str):
+            return None
+        error = entry.get("errorMessage")
+        states.append(
+            McpServerState(
+                name=name, status=status, error=error if isinstance(error, str) else None
+            )
+        )
+    return McpStatus(servers=tuple(states))
 
 
 def _skip_reason(skipped: Any) -> str | None:

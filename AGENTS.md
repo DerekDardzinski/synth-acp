@@ -174,6 +174,13 @@ Optional (`pip install synth-acp[search]`):
   which v3 always admits (kiro-cli 2.29.1; undocumented, re-check on Kiro upgrades)
 - v3 rejects profiles that use `allowedTools` / `toolsSettings` (reason `cli_only_agent`,
   all SHScienceAgentKit profiles) and falls back to mode `vibe`; synth shows a warning
+- v3 answers session/new before its MCP servers connect (measured: slowest server 4.7 s
+  later) and reports progress in full `kiro/mcp/status` snapshots. `waits_for_mcp_status`
+  makes `ACPSession._await_mcp_ready` hold the agent in INITIALIZING until a snapshot has
+  no server `connecting` (any other status, including `failed`, counts as settled), the
+  process exits, or `_MCP_READY_TIMEOUT` (30 s) passes. Snapshots are recorded by session
+  id before the sessionId and replay guards, because the first ones arrive during
+  session/new. Each failed server and a timeout produce one warning
 - v3 returns native `configOptions` and no `models`; `session/set_model` fails (-32603), so
   only the native `set_config_option` path is used
 - Restore: `session/resume` when advertised (Claude), else `session/load` with the

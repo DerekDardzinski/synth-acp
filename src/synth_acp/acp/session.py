@@ -83,6 +83,7 @@ from synth_acp.models.events import (
 from synth_acp.models.extensions import (
     ContextUsage,
     ExtensionCapabilities,
+    McpStatus,
     ProfileUnavailable,
     Signal,
     SteerOutcome,
@@ -106,6 +107,10 @@ _STEER_ACCEPTANCE_TIMEOUT = 10.0
 """Seconds to wait for the harness's deterministic steering acceptance response."""
 
 _ADOPTED_TURN_START_TIMEOUT = 5.0
+
+# Longest startup waits for MCP servers to settle (extensions with waits_for_mcp_status).
+# Measured on Kiro v3 with six servers: the slowest connected 4.7 s after session/new.
+_MCP_READY_TIMEOUT = 30.0
 """Seconds a turn the harness started with a steer (``started_turn``) may take to report
 ``TurnActivity(active=True)``.  With no report in that time the agent goes IDLE, so a
 steer the harness handled without running a turn cannot leave the agent BUSY forever."""
@@ -388,6 +393,9 @@ class ACPSession:
         self._on_session_created: Callable[[str, str], Awaitable[None]] | None = None
         self._shutting_down: bool = False
         self._stderr_tail: _StderrTail = _StderrTail()
+        self._mcp_status: dict[str, McpStatus] = {}
+        """Latest MCP snapshot per ACP session id, recorded before the session guards."""
+        self._mcp_status_changed: asyncio.Event = asyncio.Event()
         """Drained stderr of the current agent process, replaced on each spawn.
 
         Held on the session rather than passed to each handshake because a parameter is a
@@ -764,6 +772,7 @@ class ACPSession:
 
                 await self._capture_config_options(session)
                 await self._apply_agent_mode_option(conn)
+                await self._await_mcp_ready(proc)
                 await self._sm.transition(AgentState.IDLE)
                 await proc.wait()
         except HandshakeTimeoutError as e:
@@ -990,6 +999,7 @@ class ACPSession:
 
                 await self._capture_config_options(session)
                 await self._apply_agent_mode_option(conn)
+                await self._await_mcp_ready(proc)
                 await self._sm.transition(AgentState.IDLE)
                 await proc.wait()
         except HandshakeTimeoutError as e:
@@ -1684,18 +1694,95 @@ class ACPSession:
         """
         if self._shutting_down:
             return
+        signals = self._ext.on_ext_notification(method, params)
+        # MCP status snapshots are recorded BEFORE the guards below, keyed by the
+        # session they name.  Kiro v3 sends its first snapshots while session/new is
+        # still running, before synth knows the session id, and on a restore that falls
+        # back to session/new the id is briefly the old one; the guards would drop
+        # those.  A snapshot is current state, not history, so replay suppression does
+        # not apply either.  _await_mcp_ready reads the entry for the final id.
+        session_key = params.get("sessionId")
+        for sig in signals:
+            if isinstance(sig, McpStatus) and isinstance(session_key, str):
+                self._mcp_status[session_key] = sig
+                self._mcp_status_changed.set()
         # `is None` first: without it a payload that omits sessionId compares
         # equal while _session_id is still unset, and usage is emitted for an
         # agent that has no ACP session yet. Usage without a session is not a
         # measurement of anything.
-        if self._session_id is None or params.get("sessionId") != self._session_id:
+        if self._session_id is None or session_key != self._session_id:
             return
         # Same guard as the UsageUpdate branch of session_update: load_session
         # replays history, and a replayed usage figure is not the current one.
         if self._suppress_history_replay:
             return
-        for sig in self._ext.on_ext_notification(method, params):
+        for sig in signals:
             await self._emit_signal(sig)
+
+    async def _await_mcp_ready(self, proc: Any) -> None:
+        """Hold startup until the engine reports every MCP server settled.
+
+        Only for an extension with ``waits_for_mcp_status``.  Returns when the latest
+        snapshot for the current session has no server ``"connecting"``, when the
+        agent process exits, or after ``_MCP_READY_TIMEOUT`` seconds.  A timeout warns
+        with the servers still connecting and the agent goes IDLE anyway.  Each failed
+        server gets one warning, because its tools are missing from the session.
+
+        Args:
+            proc: The agent subprocess; its exit ends the wait early.
+        """
+        if not self.capabilities.waits_for_mcp_status:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _MCP_READY_TIMEOUT
+        exited = asyncio.ensure_future(proc.wait())
+        try:
+            while True:
+                status = self._mcp_status.get(self._session_id or "")
+                if status is not None and not status.connecting:
+                    break
+                remaining = deadline - loop.time()
+                if remaining <= 0 or exited.done():
+                    if not exited.done():
+                        pending = (
+                            ", ".join(status.connecting)
+                            if status is not None
+                            else "no MCP status was reported"
+                        )
+                        await self._event_sink(
+                            BrokerError(
+                                agent_id=self.agent_id,
+                                message=(
+                                    f"MCP servers not ready after {_MCP_READY_TIMEOUT:.0f} s "
+                                    f"({pending}); continuing without waiting."
+                                ),
+                                severity="warning",
+                            )
+                        )
+                    return
+                self._mcp_status_changed.clear()
+                changed = asyncio.ensure_future(self._mcp_status_changed.wait())
+                try:
+                    await asyncio.wait(
+                        {changed, exited}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    changed.cancel()
+        finally:
+            if not exited.done():
+                exited.cancel()
+        for server in status.failed:
+            detail = f": {server.error}" if server.error else ""
+            await self._event_sink(
+                BrokerError(
+                    agent_id=self.agent_id,
+                    message=(
+                        f"MCP server '{server.name}' failed to start{detail}. "
+                        "Its tools are not available to this agent."
+                    ),
+                    severity="warning",
+                )
+            )
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """ACP Client callback for agent-to-client extension requests.
@@ -1741,6 +1828,9 @@ class ACPSession:
             )
         elif isinstance(sig, TurnActivity):
             await self._on_turn_activity(sig.active)
+        elif isinstance(sig, McpStatus):
+            # Recorded by ext_notification before its guards; read by _await_mcp_ready.
+            pass
         elif isinstance(sig, ProfileUnavailable):
             fallback = sig.fallback or "the harness default"
             await self._event_sink(

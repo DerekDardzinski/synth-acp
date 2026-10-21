@@ -3765,3 +3765,220 @@ class TestAgentModeViaConfigOption:
         assert warnings[0].startswith("Failed to set mode=plan:")
         assert self._last_mode(events) == "build"
         assert self._reached_idle(events)
+
+
+def _mcp_snapshot(session_id: str, **servers: str) -> dict[str, Any]:
+    """``kiro/mcp/status`` params with one ``{name: status}`` entry per keyword."""
+    return {
+        "sessionId": session_id,
+        "servers": [{"name": name, "status": status} for name, status in servers.items()],
+    }
+
+
+class TestMcpReadyGate:
+    """A Kiro v3 agent must not go IDLE, and so take its first prompt, before its MCP
+    servers connect.
+
+    Silent failure guarded: v3 answers session/new about 4.7 s before its slowest MCP
+    server connects (measured), so a fast model given a task at launch ran with no MCP
+    tools and concluded it had none.
+    """
+
+    def _harness(self) -> tuple[ACPSession, list[BrokerEvent], Any, Any, asyncio.Event]:
+        events: list[BrokerEvent] = []
+
+        async def sink(event: BrokerEvent) -> None:
+            events.append(event)
+
+        session = ACPSession(
+            agent_id="agent-1",
+            binary="fake",
+            args=[],
+            cwd=".",
+            event_sink=sink,
+            extension=get_extension("kiro_v3"),
+        )
+        conn = AsyncMock()
+        conn.initialize.return_value = MagicMock(agent_capabilities=None, agent_info=None)
+        exit_now = asyncio.Event()
+        proc = MagicMock(returncode=None)
+
+        async def wait() -> int:
+            await exit_now.wait()
+            return 0
+
+        proc.wait = wait
+        proc.stdin = MagicMock(is_closing=MagicMock(return_value=True))
+        return session, events, conn, proc, exit_now
+
+    @staticmethod
+    def _spawn(conn: Any, proc: Any) -> Any:
+        @asynccontextmanager
+        async def fake_spawn(*_a: Any, **_kw: Any) -> Any:
+            yield conn, proc, _StderrTail()
+
+        return fake_spawn
+
+    @staticmethod
+    def _idle(session: ACPSession) -> bool:
+        return session.state == AgentState.IDLE
+
+    @staticmethod
+    def _warnings(events: list[BrokerEvent]) -> list[str]:
+        return [e.message for e in events if isinstance(e, BrokerError) and e.severity == "warning"]
+
+    async def test_waits_for_servers_that_connect_after_session_new(self) -> None:
+        session, events, conn, proc, exit_now = self._harness()
+
+        async def new_session(**_kw: Any) -> Any:
+            # Sent while session/new runs, before synth knows the session id.
+            await session.ext_notification(
+                "kiro/mcp/status", _mcp_snapshot("sess-1", **{"synth-mcp": "connecting"})
+            )
+            return MagicMock(session_id="sess-1", modes=None, models=None, config_options=None)
+
+        conn.new_session.side_effect = new_session
+        with patch("synth_acp.acp.session._spawn_isolated_agent", self._spawn(conn, proc)):
+            task = asyncio.create_task(session.run())
+            try:
+                await _pump_until(lambda: conn.new_session.await_count == 1)
+                for _ in range(50):
+                    await asyncio.sleep(0)
+                assert session.state == AgentState.INITIALIZING
+
+                await session.ext_notification(
+                    "kiro/mcp/status",
+                    _mcp_snapshot("sess-1", **{"synth-mcp": "connected", "trails": "connecting"}),
+                )
+                for _ in range(50):
+                    await asyncio.sleep(0)
+                assert session.state == AgentState.INITIALIZING
+
+                await session.ext_notification(
+                    "kiro/mcp/status",
+                    _mcp_snapshot("sess-1", **{"synth-mcp": "connected", "trails": "connected"}),
+                )
+                await _pump_until(lambda: self._idle(session))
+                assert self._warnings(events) == []
+            finally:
+                exit_now.set()
+                await task
+
+    async def test_snapshot_settled_during_session_new_does_not_wait(self) -> None:
+        """The only settled snapshot can arrive before synth knows the session id; if it
+        were dropped, every launch would sit out the full timeout."""
+        session, events, conn, proc, exit_now = self._harness()
+
+        async def new_session(**_kw: Any) -> Any:
+            await session.ext_notification(
+                "kiro/mcp/status", _mcp_snapshot("sess-1", **{"synth-mcp": "connected"})
+            )
+            return MagicMock(session_id="sess-1", modes=None, models=None, config_options=None)
+
+        conn.new_session.side_effect = new_session
+        with (
+            patch("synth_acp.acp.session._MCP_READY_TIMEOUT", 30.0),
+            patch("synth_acp.acp.session._spawn_isolated_agent", self._spawn(conn, proc)),
+        ):
+            task = asyncio.create_task(session.run())
+            try:
+                await asyncio.wait_for(_pump_until(lambda: self._idle(session)), timeout=2)
+                assert self._warnings(events) == []
+            finally:
+                exit_now.set()
+                await task
+
+    async def test_failed_server_settles_and_warns_once(self) -> None:
+        session, events, conn, proc, exit_now = self._harness()
+        snapshot = {
+            "sessionId": "sess-1",
+            "servers": [
+                {"name": "synth-mcp", "status": "connected"},
+                {"name": "github", "status": "failed", "errorMessage": "OAuth authorization required"},
+            ],
+        }
+
+        async def new_session(**_kw: Any) -> Any:
+            await session.ext_notification("kiro/mcp/status", snapshot)
+            return MagicMock(session_id="sess-1", modes=None, models=None, config_options=None)
+
+        conn.new_session.side_effect = new_session
+        with patch("synth_acp.acp.session._spawn_isolated_agent", self._spawn(conn, proc)):
+            task = asyncio.create_task(session.run())
+            try:
+                await asyncio.wait_for(_pump_until(lambda: self._idle(session)), timeout=2)
+                assert self._warnings(events) == [
+                    "MCP server 'github' failed to start: OAuth authorization required. "
+                    "Its tools are not available to this agent."
+                ]
+            finally:
+                exit_now.set()
+                await task
+
+    async def test_server_still_connecting_at_timeout_warns_and_goes_idle(self) -> None:
+        session, events, conn, proc, exit_now = self._harness()
+
+        async def new_session(**_kw: Any) -> Any:
+            await session.ext_notification(
+                "kiro/mcp/status",
+                _mcp_snapshot("sess-1", **{"synth-mcp": "connected", "trails": "connecting"}),
+            )
+            return MagicMock(session_id="sess-1", modes=None, models=None, config_options=None)
+
+        conn.new_session.side_effect = new_session
+        with (
+            patch("synth_acp.acp.session._MCP_READY_TIMEOUT", 0.05),
+            patch("synth_acp.acp.session._spawn_isolated_agent", self._spawn(conn, proc)),
+        ):
+            task = asyncio.create_task(session.run())
+            try:
+                for _ in range(200):
+                    if self._idle(session):
+                        break
+                    await asyncio.sleep(0.01)
+                assert self._idle(session)
+                warnings = self._warnings(events)
+                assert len(warnings) == 1
+                assert "trails" in warnings[0]
+                assert "synth-mcp" not in warnings[0]
+            finally:
+                exit_now.set()
+                await task
+
+    async def test_restore_counts_snapshots_sent_during_load(self) -> None:
+        """Replay suppression during session/load must not drop MCP snapshots: they are
+        current state, not history."""
+        session, events, conn, proc, exit_now = self._harness()
+
+        async def load_session(**_kw: Any) -> Any:
+            await session.ext_notification(
+                "kiro/mcp/status", _mcp_snapshot("sess-old", **{"synth-mcp": "connected"})
+            )
+            return MagicMock(modes=None, models=None, config_options=None)
+
+        conn.load_session.side_effect = load_session
+        with patch("synth_acp.acp.session._spawn_isolated_agent", self._spawn(conn, proc)):
+            task = asyncio.create_task(session.run_restored("sess-old"))
+            try:
+                await asyncio.wait_for(_pump_until(lambda: self._idle(session)), timeout=2)
+                assert self._warnings(events) == []
+            finally:
+                exit_now.set()
+                await task
+
+    async def test_harness_without_the_capability_does_not_wait(self) -> None:
+        """Claude, Codex, OpenCode and Kiro v2 report no MCP snapshots; waiting for one
+        would delay every launch by the full timeout."""
+        session, events, conn, proc, exit_now = self._harness()
+        session._ext = get_extension("standard")
+        conn.new_session.return_value = MagicMock(
+            session_id="sess-1", modes=None, models=None, config_options=None
+        )
+        with patch("synth_acp.acp.session._spawn_isolated_agent", self._spawn(conn, proc)):
+            task = asyncio.create_task(session.run())
+            try:
+                await asyncio.wait_for(_pump_until(lambda: self._idle(session)), timeout=2)
+                assert self._warnings(events) == []
+            finally:
+                exit_now.set()
+                await task

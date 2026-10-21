@@ -355,6 +355,11 @@ Differences on v3:
   requested profile, the fallback and the reason. The launch continues.
 - Context usage is reported as a percentage, as on v2.
 - A mode switch keeps the MCP servers connected, so synth does not reload the session.
+- v3 finishes starting a session before its MCP servers connect, so synth keeps a v3
+  agent initializing until v3 reports every MCP server connected or failed, for at most
+  30 seconds. Prompts sent meanwhile are queued, so the first prompt always sees the MCP
+  tools. A server that fails to start, and a server still connecting after 30 seconds,
+  each produce a warning; the agent starts without that server's tools.
 - v3 shows an agent only the MCP tools its profile's `tools` list names. So that every
   profile gets the synth-mcp tools, synth appends `synth-mcp` to the
   `ASBX_KIRO_MANDATORY_MCPS` environment variable of the v3 subprocess, keeping any

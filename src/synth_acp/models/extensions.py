@@ -27,12 +27,18 @@ class ExtensionCapabilities(BaseModel, frozen=True):
         reload_after_mode_switch: A mode switch drops MCP servers, so reload them via
             load_session (Kiro v2).
         no_replay_load: ``session_meta("load")`` suppresses the agent's history replay.
+        waits_for_mcp_status: The engine answers session/new or session/load before its
+            MCP servers connect and reports their progress as ``McpStatus`` snapshots,
+            so ACPSession holds the agent in INITIALIZING until a snapshot shows every
+            server settled (Kiro v3).  Without the wait, the first prompt runs with no
+            MCP tools.
     """
 
     steer: bool = False
     profile_switch: Literal["mode", "handoff", "config_option"] = "mode"
     reload_after_mode_switch: bool = False
     no_replay_load: bool = False
+    waits_for_mcp_status: bool = False
 
 
 class ContextUsage(BaseModel, frozen=True):
@@ -58,7 +64,39 @@ class TurnActivity(BaseModel, frozen=True):
     active: bool
 
 
-Signal = ContextUsage | ProfileUnavailable | TurnActivity
+class McpServerState(BaseModel, frozen=True):
+    """One MCP server's entry in an ``McpStatus`` snapshot.
+
+    Attributes:
+        name: Server name as configured.
+        status: The engine's status string, e.g. ``"connecting"``, ``"connected"``,
+            ``"failed"``.  Kept verbatim so an unknown value is still reportable.
+        error: The engine's error message for a failed server, if it gave one.
+    """
+
+    name: str
+    status: str
+    error: str | None = None
+
+
+class McpStatus(BaseModel, frozen=True):
+    """A complete snapshot of the engine's MCP servers; each snapshot replaces the last."""
+
+    servers: tuple[McpServerState, ...]
+
+    @property
+    def connecting(self) -> tuple[str, ...]:
+        """Names of servers still connecting.  Every other status counts as settled,
+        so a failed server, or one waiting for sign-in, cannot hold the agent back."""
+        return tuple(s.name for s in self.servers if s.status == "connecting")
+
+    @property
+    def failed(self) -> tuple[McpServerState, ...]:
+        """Servers whose status is ``"failed"``."""
+        return tuple(s for s in self.servers if s.status == "failed")
+
+
+Signal = ContextUsage | ProfileUnavailable | TurnActivity | McpStatus
 """Closed union: a new kind needs a new model plus its mapping in ACPSession."""
 
 

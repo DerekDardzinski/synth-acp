@@ -12,7 +12,13 @@ import pytest
 from acp.schema import SessionInfoUpdate, UserMessageChunk
 
 from synth_acp.acp.extensions.kiro_v3 import KiroV3Extension
-from synth_acp.models.extensions import ContextUsage, ProfileUnavailable, SteerOutcome
+from synth_acp.models.extensions import (
+    ContextUsage,
+    McpServerState,
+    McpStatus,
+    ProfileUnavailable,
+    SteerOutcome,
+)
 
 
 def _context_usage(pct: Any) -> SessionInfoUpdate:
@@ -213,3 +219,48 @@ class TestPermissionHints:
         """A shell resource is a command line, not a tool identity."""
         meta = {"kiro": {"consent": {"capability": "shell", "resource": "echo probe123"}}}
         assert KiroV3Extension().permission_hints(None, meta).tool_identity is None
+
+
+class TestMcpStatus:
+    """``kiro/mcp/status`` snapshots decide when a v3 agent may take its first prompt."""
+
+    def test_snapshot_maps_connecting_and_failed_servers(self) -> None:
+        ext = KiroV3Extension()
+        signals = ext.on_ext_notification(
+            "kiro/mcp/status",
+            {
+                "sessionId": "sess-1",
+                "servers": [
+                    {"name": "synth-mcp", "status": "connected", "tools": [{"name": "x"}]},
+                    {"name": "trails", "status": "connecting", "tools": []},
+                    {
+                        "name": "github",
+                        "status": "failed",
+                        "failedAuthorization": True,
+                        "errorMessage": "OAuth authorization required",
+                    },
+                ],
+            },
+        )
+        assert len(signals) == 1
+        status = signals[0]
+        assert isinstance(status, McpStatus)
+        assert status.connecting == ("trails",)
+        assert status.failed == (
+            McpServerState(name="github", status="failed", error="OAuth authorization required"),
+        )
+
+    def test_entry_without_status_makes_the_snapshot_malformed(self) -> None:
+        """Dropping only the bad entry could make a still-connecting server look settled."""
+        ext = KiroV3Extension()
+        signals = ext.on_ext_notification(
+            "kiro/mcp/status",
+            {
+                "sessionId": "sess-1",
+                "servers": [{"name": "synth-mcp", "status": "connected"}, {"name": "trails"}],
+            },
+        )
+        assert signals == ()
+
+    def test_extension_asks_synth_to_wait_for_mcp(self) -> None:
+        assert KiroV3Extension.capabilities.waits_for_mcp_status is True
