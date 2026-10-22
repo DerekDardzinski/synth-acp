@@ -208,3 +208,66 @@ class TestMath:
                 and "─" in drawn
             )
             assert latex == "\\documentclass{article}"
+
+
+class TestBlockRewrites:
+    """HTML, GitHub alerts and task lists render the way agents intend."""
+
+    async def test_html_block_text_is_shown_not_dropped(self) -> None:
+        """Silent failure: Textual has no case for html_block, so the text inside a
+        `<details>` or `<p>` vanished with no sign anything was there."""
+        from textual.widgets._markdown import MarkdownParagraph
+
+        message = AgentMessage("a1")
+        app = _TestApp(message)
+        async with app.run_test(headless=True, size=(100, 40)) as pilot:
+            await message.append_chunk(
+                "<details><summary>More</summary>\n\nhidden\n\n</details>\n\n"
+                "<p>one<br>two</p>\n\n<!-- note to self -->\n\nPress <kbd>Ctrl</kbd>+C<br>now\n"
+            )
+            await message.finalize()
+            await pilot.pause()
+
+            texts = [str(p._content) for p in message.query(MarkdownParagraph)]
+            assert texts == ["▸ More", "hidden", "one\ntwo", "Press Ctrl+C\nnow"]
+
+    async def test_alert_marker_becomes_a_label_and_a_colored_quote(self) -> None:
+        """Silent failure: `[!WARNING]` showed as literal text in a plain quote, so a
+        caveat the agent flagged looked like any other quote. A marker that is not
+        alone on its line is not an alert on GitHub and must stay text."""
+        from textual.widgets._markdown import MarkdownParagraph
+
+        from synth_acp.ui.widgets.drawn_markdown import AlertQuote
+
+        message = AgentMessage("a1")
+        app = _TestApp(message)
+        async with app.run_test(headless=True, size=(100, 40)) as pilot:
+            await message.append_chunk(
+                "> [!WARNING]\n> careful **now**\n\n> [!tip] not alone\n"
+            )
+            await message.finalize()
+            await pilot.pause()
+
+            alert, plain = message.query(AlertQuote)
+            assert alert.has_class("-alert-warning")
+            assert not plain.has_class("-alert")
+            texts = [str(p._content) for p in message.query(MarkdownParagraph)]
+            assert texts == ["Warning\ncareful now", "[!tip] not alone"]
+
+    async def test_task_items_get_checkbox_bullets(self) -> None:
+        """Silent failure: `[x]`/`[ ]` showed as text after a normal bullet, so done
+        and open items in an agent's plan looked alike at a glance. Ordered items keep
+        their number."""
+        from textual.widgets._markdown import MarkdownBullet, MarkdownParagraph
+
+        message = AgentMessage("a1")
+        app = _TestApp(message)
+        async with app.run_test(headless=True, size=(100, 40)) as pilot:
+            await message.append_chunk("- [x] done\n- [ ] todo\n- plain\n\n1. [x] kept\n")
+            await message.finalize()
+            await pilot.pause()
+
+            symbols = [b.symbol for b in message.query(MarkdownBullet)]
+            assert symbols[:3] == ["☑ ", "☐ ", "• "]
+            texts = [str(p._content) for p in message.query(MarkdownParagraph)]
+            assert texts == ["done", "todo", "plain", "[x] kept"]

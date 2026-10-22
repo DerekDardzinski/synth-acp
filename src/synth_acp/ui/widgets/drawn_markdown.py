@@ -1,5 +1,9 @@
 """Markdown that draws mermaid diagrams and LaTeX math as text.
 
+It also rewrites three constructs Textual's Markdown shows badly, always, with no
+optional library: HTML blocks (Textual drops them and their text), GitHub alerts
+(``> [!WARNING]``) and task lists (``- [x] done``).
+
 Two optional libraries do the drawing:
 
 - ``termaid`` (``synth-acp[diagrams]``) draws closed ```` ```mermaid ```` fences.
@@ -17,18 +21,23 @@ drawing, an error row from TeXicode, or a ``?`` TeXicode put in for an unknown c
 
 from __future__ import annotations
 
+import re
+from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from markdown_it import MarkdownIt
+from markdown_it.token import Token
 from mdit_py_plugins.dollarmath import dollarmath_plugin
 from textual.content import Content
+from textual.widgets._markdown import MarkdownBlockQuote, MarkdownUnorderedListItem
 from textual.widgets.markdown import Markdown, MarkdownBlock, MarkdownFence
 
 if TYPE_CHECKING:
     from markdown_it.rules_block import StateBlock
     from markdown_it.rules_core import StateCore
     from markdown_it.rules_inline import StateInline
-    from markdown_it.token import Token
+
+_BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
 
 MATH_LANGUAGE = "math"
 
@@ -172,12 +181,202 @@ def _word_bounded(rule: Any) -> Any:
     return wrapped
 
 
+ALERT_KINDS = ("note", "tip", "important", "warning", "caution")
+_ALERT_MARKER = re.compile(r"\[!(" + "|".join(ALERT_KINDS) + r")\]", re.IGNORECASE)
+_TASK_MARKER = re.compile(r"\[([ xX])\](?: |$)")
+_HTML_BLOCK_TAGS = frozenset(
+    [
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "dd",
+        "details",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "summary",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    ]
+)
+
+
+class _HTMLText(HTMLParser):
+    """Collect the readable text of an HTML fragment, one entry per visual line."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.lines: list[str] = [""]
+        self._skip = 0
+
+    def _newline(self) -> None:
+        if self.lines[-1].strip():
+            self.lines.append("")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:  # noqa: ARG002 - HTMLParser signature
+        if tag in ("script", "style"):
+            self._skip += 1
+        elif tag in _HTML_BLOCK_TAGS:
+            self._newline()
+            if tag == "summary":
+                self.lines[-1] += "▸ "
+            elif tag == "li":
+                self.lines[-1] += "• "
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+        elif tag in _HTML_BLOCK_TAGS:
+            self._newline()
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip:
+            self.lines[-1] += data
+
+
+def html_to_lines(html: str) -> list[str]:
+    """Return the readable text of an HTML block as lines, tags and comments removed."""
+    parser = _HTMLText()
+    parser.feed(html)
+    parser.close()
+    lines = (" ".join(line.split()) for line in parser.lines)
+    return [line for line in lines if line and line not in {"▸", "•"}]
+
+
+def _convert_html_block(tokens: list[Token], index: int) -> int:
+    """Replace the html_block at ``index`` with a paragraph of its text.
+
+    Textual's Markdown widget has no case for html_block, so without this the block,
+    and every word inside it, silently disappears.
+
+    Returns:
+        The number of tokens now occupying the block's position (0 if it had no text).
+    """
+    block = tokens[index]
+    lines = html_to_lines(block.content)
+    if not lines:
+        del tokens[index]
+        return 0
+    children: list[Token] = []
+    for n, line in enumerate(lines):
+        if n:
+            children.append(Token("hardbreak", "br", 0))
+        children.append(Token("text", "", 0, content=line))
+    opened = Token("paragraph_open", "p", 1, map=block.map, block=True)
+    inline = Token("inline", "", 0, map=block.map, content="\n".join(lines), children=children)
+    closed = Token("paragraph_close", "p", -1, block=True)
+    tokens[index : index + 1] = [opened, inline, closed]
+    return 3
+
+
+def _first_paragraph_inline(tokens: list[Token], index: int) -> Token | None:
+    """Return the inline token of the paragraph that opens right after ``index``."""
+    if index + 2 < len(tokens) and tokens[index + 1].type == "paragraph_open":
+        inline = tokens[index + 2]
+        if inline.type == "inline" and inline.children:
+            return inline
+    return None
+
+
+def _mark_alert(tokens: list[Token], index: int) -> None:
+    """Turn ``> [!WARNING]`` into a labeled alert quote, as GitHub renders it.
+
+    The marker must be the whole first line of the quote. It is replaced by a bold
+    label, and the quote token is tagged so AlertQuote can color its border.
+    """
+    inline = _first_paragraph_inline(tokens, index)
+    if inline is None or inline.children is None:
+        return
+    children = inline.children
+    first = children[0]
+    match = _ALERT_MARKER.fullmatch(first.content.strip()) if first.type == "text" else None
+    if match is None or (len(children) > 1 and children[1].type != "softbreak"):
+        return
+    kind = match.group(1).lower()
+    tokens[index].meta["alert"] = kind
+    label = [
+        Token("strong_open", "strong", 1),
+        Token("text", "", 0, content=kind.capitalize()),
+        Token("strong_close", "strong", -1),
+    ]
+    rest = children[2:]
+    inline.children = label + ([Token("hardbreak", "br", 0), *rest] if rest else [])
+
+
+def _mark_task(tokens: list[Token], index: int) -> None:
+    """Turn ``- [x] done`` into a list item whose bullet is a checkbox."""
+    if tokens[index].info:  # ordered list item: keep its number
+        return
+    inline = _first_paragraph_inline(tokens, index)
+    if inline is None or inline.children is None or inline.children[0].type != "text":
+        return
+    first = inline.children[0]
+    match = _TASK_MARKER.match(first.content)
+    if match is None:
+        return
+    tokens[index].meta["task"] = match.group(1) != " "
+    first.content = first.content[match.end() :]
+
+
+class AlertQuote(MarkdownBlockQuote):
+    """A block quote that shows a GitHub alert (note, tip, warning, ...)."""
+
+    def __init__(self, markdown: Markdown, token: Token) -> None:
+        super().__init__(markdown, token)
+        kind = token.meta.get("alert") if token.meta else None
+        if kind:
+            self.add_class("-alert", f"-alert-{kind}")
+
+
+class TaskListItem(MarkdownUnorderedListItem):
+    """A bullet list item whose bullet is a checkbox when it is a task."""
+
+    def __init__(self, markdown: Markdown, token: Token, bullet: str) -> None:
+        task = token.meta.get("task") if token.meta else None
+        if task is not None:
+            bullet = "☑ " if task else "☐ "
+        super().__init__(markdown, token, bullet)
+
+
 class DrawnMarkdown(Markdown):
-    """Markdown that draws diagrams and math when ``drawing`` is True."""
+    """Markdown that draws diagrams and math when ``drawing`` is True.
+
+    It also always shows HTML blocks as text, GitHub alerts as labeled quotes, and
+    task lists with checkboxes.
+    """
 
     BLOCKS: ClassVar[dict[str, type[MarkdownBlock]]] = {
         **Markdown.BLOCKS,
         "fence": DrawnFence,
+        "blockquote_open": AlertQuote,
+        "list_item_unordered_open": TaskListItem,
     }
 
     def __init__(self, *args: Any, drawing: bool = False, **kwargs: Any) -> None:
@@ -208,7 +407,32 @@ class DrawnMarkdown(Markdown):
         inline = next(r.fn for r in parser.inline.ruler.__rules__ if r.name == "math_inline")
         parser.inline.ruler.at("math_inline", _word_bounded(inline))
         parser.core.ruler.push("synth_math", self._convert_math_tokens)
+        parser.core.ruler.push("synth_blocks", self._convert_block_tokens)
         return parser
+
+    @staticmethod
+    def _convert_block_tokens(state: StateCore) -> None:
+        """Rewrite HTML, alert and task-list tokens into ones Textual renders.
+
+        These run while streaming too: unlike diagrams and math, a half-written one
+        just shows as text until its line is complete.
+        """
+        tokens = state.tokens
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if token.type == "html_block":
+                index += _convert_html_block(tokens, index)
+                continue
+            if token.type == "blockquote_open":
+                _mark_alert(tokens, index)
+            elif token.type == "list_item_open":
+                _mark_task(tokens, index)
+            elif token.type == "inline" and token.children:
+                for child in token.children:
+                    if child.type == "html_inline" and _BR.fullmatch(child.content):
+                        child.type = "hardbreak"
+            index += 1
 
     def _convert_math_tokens(self, state: StateCore) -> None:
         """Turn math tokens into types Textual renders; it drops types it does not know.
