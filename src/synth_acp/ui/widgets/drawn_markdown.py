@@ -11,6 +11,9 @@ Two optional libraries do the drawing:
   and ```` ```math ```` fences. ```` ```latex ```` fences are left alone, because agents
   use them for LaTeX source code as often as for equations.
 
+```` ```csv ```` and ```` ```tsv ```` fences are drawn as tables with no extra library.
+Every drawn fence has a "⇄ source" label that switches between drawing and source.
+
 Drawing is off while a message streams, because neither library rejects unfinished
 input: each draws what it has, which would show a wrong picture. The owner turns
 ``drawing`` on once the message is complete and re-parses it.
@@ -21,6 +24,8 @@ drawing, an error row from TeXicode, or a ``?`` TeXicode put in for an unknown c
 
 from __future__ import annotations
 
+import csv
+import io
 import re
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -28,7 +33,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 from mdit_py_plugins.dollarmath import dollarmath_plugin
+from rich.cells import cell_len
+from rich.text import Text
 from textual.content import Content
+from textual.css.query import NoMatches
+from textual.widgets import Static
 from textual.widgets._markdown import MarkdownBlockQuote, MarkdownUnorderedListItem
 from textual.widgets.markdown import Markdown, MarkdownBlock, MarkdownFence
 
@@ -36,6 +45,8 @@ if TYPE_CHECKING:
     from markdown_it.rules_block import StateBlock
     from markdown_it.rules_core import StateCore
     from markdown_it.rules_inline import StateInline
+    from textual.app import ComposeResult
+    from textual.events import Click
 
 _BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
 
@@ -98,14 +109,85 @@ def render_math(tex: str, *, inline: bool) -> str | None:
     return drawn
 
 
+TABLE_DELIMITERS = {"csv": ",", "tsv": "\t"}
+MAX_TABLE_ROWS = 200
+_NUMBER = re.compile(r"[-+]?(\d[\d,_]*)?(\.\d+)?([eE][-+]?\d+)?%?")
+
+
+def render_table(code: str, delimiter: str) -> Content | None:
+    """Draw CSV or TSV text as a box-drawn table, or None when it is not a table.
+
+    The first row is the header. Columns whose body cells are all numbers are
+    right-aligned. Rows past ``MAX_TABLE_ROWS`` are counted, not drawn.
+
+    Returns:
+        The table, or None when the text does not parse, has fewer than two rows, or
+        has fewer than two columns (then it is a list, and the source reads better).
+    """
+    try:
+        rows = list(csv.reader(io.StringIO(code.strip("\n")), delimiter=delimiter))
+    except csv.Error:
+        return None
+    rows = [[cell.strip() for cell in row] for row in rows if row]
+    if len(rows) < 2:
+        return None
+    n_cols = max(len(row) for row in rows)
+    if n_cols < 2:
+        return None
+    rows = [row + [""] * (n_cols - len(row)) for row in rows]
+    header, body = rows[0], rows[1:]
+    hidden = max(0, len(body) - MAX_TABLE_ROWS)
+    body = body[:MAX_TABLE_ROWS]
+    widths = [max(cell_len(row[c]) for row in [header, *body]) for c in range(n_cols)]
+    numeric = [
+        any(row[c] for row in body) and all(not row[c] or _NUMBER.fullmatch(row[c]) for row in body)
+        for c in range(n_cols)
+    ]
+
+    def line(left: str, mid: str, right: str) -> str:
+        return left + mid.join("─" * (w + 2) for w in widths) + right + "\n"
+
+    def cells(row: list[str], right_align: list[bool]) -> str:
+        parts = []
+        for c, cell in enumerate(row):
+            pad = " " * (widths[c] - cell_len(cell))
+            parts.append(f" {pad}{cell} " if right_align[c] else f" {cell}{pad} ")
+        return "│" + "│".join(parts) + "│\n"
+
+    text = Text(line("┌", "┬", "┐"))
+    text.append(cells(header, [False] * n_cols), style="bold")
+    text.append(line("├", "┼", "┤"))
+    for row in body:
+        text.append(cells(row, numeric))
+    text.append(line("└", "┴", "┘").rstrip("\n"))
+    if hidden:
+        text.append(f"\n… {hidden} more rows", style="dim")
+    return Content.from_rich_text(text)
+
+
+class _DrawnToggle(Static):
+    """Clickable label that switches a drawn fence between drawing and source."""
+
+    def on_click(self, event: Click) -> None:
+        event.stop()
+        fence = self.parent
+        if isinstance(fence, DrawnFence):
+            fence.toggle_source()
+
+
 class DrawnFence(MarkdownFence):
-    """A fence that shows a drawing instead of code when it can."""
+    """A fence that shows a drawing instead of code when it can.
+
+    A small label above a drawing switches between the drawing and its source.
+    """
 
     # Layout lives in app.tcss: its MarkdownFence rules wrap code lines, and app CSS
     # outranks DEFAULT_CSS, so the no-wrap rule for drawings must sit beside them.
 
     def __init__(self, markdown: Markdown, token: Token, code: str) -> None:
         super().__init__(markdown, token, code)
+        self._source = self._highlighted_code
+        self._showing_source = False
         self._drawing: Content | None = None
         if getattr(markdown, "drawing", False):
             language = (self.lexer or "").strip().split(maxsplit=1)
@@ -115,24 +197,65 @@ class DrawnFence(MarkdownFence):
             elif name == MATH_LANGUAGE:
                 drawn = render_math(code, inline=False)
                 self._drawing = Content(drawn) if drawn is not None else None
+            elif name in TABLE_DELIMITERS:
+                self._drawing = render_table(code, TABLE_DELIMITERS[name])
         if self._drawing is not None:
             self._highlighted_code = self._drawing
             self.add_class("-drawn")
 
-    def notify_style_update(self) -> None:
-        """Keep the drawing when the theme changes; the base class re-highlights code."""
-        super().notify_style_update()
+    def compose(self) -> ComposeResult:
+        # Only drawn fences get a toggle, so plain code blocks cost no extra widget.
         if self._drawing is not None:
-            # The base can run before compose, so restore the stored content too:
-            # compose builds the Label from _highlighted_code, not from set_content.
-            self._highlighted_code = self._drawing
-            self.set_content(self._drawing)
+            yield _DrawnToggle(self._toggle_text(), classes="drawn-toggle")
+        yield from super().compose()
+
+    def _toggle_text(self) -> str:
+        return "⇄ drawing" if self._showing_source else "⇄ source"
+
+    def _shown(self) -> Content:
+        if self._drawing is None or self._showing_source:
+            return self._source
+        return self._drawing
+
+    def toggle_source(self) -> None:
+        """Switch between the drawing and its source. Does nothing without a drawing."""
+        if self._drawing is None:
+            return
+        self._showing_source = not self._showing_source
+        self._refresh_view()
+
+    def _refresh_view(self) -> None:
+        # compose builds the Label from _highlighted_code, not from set_content, so
+        # both must hold what is shown.
+        self._highlighted_code = self._shown()
+        self.set_content(self._highlighted_code)
+        try:
+            toggle = self.query_one(_DrawnToggle)
+        except NoMatches:
+            # A streaming re-parse can hand a drawing to a fence composed without one.
+            if self._drawing is not None and self.is_mounted:
+                self.mount(_DrawnToggle(self._toggle_text(), classes="drawn-toggle"), before=0)
+            return
+        toggle.display = self._drawing is not None
+        toggle.update(self._toggle_text())
+
+    def notify_style_update(self) -> None:
+        """Keep the shown view when the theme changes; the base class re-highlights."""
+        super().notify_style_update()
+        # The base just re-highlighted the source for the new theme into
+        # _highlighted_code, and it can run before compose.
+        if self._drawing is not None and self._highlighted_code is not self._drawing:
+            self._source = self._highlighted_code
+        self._refresh_view()
 
     def _copy_context(self, block: MarkdownBlock) -> None:
         super()._copy_context(block)
         if isinstance(block, DrawnFence):
+            self._source = block._source
             self._drawing = block._drawing
+            self._showing_source = False
             self.set_class(block._drawing is not None, "-drawn")
+            self._refresh_view()
 
 
 def _interrupting(rule: Any) -> Any:

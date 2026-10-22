@@ -23,6 +23,7 @@ from synth_acp.models.events import ToolCallDiff, ToolCallLocation
 from synth_acp.ui.ids import widget_id
 from synth_acp.ui.widgets.copy_button import CopyButton
 from synth_acp.ui.widgets.diff_view import DiffView
+from synth_acp.ui.widgets.drawn_markdown import DrawnMarkdown
 from synth_acp.ui.widgets.expandable_section import ExpandableSection
 
 _HIGHLIGHTER = ReprHighlighter()
@@ -276,7 +277,7 @@ class ToolCallBlock(Vertical, can_focus=False):
         self._text_rendered = True
         self._copyable_parts.append(text_content)
         if self._kind == "think":
-            return [Markdown(text_content, id="tc-text", open_links=False)]
+            return [DrawnMarkdown(text_content, id="tc-text", open_links=False, drawing=True)]
         label = Label(_highlight_output(text_content), id="tc-text-output-label")
         return [VerticalScroll(label, id="tc-text-output")]
 

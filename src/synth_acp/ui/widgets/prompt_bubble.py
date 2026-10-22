@@ -5,9 +5,9 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Static
-from textual.widgets.markdown import Markdown
 
 from synth_acp.ui.widgets.copy_button import CopyButton
+from synth_acp.ui.widgets.drawn_markdown import DrawnMarkdown
 
 
 class PromptBubble(Vertical, can_focus=False):
@@ -25,5 +25,5 @@ class PromptBubble(Vertical, can_focus=False):
 
     def compose(self) -> ComposeResult:
         yield CopyButton(lambda: self._text)
-        yield Markdown(self._text, open_links=False)
+        yield DrawnMarkdown(self._text, open_links=False, drawing=True)
         yield Static(f"[dim]{self._timestamp}[/dim]", classes="bubble-ts")

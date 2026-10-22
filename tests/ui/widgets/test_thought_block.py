@@ -148,3 +148,25 @@ class TestThoughtBlockReopen:
             await pilot.pause()
 
             assert "".join(block._chunks) == "seedonetwo"
+
+
+class TestThoughtDrawing:
+    async def test_csv_is_drawn_only_after_finalize(self) -> None:
+        """Silent failure: a thought drawn mid-stream shows a table built from a
+        half-written block; one never drawn means reasoning looks unlike replies."""
+        from textual.widgets import Label
+        from textual.widgets.markdown import MarkdownFence
+
+        block = ThoughtBlock()
+        app = _TestApp(block)
+
+        async with app.run_test(headless=True, size=(80, 24)) as pilot:
+            await block.append_chunk("```csv\na,b\n1,2\n```\n")
+            await pilot.pause()
+            fence = block.query_one(MarkdownFence)
+            assert str(fence.query_one("#code-content", Label).render()) == "a,b\n1,2"
+
+            await block.finalize()
+            await pilot.pause()
+            fence = block.query_one(MarkdownFence)
+            assert "│ a │ b │" in str(fence.query_one("#code-content", Label).render())

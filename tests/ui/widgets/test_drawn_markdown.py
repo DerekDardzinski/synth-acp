@@ -63,3 +63,72 @@ class TestDollarDetection:
         """Silent failure: an over-strict boundary rule would quietly stop drawing the
         common cases of math followed by a comma or wrapped in parentheses."""
         assert _math_spans("Let $x$, and ($y_1$) hold.") == ["x", "y_1"]
+
+
+class TestRenderTable:
+    def test_csv_with_quoted_comma_and_numeric_column(self) -> None:
+        """Silent failures: a quoted comma splitting a cell shifts every later column,
+        and numbers left-aligned make magnitudes hard to compare."""
+        from synth_acp.ui.widgets.drawn_markdown import render_table
+
+        table = render_table('name,score,note\nalpha,1.5,"a, b"\nbeta,10,ok\n', ",")
+        assert table is not None
+        assert table.plain == (
+            "┌───────┬───────┬──────┐\n"
+            "│ name  │ score │ note │\n"
+            "├───────┼───────┼──────┤\n"
+            "│ alpha │   1.5 │ a, b │\n"
+            "│ beta  │    10 │ ok   │\n"
+            "└───────┴───────┴──────┘"
+        )
+
+    def test_one_column_or_one_row_is_not_a_table(self) -> None:
+        """Silent failure: a ```csv block holding a plain list, or only a header, drawn
+        as a box adds borders and hides nothing useful; the source reads better."""
+        from synth_acp.ui.widgets.drawn_markdown import render_table
+
+        assert render_table("one\ntwo\nthree", ",") is None
+        assert render_table("a,b,c", ",") is None
+
+    def test_rows_past_the_cap_are_counted_not_drawn(self) -> None:
+        """Silent failure: an agent pasting a 10,000-row CSV would mount a drawing tall
+        enough to stall the conversation view."""
+        from synth_acp.ui.widgets.drawn_markdown import MAX_TABLE_ROWS, render_table
+
+        rows = "\n".join(f"{n},x" for n in range(MAX_TABLE_ROWS + 5))
+        table = render_table("n,v\n" + rows, ",")
+        assert table is not None
+        assert table.plain.endswith("… 5 more rows")
+        assert table.plain.count("│ x │") == MAX_TABLE_ROWS
+
+
+class TestSourceToggle:
+    async def test_toggle_switches_between_drawing_and_source(self) -> None:
+        """Silent failure: without a working toggle a drawing that looks wrong cannot
+        be checked against what the agent wrote. Plain code gets no toggle."""
+        from textual.app import App, ComposeResult
+        from textual.widgets import Label, Static
+
+        from synth_acp.ui.widgets.drawn_markdown import DrawnFence
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield DrawnMarkdown("```csv\na,b\n1,2\n```\n\n```py\nx = 1\n```\n", drawing=True)
+
+        app = _App()
+        async with app.run_test(headless=True, size=(80, 24)) as pilot:
+            await pilot.pause()
+            drawn, code = app.query(DrawnFence)
+
+            def shown(fence: DrawnFence) -> str:
+                return str(fence.query_one("#code-content", Label).render())
+
+            assert "│ a │ b │" in shown(drawn)
+            assert len(code.query(".drawn-toggle")) == 0
+
+            await pilot.click(".drawn-toggle")
+            assert shown(drawn) == "a,b\n1,2"
+            assert str(drawn.query_one(".drawn-toggle", Static).render()) == "⇄ drawing"
+
+            await pilot.click(".drawn-toggle")
+            assert "│ a │ b │" in shown(drawn)

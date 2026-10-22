@@ -435,6 +435,11 @@ MarkdownFence Label { width: 1fr; text-wrap: wrap; }
 /* Drawn diagrams and math must not wrap; wide ones scroll sideways instead. */
 DrawnFence.-drawn { overflow: auto hidden; scrollbar-size-horizontal: 1; }
 DrawnFence.-drawn Label { width: auto; text-wrap: nowrap; }
+DrawnFence .drawn-toggle {
+    width: 1fr; height: 1; text-align: right; padding: 0 1;
+    color: $text-muted;
+}
+DrawnFence .drawn-toggle:hover { color: $text; text-style: underline; }
 /* GitHub alerts (> [!NOTE] ...): border color by kind, as GitHub uses. */
 AlertQuote.-alert-note { border-left: outer $primary; }
 AlertQuote.-alert-tip { border-left: outer $success; }

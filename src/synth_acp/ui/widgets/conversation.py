@@ -18,7 +18,6 @@ from textual.markup import escape
 from textual.message import Message
 from textual.signal import Signal
 from textual.widgets import Static
-from textual.widgets.markdown import Markdown
 from textual.worker import Worker
 
 from synth_acp.models.events import (
@@ -37,6 +36,7 @@ from synth_acp.models.events import (
 from synth_acp.ui.widgets.agent_message import AgentMessage
 from synth_acp.ui.widgets.copy_button import CopyButton
 from synth_acp.ui.widgets.diff_view import DiffView
+from synth_acp.ui.widgets.drawn_markdown import DrawnMarkdown
 from synth_acp.ui.widgets.input_bar import InputBar
 from synth_acp.ui.widgets.plan_block import PlanBlock
 from synth_acp.ui.widgets.prompt_bubble import PromptBubble
@@ -1281,7 +1281,7 @@ class ConversationFeed(Vertical):
         await target.mount(container)
         async with container.batch():
             await container.mount(CopyButton(lambda t=text: t))
-            await container.mount(Markdown(text, open_links=False))
+            await container.mount(DrawnMarkdown(text, open_links=False, drawing=True))
             await container.mount(
                 Static(
                     f"[dim]◈ {'you (steer)' if source == 'user' else escape(from_agent or 'agent')}"
