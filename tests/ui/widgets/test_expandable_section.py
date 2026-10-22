@@ -81,6 +81,31 @@ class TestExpandableSection:
             preview = section.query_one("#es-preview", Static)
             assert "Loading files..." in str(preview.content)
 
+    async def test_preview_sits_on_its_own_line_and_hides_when_empty(self) -> None:
+        """Silent failures: the preview drifting back onto the toggle's line, or an
+        empty preview still taking a blank row under every fold."""
+        section = ExpandableSection(Static("body"), label="Build log", id="sec")
+        app = _TestApp(section)
+
+        async with app.run_test(headless=True, size=(80, 24)) as pilot:
+            toggle = section.query_one("#es-toggle", _ToggleLabel)
+            preview = section.query_one("#es-preview", Static)
+            assert str(toggle.render()) == "▶ Build log"
+            assert preview.display is False
+
+            section.set_preview("last line of output")
+            await pilot.pause()
+            assert preview.display is True
+            assert preview.region.y == toggle.region.y + 1
+
+            section.toggle()
+            await pilot.pause()
+            assert str(toggle.render()) == "▼ Build log"
+
+            section.set_preview("")
+            await pilot.pause()
+            assert preview.display is False
+
     async def test_start_expanded_shows_body(self) -> None:
         """start_expanded=True means body is visible (no -collapsed class)."""
         section = ExpandableSection(Static("visible"), start_expanded=True, id="sec")
@@ -93,9 +118,7 @@ class TestExpandableSection:
 
     async def test_toggle_position_bottom_puts_header_below(self) -> None:
         """toggle_position='bottom' places header after body."""
-        section = ExpandableSection(
-            Static("content"), toggle_position="bottom", id="sec"
-        )
+        section = ExpandableSection(Static("content"), toggle_position="bottom", id="sec")
         app = _TestApp(section)
 
         async with app.run_test(headless=True, size=(80, 24)):
@@ -151,9 +174,7 @@ class TestSetActivity:
         app = _TestApp(section)
 
         async with app.run_test(headless=True, size=(80, 24)) as pilot:
-            with patch.object(
-                ExpandableSection, "mount", side_effect=RuntimeError("boom")
-            ):
+            with patch.object(ExpandableSection, "mount", side_effect=RuntimeError("boom")):
                 section.set_activity(True)  # must not raise
             assert section._activity_bar is None
 

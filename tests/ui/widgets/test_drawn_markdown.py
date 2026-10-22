@@ -165,3 +165,41 @@ class TestFenceCopy:
                 "a,b\n1,2",
                 "x = 1",
             ]
+
+
+class TestDetailsFold:
+    async def test_details_pairs_fold_and_unmatched_stays_flat(self) -> None:
+        """Silent failures: a folded body losing its markdown (the code block inside
+        must still be a fence), `<details open>` starting closed, and an unclosed
+        `<details>` swallowing the rest of the message into an invisible fold."""
+        from textual.app import App, ComposeResult
+        from textual.widgets import Static
+        from textual.widgets._markdown import MarkdownParagraph
+
+        from synth_acp.ui.widgets.drawn_markdown import DetailsBlock, DrawnFence
+        from synth_acp.ui.widgets.expandable_section import ExpandableSection
+
+        source = (
+            "<details><summary>Build <b>log</b></summary>\n\nStep one.\n\n"
+            "```bash\nuv run pytest\n```\n\n</details>\n\n"
+            "<details open>\n\nOpen body.\n\n</details>\n\n"
+            "<details><summary>Unclosed</summary>\n\ntail text\n"
+        )
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield DrawnMarkdown(source)
+
+        app = _App()
+        async with app.run_test(headless=True, size=(80, 30)) as pilot:
+            await pilot.pause()
+            closed, opened = (d.query_one(ExpandableSection) for d in app.query(DetailsBlock))
+
+            assert str(closed.query_one("#es-toggle", Static).render()) == "▶ Build log"
+            assert closed.collapsed is True
+            assert len(closed.content.query(DrawnFence)) == 1
+            assert opened.collapsed is False
+            assert str(opened.query_one("#es-toggle", Static).render()) == "▼ Details"
+
+            top = app.query_one(DrawnMarkdown).query_children(MarkdownParagraph)
+            assert [str(p._content) for p in top] == ["▸ Unclosed", "tail text"]

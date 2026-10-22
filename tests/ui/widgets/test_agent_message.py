@@ -229,7 +229,8 @@ class TestBlockRewrites:
             await pilot.pause()
 
             texts = [str(p._content) for p in message.query(MarkdownParagraph)]
-            assert texts == ["▸ More", "hidden", "one\ntwo", "Press Ctrl+C\nnow"]
+            # "hidden" is inside the <details> fold (tests/ui/widgets/test_drawn_markdown.py).
+            assert texts == ["hidden", "one\ntwo", "Press Ctrl+C\nnow"]
 
     async def test_alert_marker_becomes_a_label_and_a_colored_quote(self) -> None:
         """Silent failure: `[!WARNING]` showed as literal text in a plain quote, so a
@@ -242,9 +243,7 @@ class TestBlockRewrites:
         message = AgentMessage("a1")
         app = _TestApp(message)
         async with app.run_test(headless=True, size=(100, 40)) as pilot:
-            await message.append_chunk(
-                "> [!WARNING]\n> careful **now**\n\n> [!tip] not alone\n"
-            )
+            await message.append_chunk("> [!WARNING]\n> careful **now**\n\n> [!tip] not alone\n")
             await message.finalize()
             await pilot.pause()
 

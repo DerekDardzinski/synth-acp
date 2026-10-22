@@ -43,6 +43,7 @@ from textual.widgets._markdown import MarkdownBlockQuote, MarkdownUnorderedListI
 from textual.widgets.markdown import Markdown, MarkdownBlock, MarkdownFence
 
 from synth_acp.ui.widgets.copy_button import CopyButton
+from synth_acp.ui.widgets.expandable_section import ExpandableSection
 
 if TYPE_CHECKING:
     from markdown_it.rules_block import StateBlock
@@ -500,14 +501,89 @@ def _mark_task(tokens: list[Token], index: int) -> None:
     first.content = first.content[match.end() :]
 
 
+_DETAILS_OPEN = re.compile(
+    r"\s*<details(\s+open)?\s*>\s*(?:<summary>(.*?)</summary>)?\s*", re.IGNORECASE | re.DOTALL
+)
+_DETAILS_CLOSE = re.compile(r"\s*</details>\s*", re.IGNORECASE)
+
+
+def _fold_details(tokens: list[Token]) -> None:
+    """Turn each matched ``<details>`` / ``</details>`` pair of HTML blocks into a fold.
+
+    Textual's Markdown only nests blocks under token types it knows, so the pair
+    becomes blockquote tokens tagged ``details``; AlertQuote then builds a
+    DetailsBlock. A pair matches only at the same nesting level, and the opening
+    block may hold nothing but the ``<details>`` and ``<summary>`` tags. Anything
+    unmatched is left as HTML and shown flat.
+    """
+    stack: list[tuple[int, re.Match[str]]] = []
+    for index, token in enumerate(tokens):
+        if token.type != "html_block":
+            continue
+        if opened := _DETAILS_OPEN.fullmatch(token.content):
+            stack.append((index, opened))
+        elif _DETAILS_CLOSE.fullmatch(token.content) and stack:
+            start, opened = stack[-1]
+            if tokens[start].level != token.level:
+                continue
+            stack.pop()
+            summary = " ".join(html_to_lines(opened.group(2) or "")) or "Details"
+            tokens[start] = Token(
+                "blockquote_open",
+                "blockquote",
+                1,
+                map=tokens[start].map,
+                block=True,
+                level=tokens[start].level,
+                meta={"details": summary, "open": bool(opened.group(1))},
+            )
+            tokens[index] = Token(
+                "blockquote_close", "blockquote", -1, block=True, level=token.level
+            )
+
+
 class AlertQuote(MarkdownBlockQuote):
-    """A block quote that shows a GitHub alert (note, tip, warning, ...)."""
+    """A block quote that shows a GitHub alert (note, tip, warning, ...).
+
+    A quote token tagged ``details`` builds a DetailsBlock instead: Textual looks up
+    one class per token type, so the choice is made here.
+    """
+
+    def __new__(cls, markdown: Markdown, token: Token) -> AlertQuote:  # noqa: ARG004
+        is_details = cls is AlertQuote and token.meta and "details" in token.meta
+        return super().__new__(DetailsBlock if is_details else cls)
 
     def __init__(self, markdown: Markdown, token: Token) -> None:
         super().__init__(markdown, token)
         kind = token.meta.get("alert") if token.meta else None
         if kind:
             self.add_class("-alert", f"-alert-{kind}")
+
+
+class DetailsBlock(AlertQuote):
+    """An HTML ``<details>`` section, drawn as a fold titled with its summary.
+
+    Collapsed unless the tag says ``<details open>``. The body scrolls past 20 lines,
+    as tool output and reasoning do.
+    """
+
+    DEFAULT_CSS = """
+    DetailsBlock, DetailsBlock:light {
+        background: transparent;
+        border-left: none;
+        padding: 0;
+        margin: 1 0;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        meta = self._token.meta
+        yield ExpandableSection(
+            *self._blocks,
+            label=meta.get("details") or "Details",
+            start_expanded=bool(meta.get("open")),
+        )
+        self._blocks.clear()
 
 
 class TaskListItem(MarkdownUnorderedListItem):
@@ -573,6 +649,7 @@ class DrawnMarkdown(Markdown):
         just shows as text until its line is complete.
         """
         tokens = state.tokens
+        _fold_details(tokens)
         index = 0
         while index < len(tokens):
             token = tokens[index]

@@ -36,6 +36,8 @@ The `[math]` extra draws LaTeX math in agent replies as Unicode text, using [TeX
 
 ```` ```csv ```` and ```` ```tsv ```` blocks are drawn as tables with no extra install: the first row is the header, all-numeric columns are right-aligned, and only the first 200 rows are drawn. Every code block has a `⎘` copy button that copies what the block shows. Every drawn block (diagram, math or table) also has a `⇄ source` label above it that switches between the drawing and its source. Drawing applies to agent replies, reasoning, inter-agent messages, subagent output in tool calls, and your own prompts.
 
+HTML `<details>` sections become folds titled with their `<summary>`, collapsed unless written `<details open>`. The `<details>` and `</details>` tags must each be on their own line with blank lines around the body, as GitHub also requires; otherwise the section shows flat. While a reply streams, a section shows flat and folds when the reply finishes.
+
 ## Quick Start
 
 ```bash

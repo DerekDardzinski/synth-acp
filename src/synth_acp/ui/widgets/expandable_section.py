@@ -1,4 +1,4 @@
-"""Expandable section with single-line header and bounded scrollable content."""
+"""Expandable section with a toggle line, an optional preview line, and bounded content."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import logging
 from typing import Literal
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widget import Widget
@@ -39,14 +39,16 @@ class _ToggleLabel(Static, can_focus=False):
         self.post_message(self.Toggle())
 
 
-class _Header(Horizontal):
-    """Single-line header row: [toggle label] [preview...]."""
+class _Header(Vertical):
+    """Header: the toggle on its own line, then the preview line when it has text."""
 
 
 class ExpandableSection(Vertical, can_focus=False):
-    """Collapsible section with single-line header (toggle label + preview)
-    and a bounded scrollable content region. An activity bar below the header
-    animates while active.
+    """Collapsible section with a header and a bounded scrollable content region.
+
+    The header is the toggle on its own line (``▶ Expand``, or ``▶ <label>`` when a
+    label is given), then a muted preview line, shown only while it has text. An
+    activity bar below the header animates while active.
     """
 
     DEFAULT_CSS = """
@@ -58,7 +60,11 @@ class ExpandableSection(Vertical, can_focus=False):
     }
     ExpandableSection #es-preview {
         width: 1fr;
+        height: auto;
         color: $text-muted;
+    }
+    ExpandableSection #es-preview.-empty {
+        display: none;
     }
     ExpandableSection .es-activity {
         height: 1;
@@ -94,21 +100,24 @@ class ExpandableSection(Vertical, can_focus=False):
         self,
         *children: Widget,
         start_expanded: bool = False,
+        label: str | None = None,
         toggle_position: Literal["top", "bottom"] = "top",
         max_content_height: int = 20,
         id: str | None = None,  # noqa: A002
         classes: str | None = None,
     ) -> None:
         """Args:
-            *children: Initial content widgets mounted into the scrollable body.
-            start_expanded: If True, body is visible on mount. Default collapsed.
-            toggle_position: Header at "top" (expand downward) or "bottom" (expand upward).
-            max_content_height: Max height in lines for the scrollable body.
+        *children: Initial content widgets mounted into the scrollable body.
+        start_expanded: If True, body is visible on mount. Default collapsed.
+        label: Toggle text after the arrow. None shows "Expand" / "Collapse".
+        toggle_position: Header at "top" (expand downward) or "bottom" (expand upward).
+        max_content_height: Max height in lines for the scrollable body.
         """
         super().__init__(id=id, classes=classes)
         self._content_children = children
         self._toggle_position = toggle_position
         self._max_content_height = max_content_height
+        self._label = label
         self._activity_bar: ActivityBar | None = None
         self.collapsed = not start_expanded
 
@@ -119,8 +128,8 @@ class ExpandableSection(Vertical, can_focus=False):
         removes it again, so an idle section holds no gradient timer.
         """
         header = _Header(
-            _ToggleLabel("▶ Expand", id="es-toggle"),
-            Static("", id="es-preview"),
+            _ToggleLabel(self._toggle_text(collapsed=self.collapsed), id="es-toggle"),
+            Static("", id="es-preview", classes="-empty"),
             classes="es-header",
         )
         body = VerticalScroll(*self._content_children, classes="es-body")
@@ -143,11 +152,15 @@ class ExpandableSection(Vertical, can_focus=False):
             body.remove_class("-collapsed")
             self._set_toggle_label(collapsed=False)
 
+    def _toggle_text(self, *, collapsed: bool) -> str:
+        arrow = "▶" if collapsed else "▼"
+        if self._label is not None:
+            return f"{arrow} {self._label}"
+        return f"{arrow} {'Expand' if collapsed else 'Collapse'}"
+
     def _set_toggle_label(self, *, collapsed: bool) -> None:
         """Update the toggle label text."""
-        self.query_one("#es-toggle", _ToggleLabel).update(
-            "▶ Expand" if collapsed else "▼ Collapse"
-        )
+        self.query_one("#es-toggle", _ToggleLabel).update(self._toggle_text(collapsed=collapsed))
 
     def watch_collapsed(self, collapsed: bool) -> None:
         """React to collapsed state changes."""
@@ -173,8 +186,10 @@ class ExpandableSection(Vertical, can_focus=False):
         return self.query_one(".es-body", VerticalScroll)
 
     def set_preview(self, text: str) -> None:
-        """Update the preview text in the header. Truncates to fit one line."""
-        self.query_one("#es-preview", Static).update(text)
+        """Update the preview line under the toggle; empty text hides the line."""
+        preview = self.query_one("#es-preview", Static)
+        preview.update(text)
+        preview.set_class(not text, "-empty")
 
     def set_activity(self, active: bool) -> None:
         """Show or hide the streaming activity indicator. SYNCHRONOUS.
