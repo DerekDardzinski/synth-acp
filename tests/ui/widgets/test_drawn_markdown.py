@@ -132,3 +132,36 @@ class TestSourceToggle:
 
             await pilot.click(".drawn-toggle")
             assert "│ a │ b │" in shown(drawn)
+
+
+class TestFenceCopy:
+    async def test_copy_button_copies_what_the_fence_shows(self) -> None:
+        """Silent failure: copying a drawn table must give the table, copying after
+        switching to source must give the CSV, and plain code must give the code,
+        not the syntax-highlighted markup or the whole message."""
+        from textual.app import App, ComposeResult
+
+        from synth_acp.ui.widgets.copy_button import CopyButton
+        from synth_acp.ui.widgets.drawn_markdown import DrawnFence
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield DrawnMarkdown("```csv\na,b\n1,2\n```\n\n```py\nx = 1\n```\n", drawing=True)
+
+        app = _App()
+        copied: list[str] = []
+        app.copy_to_clipboard = copied.append  # type: ignore[method-assign]
+        async with app.run_test(headless=True, size=(80, 24)) as pilot:
+            await pilot.pause()
+            drawn, code = app.query(DrawnFence)
+
+            await pilot.click(drawn.query_one(CopyButton))
+            await pilot.click(drawn.query_one(".drawn-toggle"))
+            await pilot.click(drawn.query_one(CopyButton))
+            await pilot.click(code.query_one(CopyButton))
+
+            assert copied == [
+                "┌───┬───┐\n│ a │ b │\n├───┼───┤\n│ 1 │ 2 │\n└───┴───┘",
+                "a,b\n1,2",
+                "x = 1",
+            ]

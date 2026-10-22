@@ -41,6 +41,8 @@ from textual.widgets import Static
 from textual.widgets._markdown import MarkdownBlockQuote, MarkdownUnorderedListItem
 from textual.widgets.markdown import Markdown, MarkdownBlock, MarkdownFence
 
+from synth_acp.ui.widgets.copy_button import CopyButton
+
 if TYPE_CHECKING:
     from markdown_it.rules_block import StateBlock
     from markdown_it.rules_core import StateCore
@@ -178,7 +180,8 @@ class _DrawnToggle(Static):
 class DrawnFence(MarkdownFence):
     """A fence that shows a drawing instead of code when it can.
 
-    A small label above a drawing switches between the drawing and its source.
+    Every fence has a copy button that copies what it shows. A small label above a
+    drawing switches between the drawing and its source.
     """
 
     # Layout lives in app.tcss: its MarkdownFence rules wrap code lines, and app CSS
@@ -204,13 +207,20 @@ class DrawnFence(MarkdownFence):
             self.add_class("-drawn")
 
     def compose(self) -> ComposeResult:
-        # Only drawn fences get a toggle, so plain code blocks cost no extra widget.
+        yield CopyButton(self.copy_text)
+        # Only drawn fences get a toggle, so plain code blocks pay for one widget, not two.
         if self._drawing is not None:
             yield _DrawnToggle(self._toggle_text(), classes="drawn-toggle")
         yield from super().compose()
 
     def _toggle_text(self) -> str:
         return "⇄ drawing" if self._showing_source else "⇄ source"
+
+    def copy_text(self) -> str:
+        """Return what the fence shows as plain text: the drawing, or the source."""
+        if self._drawing is None or self._showing_source:
+            return self.code
+        return self._drawing.plain
 
     def _shown(self) -> Content:
         if self._drawing is None or self._showing_source:
