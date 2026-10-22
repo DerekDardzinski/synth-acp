@@ -173,9 +173,10 @@ class _DrawnToggle(Static):
 
     def on_click(self, event: Click) -> None:
         event.stop()
-        fence = self.parent
-        if isinstance(fence, DrawnFence):
-            fence.toggle_source()
+        for node in self.ancestors:
+            if isinstance(node, DrawnFence):
+                node.toggle_source()
+                return
 
 
 class DrawnFence(MarkdownFence):
@@ -185,8 +186,16 @@ class DrawnFence(MarkdownFence):
     drawing switches between the drawing and its source.
     """
 
-    # Layout lives in app.tcss: its MarkdownFence rules wrap code lines, and app CSS
-    # outranks DEFAULT_CSS, so the no-wrap rule for drawings must sit beside them.
+    # The no-wrap rule for drawings lives in app.tcss: its MarkdownFence rules wrap
+    # code lines, and app CSS outranks DEFAULT_CSS. The control bar has no such
+    # conflict, so it lives here and applies wherever the widget is used.
+    # "⇄ source  ⎘" sits on one row: the copy button docks right in the bar, and the
+    # toggle sits just left of it.
+    DEFAULT_CSS = """
+    DrawnFence .drawn-bar { width: 1fr; height: 1; align-horizontal: right; }
+    DrawnFence .drawn-toggle { width: auto; height: 1; padding: 0 1; color: $text-muted; }
+    DrawnFence .drawn-toggle:hover { color: $text; text-style: underline; }
+    """
 
     def __init__(self, markdown: Markdown, token: Token, code: str) -> None:
         super().__init__(markdown, token, code)
