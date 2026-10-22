@@ -95,3 +95,65 @@ class TestReopen:
             await pilot.pause()
 
             assert "".join(message._chunks) == "seedonetwo"
+
+
+_MERMAID = "```mermaid\nflowchart LR\n    Alpha --> Beta\n```\n"
+
+
+def _fence_text(message: AgentMessage) -> str:
+    from textual.widgets import Label
+    from textual.widgets.markdown import MarkdownFence
+
+    fence = message.query_one(MarkdownFence)
+    return str(fence.query_one("#code-content", Label).render())
+
+
+class TestMermaidDiagrams:
+    """Closed mermaid fences are drawn once the message finishes streaming."""
+
+    async def test_streaming_shows_source_and_finalize_draws_the_diagram(self) -> None:
+        """Silent failure: a diagram drawn from a half-streamed fence is a wrong picture,
+        and a finished one left as source means the feature quietly does nothing."""
+        message = AgentMessage("a1")
+        app = _TestApp(message)
+
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await message.append_chunk("Here:\n\n```mermaid\nflowchart LR\n    Alpha --> ")
+            await pilot.pause()
+            assert "-->" in _fence_text(message)
+
+            await message.append_chunk("Beta\n```\n")
+            await message.finalize()
+            await pilot.pause()
+
+            drawn = _fence_text(message)
+            assert "-->" not in drawn
+            assert "Alpha" in drawn and "Beta" in drawn
+            assert "►" in drawn
+
+    async def test_unparseable_mermaid_falls_back_to_source(self) -> None:
+        """Silent failure: termaid returns an empty drawing for text it cannot parse, so
+        without the fallback the block renders blank and the content is lost."""
+        message = AgentMessage("a1")
+        app = _TestApp(message)
+
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await message.append_chunk("```mermaid\nnot a diagram at all\n```\n")
+            await message.finalize()
+            await pilot.pause()
+
+            assert "not a diagram at all" in _fence_text(message)
+
+    async def test_missing_termaid_falls_back_to_source(self) -> None:
+        """Silent failure: without the optional extra installed, a mermaid block must
+        still show its source rather than raising or rendering empty."""
+        message = AgentMessage("a1")
+        app = _TestApp(message)
+
+        with patch.dict("sys.modules", {"termaid": None}):
+            async with app.run_test(headless=True, size=(120, 40)) as pilot:
+                await message.append_chunk(_MERMAID)
+                await message.finalize()
+                await pilot.pause()
+
+                assert "Alpha --> Beta" in _fence_text(message)

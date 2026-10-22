@@ -32,12 +32,16 @@ search = [
     "bm25s>=0.2.0",
     "PyStemmer>=2.0.0",
 ]
+diagrams = [
+    "termaid[rich]>=0.9.1",
+]
 
 [dependency-groups]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "ruff>=0.11",
+    "termaid[rich]>=0.9.1",
     "textual-dev>=1.8.0",
     "ty>=0.0.1a7",
 ]

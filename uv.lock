@@ -1578,6 +1578,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+diagrams = [
+    { name = "termaid", extra = ["rich"] },
+]
 search = [
     { name = "bm25s" },
     { name = "onnxruntime" },
@@ -1590,6 +1593,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "termaid", extra = ["rich"] },
     { name = "textual-dev" },
     { name = "ty" },
 ]
@@ -1603,20 +1607,36 @@ requires-dist = [
     { name = "onnxruntime", marker = "extra == 'search'", specifier = ">=1.17.0" },
     { name = "pystemmer", marker = "extra == 'search'", specifier = ">=2.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "termaid", extras = ["rich"], marker = "extra == 'diagrams'", specifier = ">=0.9.1" },
     { name = "textual", extras = ["syntax"], specifier = ">=8.2.1" },
     { name = "textual-speedups", specifier = ">=0.2.1" },
     { name = "tokenizers", marker = "extra == 'search'", specifier = ">=0.15.0" },
     { name = "typer", specifier = ">=0.9" },
 ]
-provides-extras = ["search"]
+provides-extras = ["search", "diagrams"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=7.0" },
     { name = "pytest-asyncio", specifier = ">=0.21" },
     { name = "ruff", specifier = ">=0.11" },
+    { name = "termaid", extras = ["rich"], specifier = ">=0.9.1" },
     { name = "textual-dev", specifier = ">=1.8.0" },
     { name = "ty", specifier = ">=0.0.1a7" },
+]
+
+[[package]]
+name = "termaid"
+version = "0.9.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6c/5c/e2bc0d27c30de7a55a1c7fac8326454353058385864c5cda4a0d9d19ec59/termaid-0.9.1.tar.gz", hash = "sha256:e81ccdf92590182873b5a6437d709264fd70611a91f130f14418e80fad4c7ecf", size = 444724, upload-time = "2026-10-18T00:27:50.279Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/15/fa/1ea6c5417c5f6f23d6dcb86d969eb30672242e14c83ca782a1b3299ea74a/termaid-0.9.1-py3-none-any.whl", hash = "sha256:c14454d3dbfb82eab817dc3b43cf478092002ed177bbc9b1da28a466af3791ee", size = 170485, upload-time = "2026-10-18T00:27:48.576Z" },
+]
+
+[package.optional-dependencies]
+rich = [
+    { name = "rich" },
 ]
 
 [[package]]

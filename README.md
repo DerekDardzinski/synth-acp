@@ -23,9 +23,14 @@ uv tool install synth-acp
 
 # With semantic session search support (recommended)
 uv tool install "synth-acp[search]"
+
+# With Mermaid diagram drawing
+uv tool install "synth-acp[search,diagrams]"
 ```
 
 The `[search]` extra enables semantic search when restoring previous sessions (`synth --restore`). Without it, session restore falls back to recency-based listing only.
+
+The `[diagrams]` extra draws ```` ```mermaid ```` blocks in agent replies as text diagrams, using [termaid](https://github.com/fasouto/termaid). A diagram is drawn when the reply finishes streaming; until then, and for anything termaid cannot draw, the block shows its source. Wide diagrams scroll sideways.
 
 ## Quick Start
 
