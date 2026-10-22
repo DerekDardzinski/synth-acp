@@ -35,6 +35,7 @@ from markdown_it.token import Token
 from mdit_py_plugins.dollarmath import dollarmath_plugin
 from rich.cells import cell_len
 from rich.text import Text
+from textual.containers import Horizontal
 from textual.content import Content
 from textual.css.query import NoMatches
 from textual.widgets import Static
@@ -207,11 +208,20 @@ class DrawnFence(MarkdownFence):
             self.add_class("-drawn")
 
     def compose(self) -> ComposeResult:
-        yield CopyButton(self.copy_text)
-        # Only drawn fences get a toggle, so plain code blocks pay for one widget, not two.
         if self._drawing is not None:
-            yield _DrawnToggle(self._toggle_text(), classes="drawn-toggle")
+            yield self._control_bar()
+        else:
+            # Plain code: the copy button docks in the corner and takes no row.
+            yield CopyButton(self.copy_text)
         yield from super().compose()
+
+    def _control_bar(self) -> Horizontal:
+        """One row holding "⇄ source" and the copy button, right-aligned."""
+        return Horizontal(
+            _DrawnToggle(self._toggle_text(), classes="drawn-toggle"),
+            CopyButton(self.copy_text),
+            classes="drawn-bar",
+        )
 
     def _toggle_text(self) -> str:
         return "⇄ drawing" if self._showing_source else "⇄ source"
@@ -242,9 +252,12 @@ class DrawnFence(MarkdownFence):
         try:
             toggle = self.query_one(_DrawnToggle)
         except NoMatches:
-            # A streaming re-parse can hand a drawing to a fence composed without one.
+            # A streaming re-parse can hand a drawing to a fence composed without one:
+            # swap its corner copy button for the one-row bar.
             if self._drawing is not None and self.is_mounted:
-                self.mount(_DrawnToggle(self._toggle_text(), classes="drawn-toggle"), before=0)
+                for button in self.query_children(CopyButton):
+                    button.remove()
+                self.mount(self._control_bar(), before=0)
             return
         toggle.display = self._drawing is not None
         toggle.update(self._toggle_text())
