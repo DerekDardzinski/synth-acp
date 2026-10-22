@@ -1571,6 +1571,7 @@ dependencies = [
     { name = "agent-client-protocol" },
     { name = "inquirerpy" },
     { name = "mcp" },
+    { name = "mdit-py-plugins" },
     { name = "pyyaml" },
     { name = "textual", extra = ["syntax"] },
     { name = "textual-speedups" },
@@ -1580,6 +1581,9 @@ dependencies = [
 [package.optional-dependencies]
 diagrams = [
     { name = "termaid", extra = ["rich"] },
+]
+math = [
+    { name = "texicode" },
 ]
 search = [
     { name = "bm25s" },
@@ -1594,6 +1598,7 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
     { name = "termaid", extra = ["rich"] },
+    { name = "texicode" },
     { name = "textual-dev" },
     { name = "ty" },
 ]
@@ -1604,16 +1609,18 @@ requires-dist = [
     { name = "bm25s", marker = "extra == 'search'", specifier = ">=0.2.0" },
     { name = "inquirerpy", specifier = "==0.3.4" },
     { name = "mcp", specifier = ">=1.0.0,<2" },
+    { name = "mdit-py-plugins", specifier = ">=0.4" },
     { name = "onnxruntime", marker = "extra == 'search'", specifier = ">=1.17.0" },
     { name = "pystemmer", marker = "extra == 'search'", specifier = ">=2.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "termaid", extras = ["rich"], marker = "extra == 'diagrams'", specifier = ">=0.9.1" },
+    { name = "texicode", marker = "extra == 'math'", specifier = ">=1.0.5" },
     { name = "textual", extras = ["syntax"], specifier = ">=8.2.1" },
     { name = "textual-speedups", specifier = ">=0.2.1" },
     { name = "tokenizers", marker = "extra == 'search'", specifier = ">=0.15.0" },
     { name = "typer", specifier = ">=0.9" },
 ]
-provides-extras = ["search", "diagrams"]
+provides-extras = ["search", "diagrams", "math"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1621,6 +1628,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.21" },
     { name = "ruff", specifier = ">=0.11" },
     { name = "termaid", extras = ["rich"], specifier = ">=0.9.1" },
+    { name = "texicode", specifier = ">=1.0.5" },
     { name = "textual-dev", specifier = ">=1.8.0" },
     { name = "ty", specifier = ">=0.0.1a7" },
 ]
@@ -1637,6 +1645,15 @@ wheels = [
 [package.optional-dependencies]
 rich = [
     { name = "rich" },
+]
+
+[[package]]
+name = "texicode"
+version = "1.0.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b5/45/8352bf030453da65751941f7bc393bdacdc7661f6113217c0888f422fb5f/texicode-1.0.5.tar.gz", hash = "sha256:c80b2b65c614402ee01ffe479b76d73ab39b6e42684f7308659e63a8c4b62acb", size = 27318, upload-time = "2026-08-20T15:39:14.772Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/49/0d/6e5bf3c5c171d495f063024a12e69e185043ba71f01891673d7a074b7ca4/texicode-1.0.5-py3-none-any.whl", hash = "sha256:cb0e77ec885540da3d1ac96d5128120968c9330cfaca1733d3871740ad8130b8", size = 22640, upload-time = "2026-08-20T15:39:13.502Z" },
 ]
 
 [[package]]

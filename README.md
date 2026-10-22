@@ -24,13 +24,15 @@ uv tool install synth-acp
 # With semantic session search support (recommended)
 uv tool install "synth-acp[search]"
 
-# With Mermaid diagram drawing
-uv tool install "synth-acp[search,diagrams]"
+# With Mermaid diagram and LaTeX math drawing
+uv tool install "synth-acp[search,diagrams,math]"
 ```
 
 The `[search]` extra enables semantic search when restoring previous sessions (`synth --restore`). Without it, session restore falls back to recency-based listing only.
 
 The `[diagrams]` extra draws ```` ```mermaid ```` blocks in agent replies as text diagrams, using [termaid](https://github.com/fasouto/termaid). A diagram is drawn when the reply finishes streaming; until then, and for anything termaid cannot draw, the block shows its source. Wide diagrams scroll sideways.
+
+The `[math]` extra draws LaTeX math in agent replies as Unicode text, using [TeXicode](https://github.com/dxddxx/TeXicode): `$…$` inline, and `$$…$$` or ```` ```math ```` blocks on their own lines. Inline math is drawn only when it fits on one line; a stacked fraction inside a sentence stays as source. Dollar signs count as math only in the strict form: Pandoc's rule (no space just inside them, no digit right after the closing one) plus no letter or digit touching either dollar from outside. Prices (`$5`, `US$ 500`) and shell variables (`$HOME`) stay as written. ```` ```latex ```` blocks are left as code, since they usually hold LaTeX source. As with diagrams, math is drawn when the reply finishes, and anything TeXicode cannot draw shows its source.
 
 ## Quick Start
 

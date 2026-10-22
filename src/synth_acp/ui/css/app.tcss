@@ -432,9 +432,9 @@ ThreadDetail {
 /* ── Markdown code block wrapping ── */
 MarkdownFence { overflow: hidden hidden; }
 MarkdownFence Label { width: 1fr; text-wrap: wrap; }
-/* Drawn diagrams must not wrap; wide ones scroll sideways instead. */
-DiagramFence.-diagram { overflow: auto hidden; scrollbar-size-horizontal: 1; }
-DiagramFence.-diagram Label { width: auto; text-wrap: nowrap; }
+/* Drawn diagrams and math must not wrap; wide ones scroll sideways instead. */
+DrawnFence.-drawn { overflow: auto hidden; scrollbar-size-horizontal: 1; }
+DrawnFence.-drawn Label { width: auto; text-wrap: nowrap; }
 
 Footer { background: $background; color: $text-muted; }
 

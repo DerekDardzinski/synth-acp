@@ -157,3 +157,54 @@ class TestMermaidDiagrams:
                 await pilot.pause()
 
                 assert "Alpha --> Beta" in _fence_text(message)
+
+
+_MATH_REPLY = (
+    "Let $\\alpha_1$ be small; it costs $5 and $10 in $HOME.\n"
+    "The root is:\n"
+    "$$\n"
+    "\\frac{-b}{2a}\n"
+    "$$\n"
+    "\n"
+    "```latex\n"
+    "\\documentclass{article}\n"
+    "```\n"
+)
+
+
+class TestMath:
+    """LaTeX math is drawn once the message finishes streaming."""
+
+    async def test_streaming_shows_source_and_finalize_draws_math(self) -> None:
+        """Silent failures: math drawn mid-stream from a partial span; a `$$` block right
+        after a line of text (no blank line, the usual model output) left as source or
+        duplicated; prices and shell variables eaten as math; LaTeX source in a
+        ```latex fence redrawn as an equation."""
+        from textual.widgets._markdown import MarkdownParagraph
+        from textual.widgets.markdown import MarkdownFence
+
+        message = AgentMessage("a1")
+        app = _TestApp(message)
+
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await message.append_chunk(_MATH_REPLY)
+            await pilot.pause()
+            first = message.query(MarkdownParagraph).first()
+            assert "$\\alpha_1$" in str(first._content)
+
+            await message.finalize()
+            await pilot.pause()
+
+            paragraph = str(message.query(MarkdownParagraph).first()._content)
+            assert paragraph == ("Let α₁ be small; it costs $5 and $10 in $HOME. The root is:")
+            fences = list(message.query(MarkdownFence))
+            assert len(fences) == 2
+            from textual.widgets import Label
+
+            drawn, latex = (str(f.query_one("#code-content", Label).render()) for f in fences)
+            assert (
+                "\\frac" not in drawn
+                and "2\N{MATHEMATICAL ITALIC SMALL A}" in drawn
+                and "─" in drawn
+            )
+            assert latex == "\\documentclass{article}"

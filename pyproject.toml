@@ -23,6 +23,7 @@ dependencies = [
     "textual-speedups>=0.2.1",
     "InquirerPy==0.3.4",
     "PyYAML>=6.0",
+    "mdit-py-plugins>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +36,9 @@ search = [
 diagrams = [
     "termaid[rich]>=0.9.1",
 ]
+math = [
+    "texicode>=1.0.5",
+]
 
 [dependency-groups]
 dev = [
@@ -42,6 +46,7 @@ dev = [
     "pytest-asyncio>=0.21",
     "ruff>=0.11",
     "termaid[rich]>=0.9.1",
+    "texicode>=1.0.5",
     "textual-dev>=1.8.0",
     "ty>=0.0.1a7",
 ]

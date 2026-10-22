@@ -7,7 +7,7 @@ from textual.containers import Vertical
 from textual.widgets.markdown import Markdown, MarkdownStream
 
 from synth_acp.ui.widgets.copy_button import CopyButton
-from synth_acp.ui.widgets.diagram_markdown import DiagramMarkdown
+from synth_acp.ui.widgets.drawn_markdown import DrawnMarkdown
 
 
 class AgentMessage(Vertical, can_focus=False):
@@ -22,7 +22,7 @@ class AgentMessage(Vertical, can_focus=False):
         self._agent_id = agent_id
         self._stream: MarkdownStream | None = None
         self._chunks: list[str] = []
-        self._md = DiagramMarkdown("", open_links=False)
+        self._md = DrawnMarkdown("", open_links=False)
 
     def compose(self) -> ComposeResult:
         yield CopyButton(lambda: "".join(self._chunks))
@@ -46,9 +46,9 @@ class AgentMessage(Vertical, can_focus=False):
             self._stream = None
             # Work around Textual Markdown.append() cursor bug that can
             # leave fenced code blocks empty after incremental re-parse.
-            # The same full re-parse is where mermaid fences get drawn: every fence is
+            # The same full re-parse is where diagrams and math get drawn: every block is
             # closed now, so none can draw as a half-finished picture.
-            self._md.render_diagrams = True
+            self._md.drawing = True
             full_content = "".join(self._chunks)
             if full_content:
                 await self._md.update(full_content)
@@ -66,5 +66,5 @@ class AgentMessage(Vertical, can_focus=False):
         """
         if self._stream is not None:
             return
-        self._md.render_diagrams = False
+        self._md.drawing = False
         self._stream = Markdown.get_stream(self._md)
