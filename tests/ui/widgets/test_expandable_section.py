@@ -82,8 +82,9 @@ class TestExpandableSection:
             assert "Loading files..." in str(preview.content)
 
     async def test_preview_sits_on_its_own_line_and_hides_when_empty(self) -> None:
-        """Silent failures: the preview drifting back onto the toggle's line, or an
-        empty preview still taking a blank row under every fold."""
+        """Silent failures: the preview drifting back onto the toggle's line, an empty
+        preview still taking a blank row under every fold, or a preview repeating the
+        body while the section is open."""
         section = ExpandableSection(Static("body"), label="Build log", id="sec")
         app = _TestApp(section)
 
@@ -101,10 +102,27 @@ class TestExpandableSection:
             section.toggle()
             await pilot.pause()
             assert str(toggle.render()) == "▼ Build log"
+            # Open, the body shows the content, so the preview would only repeat it.
+            assert preview.display is False
+
+            section.toggle()
+            await pilot.pause()
+            assert preview.display is True
 
             section.set_preview("")
             await pilot.pause()
             assert preview.display is False
+
+    async def test_preview_hidden_when_started_expanded(self) -> None:
+        """Silent failure: a thought block streams expanded, so a preview shown while
+        open duplicates the last line of the reasoning right under the toggle."""
+        section = ExpandableSection(Static("body"), start_expanded=True, id="sec")
+        app = _TestApp(section)
+
+        async with app.run_test(headless=True, size=(80, 24)) as pilot:
+            section.set_preview("…the last line")
+            await pilot.pause()
+            assert section.query_one("#es-preview", Static).display is False
 
     async def test_start_expanded_shows_body(self) -> None:
         """start_expanded=True means body is visible (no -collapsed class)."""

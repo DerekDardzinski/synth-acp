@@ -47,7 +47,8 @@ class ExpandableSection(Vertical, can_focus=False):
     """Collapsible section with a header and a bounded scrollable content region.
 
     The header is the toggle on its own line (``▶ Expand``, or ``▶ <label>`` when a
-    label is given), then a muted preview line, shown only while it has text. An
+    label is given), then a muted preview line, shown only while the section is
+    collapsed and the preview has text: open, the body itself shows the content. An
     activity bar below the header animates while active.
     """
 
@@ -63,7 +64,7 @@ class ExpandableSection(Vertical, can_focus=False):
         height: auto;
         color: $text-muted;
     }
-    ExpandableSection #es-preview.-empty {
+    ExpandableSection #es-preview.-empty, ExpandableSection #es-preview.-open {
         display: none;
     }
     ExpandableSection .es-activity {
@@ -129,7 +130,7 @@ class ExpandableSection(Vertical, can_focus=False):
         """
         header = _Header(
             _ToggleLabel(self._toggle_text(collapsed=self.collapsed), id="es-toggle"),
-            Static("", id="es-preview", classes="-empty"),
+            Static("", id="es-preview", classes="-empty" if self.collapsed else "-empty -open"),
             classes="es-header",
         )
         body = VerticalScroll(*self._content_children, classes="es-body")
@@ -173,6 +174,7 @@ class ExpandableSection(Vertical, can_focus=False):
         else:
             body.remove_class("-collapsed")
         try:
+            self.query_one("#es-preview", Static).set_class(not collapsed, "-open")
             self._set_toggle_label(collapsed=collapsed)
         except Exception:
             pass
@@ -186,7 +188,10 @@ class ExpandableSection(Vertical, can_focus=False):
         return self.query_one(".es-body", VerticalScroll)
 
     def set_preview(self, text: str) -> None:
-        """Update the preview line under the toggle; empty text hides the line."""
+        """Update the preview line under the toggle.
+
+        The line shows only while the section is collapsed and the text is non-empty.
+        """
         preview = self.query_one("#es-preview", Static)
         preview.update(text)
         preview.set_class(not text, "-empty")
