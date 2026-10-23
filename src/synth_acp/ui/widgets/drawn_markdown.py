@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 from mdit_py_plugins.dollarmath import dollarmath_plugin
+from mdit_py_plugins.footnote import footnote_plugin
 from rich.cells import cell_len
 from rich.text import Text
 from textual.containers import Horizontal
@@ -501,6 +502,47 @@ def _mark_task(tokens: list[Token], index: int) -> None:
     first.content = first.content[match.end() :]
 
 
+_SUPERSCRIPT = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+_FOOTNOTE_DROP = frozenset(
+    {"footnote_block_close", "footnote_open", "footnote_close", "footnote_anchor"}
+)
+
+
+def _footnote_number(token: Token) -> str:
+    """The superscript number of a footnote token, counting from 1."""
+    return str(token.meta["id"] + 1).translate(_SUPERSCRIPT)
+
+
+def _convert_footnotes(tokens: list[Token]) -> None:
+    """Draw footnotes: superscript markers in the text, notes under a rule at the end.
+
+    The footnote plugin numbers notes in the order they are first referenced and
+    moves the definitions to the end. Its container tokens must go: Textual pops its
+    block stack on every ``*_close`` token, so an unknown one corrupts the tree.
+    A marker with no definition is left as the plugin leaves it, as literal text.
+    """
+    marker: str | None = None
+    kept: list[Token] = []
+    for token in tokens:
+        if token.type == "inline" and token.children:
+            for child in token.children:
+                if child.type == "footnote_ref":
+                    child.type = "text"
+                    child.content = _footnote_number(child)
+            if marker is not None:
+                token.children.insert(0, Token("text", "", 0, content=marker + " "))
+                marker = None
+        if token.type == "footnote_block_open":
+            kept.append(Token("hr", "hr", 0, block=True))
+            continue
+        if token.type == "footnote_open":
+            marker = _footnote_number(token)
+        if token.type in _FOOTNOTE_DROP:
+            continue
+        kept.append(token)
+    tokens[:] = kept
+
+
 _DETAILS_OPEN = re.compile(
     r"\s*<details(\s+open)?\s*>\s*(?:<summary>(.*?)</summary>)?\s*", re.IGNORECASE | re.DOTALL
 )
@@ -622,12 +664,16 @@ class DrawnMarkdown(Markdown):
         closing one, and no letter or digit touching either dollar from outside, so
         prices ("$5 and $10") and shell variables ("$HOME") stay text.
         """
-        parser = MarkdownIt("gfm-like").use(
-            dollarmath_plugin,
-            allow_space=False,
-            allow_digits=False,
-            allow_labels=False,
-            allow_blank_lines=False,
+        parser = (
+            MarkdownIt("gfm-like")
+            .use(
+                dollarmath_plugin,
+                allow_space=False,
+                allow_digits=False,
+                allow_labels=False,
+                allow_blank_lines=False,
+            )
+            .use(footnote_plugin, inline=False)
         )
         rule = next(r.fn for r in parser.block.ruler.__rules__ if r.name == "math_block")
         parser.block.ruler.at(
@@ -649,6 +695,7 @@ class DrawnMarkdown(Markdown):
         just shows as text until its line is complete.
         """
         tokens = state.tokens
+        _convert_footnotes(tokens)
         _fold_details(tokens)
         index = 0
         while index < len(tokens):

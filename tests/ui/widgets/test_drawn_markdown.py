@@ -203,3 +203,36 @@ class TestDetailsFold:
 
             top = app.query_one(DrawnMarkdown).query_children(MarkdownParagraph)
             assert [str(p._content) for p in top] == ["▸ Unclosed", "tail text"]
+
+
+class TestFootnotes:
+    async def test_markers_become_superscripts_and_notes_move_under_a_rule(self) -> None:
+        """Silent failures: an unknown footnote close token pops Textual's block stack
+        and scrambles the tree; a repeated marker getting a new number; a marker with
+        no definition vanishing instead of staying as written."""
+        from textual.app import App, ComposeResult
+        from textual.widgets._markdown import MarkdownHorizontalRule
+
+        source = (
+            "Cite this[^1], remark[^note], again[^1], missing[^x].\n\n"
+            "[^1]: Source **one**.\n[^note]: The remark.\n\nAfter.\n"
+        )
+
+        class _App(App):
+            def compose(self) -> ComposeResult:
+                yield DrawnMarkdown(source)
+
+        app = _App()
+        async with app.run_test(headless=True, size=(80, 20)) as pilot:
+            await pilot.pause()
+            blocks = list(app.query_one(DrawnMarkdown).children)
+            texts = [str(getattr(b, "_content", "")) for b in blocks]
+
+            assert texts == [
+                "Cite this¹, remark², again¹, missing[^x].",
+                "After.",
+                "",
+                "¹ Source one.",
+                "² The remark.",
+            ]
+            assert isinstance(blocks[2], MarkdownHorizontalRule)
